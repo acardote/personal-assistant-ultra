@@ -1,0 +1,43 @@
+# People
+
+Layer-3 knowledge: the recurring people in the user's working life. Always in context.
+
+> **This is a template.** Copy it to your content vault as `kb/people.md` and replace the placeholder entries with real ones. The method repo never holds the real file — your KB content lives in the vault (per A6 in parent #1).
+
+Each entry follows the format:
+
+```
+## <Name or handle>
+- **Role / relation:** <one line>
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <YYYY-MM-DD or never>
+- **Source:** <where this fact came from — file, URL, conversation, manual>
+
+<short body — ≤80 words. Stuff that helps the assistant give better answers about
+or involving this person. Avoid PII beyond what the user wants in their KB.>
+```
+
+Entries are added by the user (or by harvested decisions/threads that elevate them). The assistant never invents people.
+
+---
+
+## <your-handle> / <Your Full Name>
+
+- **Role / relation:** <e.g., "the user this assistant serves; engineer at <Company>; operator of this repo">
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <date or 'never (refresh on role/org change)'>
+- **Source:** <e.g., `~/.claude/CLAUDE.md`, local git config, this project's commit history>
+
+<one paragraph about you — what tone you prefer, what disciplines you follow,
+anything that helps the assistant respond in your voice. Replace this entire
+block with your real entry; it grounds every answer the assistant gives.>
+
+## <another-handle> / <Recurring Collaborator>
+
+- **Role / relation:** <e.g., "manager", "tech lead on Project X", "external partner contact at Vendor Y">
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <date or 'never'>
+- **Source:** <pointer to a real artifact — a Granola note, a Slack DM, a doc>
+
+<one paragraph that helps the assistant disambiguate this person and respond
+appropriately when they appear in your harvested content.>

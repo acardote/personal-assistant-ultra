@@ -33,11 +33,16 @@ from pathlib import Path
 import yaml
 from jsonschema import Draft202012Validator
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SCHEMA_PATH = PROJECT_ROOT / "docs" / "schemas" / "memory-object.schema.json"
-PROMPT_PATH = PROJECT_ROOT / "tools" / "prompts" / "compress.md"
-RAW_ROOT = PROJECT_ROOT / "raw"
-MEMORY_ROOT = PROJECT_ROOT / "memory"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+SCHEMA_PATH = METHOD_ROOT / "docs" / "schemas" / "memory-object.schema.json"
+PROMPT_PATH = METHOD_ROOT / "tools" / "prompts" / "compress.md"
+RAW_ROOT = _CFG.raw_root
+MEMORY_ROOT = _CFG.memory_root
+PROJECT_ROOT = METHOD_ROOT  # legacy alias for path-display helpers in this file
 
 # Default expires_at windows by kind — operationalized in #8 but the
 # compression pipeline is the natural write-time author of these dates.

@@ -48,10 +48,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_ROOT = PROJECT_ROOT / "raw"
-MEMORY_ROOT = PROJECT_ROOT / "memory"
-STATE_DIR = PROJECT_ROOT / ".harvest"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+RAW_ROOT = _CFG.raw_root
+MEMORY_ROOT = _CFG.memory_root
+STATE_DIR = _CFG.harvest_state_root
+PROJECT_ROOT = METHOD_ROOT  # legacy alias used by `derive_raw_path` etc. for relative-display
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -316,10 +321,16 @@ class _FolderSource(Source):
         return RawArtifact(content=rendered, extension=self.raw_extension, suggested_kind=self.default_kind)
 
     def dedupe_key(self, ref: ItemRef) -> str:
+        # Content-only sha, NOT path-based — making the key cross-machine portable
+        # per #12 phase 2 (challenger C3 on PR #16): including absolute paths in
+        # dedup keys leaked maintainer-machine paths into committed state and broke
+        # cross-machine consistency. The trade-off: identical-content files in two
+        # different folders dedup together, which is what we want — the same Granola
+        # export saved twice is the same memory.
         import hashlib
         path = Path(ref.meta["path"])
         sha = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-        return f"{self.name}:{path.resolve()}:{sha}"
+        return f"{self.name}:{sha}"
 
     def _render_raw(self, path: Path, content: str, ref: ItemRef) -> str:
         """Default: prepend a provenance header. Override for format-aware rendering."""

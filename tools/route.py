@@ -40,11 +40,16 @@ import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROMPTS_DIR = PROJECT_ROOT / "tools" / "prompts"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+PROMPTS_DIR = METHOD_ROOT / "tools" / "prompts"
 SPECIALISTS_DIR = PROMPTS_DIR / "specialists"
-ASSEMBLE_KB = PROJECT_ROOT / "tools" / "assemble-kb.py"
-MEMORY_ROOT = PROJECT_ROOT / "memory"
+ASSEMBLE_KB = METHOD_ROOT / "tools" / "assemble-kb.py"
+MEMORY_ROOT = _CFG.memory_root
+PROJECT_ROOT = METHOD_ROOT  # legacy alias for path-display
 
 
 SPECIALIST_TRIGGERS: dict[str, tuple[str, ...]] = {

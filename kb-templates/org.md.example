@@ -1,0 +1,43 @@
+# Org
+
+Layer-3 knowledge: organizational context that frames the user's working life. Always in context.
+
+> **This is a template.** Copy it to your content vault as `kb/org.md` and replace the placeholder entries with real ones. The method repo never holds the real file.
+
+Each entry follows the format:
+
+```
+## <Org / unit / team name>
+- **Relation to user:** <one line>
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <YYYY-MM-DD or never>
+- **Source:** <file / URL / manual>
+
+<short body — ≤120 words.>
+```
+
+Add teams, divisions, recurring vendor relationships, etc. The assistant never invents org details — populate from real sources.
+
+---
+
+## <Your Employer / Org Name>
+
+- **Relation to user:** <e.g., employer, primary client, current contracting org>
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <date or 'never (refresh on role/org change)'>
+- **Source:** <pointer that grounds the entry — email domain, an org chart doc, etc.>
+
+<short body about the org. Keep to facts the assistant should treat as ground
+truth — internal team / product / role details that shape how to answer questions
+about the user's working life. Don't invent — populate from real artifacts you
+add to your harvest sources.>
+
+## <A Specific Team / Project Within The Org>
+
+- **Relation to user:** <e.g., "team I lead", "product I'm responsible for", "partnership with Vendor X">
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <date or 'never'>
+- **Source:** <pointer to a real document or thread>
+
+<short body. The unit-level entries help the assistant disambiguate when
+multiple programs or partnerships come up in harvested content.>

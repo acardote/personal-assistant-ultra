@@ -43,10 +43,15 @@ from pathlib import Path
 
 import tiktoken
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_ROOT = PROJECT_ROOT / "raw"
-ROUTE_TOOL = PROJECT_ROOT / "tools" / "route.py"
-ASSEMBLE_KB_TOOL = PROJECT_ROOT / "tools" / "assemble-kb.py"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+RAW_ROOT = _CFG.raw_root
+ROUTE_TOOL = METHOD_ROOT / "tools" / "route.py"
+ASSEMBLE_KB_TOOL = METHOD_ROOT / "tools" / "assemble-kb.py"
+PROJECT_ROOT = METHOD_ROOT  # legacy alias
 ENCODER = tiktoken.get_encoding("cl100k_base")
 
 

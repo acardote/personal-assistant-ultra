@@ -1,0 +1,45 @@
+# Decisions
+
+Layer-3 knowledge: durable decisions the user has made. Always in context. These are the load-bearing commitments — the assistant should treat them as standing rules unless the user revises them.
+
+> **This is a template.** Copy it to your content vault as `kb/decisions.md` and replace the placeholder entries with real ones. The method repo never holds the real file.
+
+Each entry follows the format:
+
+```
+## <Decision title>
+- **Date:** <YYYY-MM-DD>
+- **Status:** decided | proposed | revisited
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <YYYY-MM-DD or never>
+- **Source:** <ADR / issue / conversation / manual>
+
+<short body — what was decided + the load-bearing reason.>
+```
+
+This file is for **your** decisions — strategy commitments, policy rules, persistent priorities. Method-level architectural decisions (about the assistant itself) live in `docs/adr/*.md` in the method repo.
+
+---
+
+## <Decision Title — e.g., "Adopted thin integration spine for Q2 2026">
+
+- **Date:** <YYYY-MM-DD>
+- **Status:** decided
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <YYYY-MM-DD or 'never (revisit if <criterion>)'>
+- **Source:** <pointer to a real artifact: a Granola note, an email thread, a doc>
+
+<short body: what was decided + the load-bearing reason. Concrete numbers,
+deadlines, named owners. The assistant treats this as ground truth when
+answering related questions; if the decision is reversed, you update or
+remove this entry — the assistant will not auto-detect drift.>
+
+## <Another Decision>
+
+- **Date:** <YYYY-MM-DD>
+- **Status:** decided | revisited
+- **Last verified:** <YYYY-MM-DD>
+- **Expires:** <date or 'never'>
+- **Source:** <real-artifact pointer>
+
+<body>

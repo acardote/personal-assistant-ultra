@@ -7,13 +7,22 @@ description: Personal assistant grounded in the layer-3 knowledge base — peopl
 
 A Claude Code skill implementing the three-layer memory architecture defined in [issue #1](https://github.com/acardote/personal-assistant-ultra/issues/1) (Sei's "Your AI Assistant Has Amnesia" model adapted to a personal context).
 
+## Method vs. content (per #12)
+
+This skill operates against **two repos**:
+
+- **Method repo** (`acardote/personal-assistant-ultra`): code, schemas, prompts, glossary, ADRs. The skill itself lives here. Path: wherever you cloned it.
+- **Content vault** (`getnexar/acardote-pa-vault`): your real `memory/`, `kb/{people,org,decisions}.md`, `.harvest/` state, `raw/`. Per-checkout location resolved from `<method-root>/.assistant.local.json`'s `paths.content_root`.
+
+Tools resolve paths via `tools/_config.py`. When `.assistant.local.json` is missing or malformed, tools emit a LOUD stderr warning and fall back to the method root (OK for fixtures/tests; NOT OK for real harvest). Setup: copy `.assistant.local.json.example` → `.assistant.local.json` and edit `paths.content_root` to point at your vault checkout.
+
 ## What "always in context" means here
 
-The layer-3 knowledge base under `kb/` is the assistant's ground truth on the user, the user's org, the user's durable decisions, and project-specific terms. It must be loaded on every invocation. Three layers:
+The layer-3 knowledge base is the assistant's ground truth on the user, the user's org, the user's durable decisions, and project-specific terms. It must be loaded on every invocation. Three layers:
 
-1. **Layer 1 — `raw/`** (mostly git-ignored): unmodified raw artifacts. NOT loaded directly into context.
-2. **Layer 2 — `memory/`** (git-tracked): editorially compressed memory objects. Loaded selectively per query (retrieval logic to be filled in by [#7](https://github.com/acardote/personal-assistant-ultra/issues/7)'s router).
-3. **Layer 3 — `kb/`** (git-tracked): always loaded. People, org, decisions, glossary. Token budget ≤4K total.
+1. **Layer 1 — `<content_root>/raw/`** (local-only by policy; PII): unmodified raw artifacts. NOT loaded directly into context.
+2. **Layer 2 — `<content_root>/memory/`** (vault-tracked): editorially compressed memory objects. Loaded selectively per query (see retrieval in `tools/route.py`; ranked-retrieval landing in [#10](https://github.com/acardote/personal-assistant-ultra/issues/10)).
+3. **Layer 3 — split**: `<method_root>/kb/glossary.md` (canonical project terms) + `<content_root>/kb/{people,org,decisions}.md` (your content). Combined assembly via `tools/assemble-kb.py`. Token budget ≤4K total.
 
 ## Activation contract — load layer 3 first
 

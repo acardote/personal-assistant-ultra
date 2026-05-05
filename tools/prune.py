@@ -37,10 +37,15 @@ from pathlib import Path
 import tiktoken
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MEMORY_ROOT = PROJECT_ROOT / "memory"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+MEMORY_ROOT = _CFG.memory_root
 ARCHIVE_ROOT = MEMORY_ROOT / ".archive"
-WINDOWS_PATH = PROJECT_ROOT / "tools" / "expiry-windows.json"
+WINDOWS_PATH = METHOD_ROOT / "tools" / "expiry-windows.json"
+PROJECT_ROOT = METHOD_ROOT  # legacy alias
 
 ENCODER = tiktoken.get_encoding("cl100k_base")
 
