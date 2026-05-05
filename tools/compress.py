@@ -269,8 +269,29 @@ def main(argv: list[str]) -> int:
                 d_front, d_body = _dedup.parse_memo_file(m.path)
                 d_front["is_canonical_for_event"] = False
                 d_front["superseded_by"] = front["id"]
+                d_front["event_id"] = cluster.event_id  # ensure cluster membership
                 m.path.write_text(render_memo(d_front, d_body), encoding="utf-8")
                 print(f"[dedup] demoted previous canonical: {m.path}", file=sys.stderr)
+                break
+
+    # If the cluster was seeded by a legacy memo (one that had no prior
+    # event_id), backfill the seed's event_id on disk so cluster membership
+    # is queryable from frontmatter alone (per reviewer C1 on PR #20).
+    # Skip this when the seed is already the demoted canonical we just rewrote.
+    if cluster.seeded_id and cluster.seeded_id != cluster.demoted_id:
+        for m in corpus:
+            if m.id == cluster.seeded_id:
+                s_front, s_body = _dedup.parse_memo_file(m.path)
+                if not s_front.get("event_id"):
+                    s_front["event_id"] = cluster.event_id
+                    # The seed was the cluster's de-facto canonical until
+                    # this new memo arrived; preserve that role unless the
+                    # new memo took it.
+                    if cluster.role == "alternate":
+                        s_front.setdefault("is_canonical_for_event", True)
+                        s_front.setdefault("superseded_by", None)
+                    m.path.write_text(render_memo(s_front, s_body), encoding="utf-8")
+                    print(f"[dedup] backfilled event_id on seed: {m.path}", file=sys.stderr)
                 break
 
     print(

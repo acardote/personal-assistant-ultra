@@ -16,9 +16,9 @@
   },
   "default_authority_for_unknown_kind": 5,
   "thresholds": {
-    "$comment": "Cluster decision uses 0.3*date_score + 0.7*cosine_score. Cluster if combined >= cluster_threshold. Tighten by raising cluster_threshold; loosen by lowering it.",
+    "$comment": "Cluster decision uses 0.3*date_score + 0.7*cosine_score. Cluster if combined >= cluster_threshold. Bumped from 0.4 to 0.55 after PR #20 challenger reproduced an F1 false-merge at 0.511 (contradictory week-2 follow-up to a templated Q3 review). T1's same-event scores are 0.83/0.86 — well above 0.55 — so the tightening doesn't regress legitimate clustering.",
     "date_window_days": 7,
     "cosine_min_for_consideration": 0.2,
-    "cluster_threshold": 0.4
+    "cluster_threshold": 0.55
   }
 }

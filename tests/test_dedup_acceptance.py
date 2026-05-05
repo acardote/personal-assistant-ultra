@@ -148,6 +148,22 @@ review of the privacy disclosure is the gating step.
         assert r4.role == "canonical", "unrelated should start its own cluster"
         print("  PASS — unrelated memo correctly stays out of the Q3 cluster (F1 holds)\n")
 
+        # T4 — F1 challenger probe: same-template recurring 1:1, week apart,
+        # different decisions. Should NOT cluster despite vocabulary overlap.
+        print("Test T4 — recurring 1:1s a week apart with different decisions don't cluster (F1 probe)")
+        wk1_path = cp(fixtures / "templated-1on1-week1.md", memory_root / "templated-1on1-week1.md")
+        wk2_path = cp(fixtures / "templated-1on1-week2.md", memory_root / "templated-1on1-week2.md")
+        wk1 = dedup.load_memo_summary(wk1_path)
+        wk2 = dedup.load_memo_summary(wk2_path)
+        score, cs, ds = dedup.pair_score(wk1, wk2, cfg)
+        print(f"  templated 1:1 pair score={score:.3f} (cosine={cs:.3f}, date={ds:.3f})")
+        r5 = dedup.cluster_with_existing(wk2, [wk1], cfg)
+        print(f"  cluster_with_existing role={r5.role} same_event={r5.event_id == wk1.event_id if wk1.event_id else 'n/a'}")
+        if r5.role == "alternate" and r5.event_id == wk1.event_id:
+            print("  WARN: clustered. F1 fires for this fixture pair under current threshold.")
+            assert False, "F1 fires: templated 1:1 pair clusters incorrectly"
+        print("  PASS — templated pair correctly stays in separate clusters\n")
+
         print("=== All #10 acceptance tests passed ===")
         return 0
     finally:

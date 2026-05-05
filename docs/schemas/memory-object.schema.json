@@ -92,6 +92,18 @@
           "expires_at": { "format": "date-time" }
         }
       }
+    },
+    {
+      "$comment": "Cluster relational invariant (per #10 challenger schema probe on PR #20): a memo flagged is_canonical_for_event MUST NOT also have a non-null superseded_by. Canonical and superseded-by are mutually exclusive states.",
+      "if": {
+        "properties": { "is_canonical_for_event": { "const": true } },
+        "required": ["is_canonical_for_event"]
+      },
+      "then": {
+        "properties": {
+          "superseded_by": { "type": "null" }
+        }
+      }
     }
   ]
 }

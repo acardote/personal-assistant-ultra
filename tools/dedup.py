@@ -30,11 +30,27 @@ Algorithm:
   `created_at`.
 
 This is intentionally a simple bag-of-words + date heuristic — embeddings
-are deferred. The thresholds are tunable in `dedup-config.json`. Falsifiers
-F1 (back-to-back meetings over-merged), F2 (stale Gmail canonical when
-Granola is edited later), F3 (alternates orphaned in retrieval) are tracked
-on issue #10; this module's job is to provide the foundation those
-falsifiers test.
+are deferred. The thresholds are tunable in `dedup-config.json`.
+
+Falsifier status (per PR #20 review):
+- F1 (back-to-back meetings over-merged): mitigated by cluster_threshold
+  raised to 0.55 after challenger reproduced a false-merge at 0.511.
+  Acceptance test T4 fixtures probe a same-template / different-decisions
+  pair and verify they do NOT cluster. NOT FULLY DEFENDED — participant
+  overlap signal would close the remaining hole; deferred to a follow-up.
+- F2 (stale canonical when alternate is edited later): NOT DEFENDED.
+  `pick_canonical` uses source_authority as the primary sort key with
+  `created_at` only as a tiebreaker among equal-authority members. There
+  is no path by which a Granola note (authority=3) supersedes a Gmail
+  thread (authority=1) regardless of edit recency. Documented as a known
+  limitation; the path forward is a recency-aware promotion rule
+  (e.g., authority + edit-staleness penalty) tracked as a future child.
+  Until then: users who need the freshest version surfaced should edit
+  the higher-authority canonical directly, not the alternate.
+- F3 (alternates orphaned in retrieval): mitigated. Canonicals get a 1.0
+  multiplier; alternates get 0.85. Multiplicative-not-filter design means
+  alternate-only-content queries still surface alternates because their
+  relevance × 0.85 > canonical's zero relevance × 1.0.
 """
 
 from __future__ import annotations
@@ -49,9 +65,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _config import load_config as load_method_config  # noqa: E402
 
 DEDUP_CONFIG_PATH = Path(__file__).resolve().parent / "dedup-config.json"
 
@@ -101,6 +114,12 @@ class ClusterResult:
     demoted_id: str | None  # id of the previous canonical that should now be demoted
     cluster_members: list[str] = field(default_factory=list)
     score: float = 0.0  # for diagnostics
+    # Per reviewer C1 on PR #20: when a NEW event_id is minted because the
+    # matched memo had no prior event_id (legacy seed), the integration must
+    # backfill that seed's event_id on disk. seeded_id carries the seed's id
+    # so compress.py can find it. None when the matched memo already had an
+    # event_id (no backfill needed) OR when no match was found (new event).
+    seeded_id: str | None = None
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -240,7 +259,6 @@ def cluster_with_existing(
 
     best_score = 0.0
     best_match: MemoSummary | None = None
-    best_cosine = 0.0
     for existing in pool:
         score, cs, _ = pair_score(new, existing, cfg)
         if cs < cfg.cosine_min:
@@ -248,7 +266,6 @@ def cluster_with_existing(
         if score > best_score:
             best_score = score
             best_match = existing
-            best_cosine = cs
 
     if best_match is None or best_score < cfg.cluster_threshold:
         # New event: own cluster, canonical by default.
@@ -259,17 +276,20 @@ def cluster_with_existing(
             demoted_id=None,
             cluster_members=[],
             score=best_score,
+            seeded_id=None,
         )
 
     # Cluster found. Find existing members (those sharing the matched memo's event_id).
     event_id = best_match.event_id
+    seeded_id: str | None = None
     if not event_id:
-        # Legacy memo without an event_id — assign one fresh and treat best_match
-        # as the seed of this cluster. The caller is responsible for backfilling
-        # best_match's event_id.
+        # Legacy memo without an event_id — mint one fresh and treat best_match
+        # as the seed of this cluster. The integration MUST backfill best_match's
+        # event_id on disk; seeded_id below carries the id so compress.py can do it.
         import uuid
         event_id = f"evt-{uuid.uuid4()}"
         members = [best_match]
+        seeded_id = best_match.id
     else:
         members = cluster_members(corpus, event_id)
 
@@ -288,6 +308,7 @@ def cluster_with_existing(
             demoted_id=current_canonical.id,
             cluster_members=[m.id for m in members],
             score=best_score,
+            seeded_id=seeded_id,
         )
     else:
         # New is less or equally authoritative → joins as alternate.
@@ -297,4 +318,5 @@ def cluster_with_existing(
             demoted_id=None,
             cluster_members=[m.id for m in members],
             score=best_score,
+            seeded_id=seeded_id,
         )
