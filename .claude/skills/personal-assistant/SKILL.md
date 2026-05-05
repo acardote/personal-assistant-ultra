@@ -182,7 +182,7 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 
 - Multi-fidelity event matching + ranked retrieval: [#10](https://github.com/acardote/personal-assistant-ultra/issues/10).
 - Slack/Gmail/Granola/Meet via MCPs (skill orchestration): [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) + [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) reopens.
-- Scheduled harvest via Claude Code routine: [#25](https://github.com/acardote/personal-assistant-ultra/issues/25) (in flight; supersedes the launchd path from #11).
+- Scheduled harvest via Claude Code routine: [#25](https://github.com/acardote/personal-assistant-ultra/issues/25) (closed; supersedes the launchd path from #11). Out-of-band watchdog alerting: [#32](https://github.com/acardote/personal-assistant-ultra/issues/32) — see `templates/routines/watchdog-routine.md`.
 - Per-document-type expiry rules: [#8](https://github.com/acardote/personal-assistant-ultra/issues/8) (closed; integrated).
 - Backup/migrate tooling: [#13](https://github.com/acardote/personal-assistant-ultra/issues/13).
 - Setup docs + bootstrap: [#14](https://github.com/acardote/personal-assistant-ultra/issues/14).
