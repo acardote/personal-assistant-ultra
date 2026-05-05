@@ -131,7 +131,14 @@ The file is append-only. Multiple runs in one day each get a timestamped section
 
 ### Cold-start (first run)
 
-The first scheduled harvest after install is a 30-day backfill. After that, each daily run uses `--since yesterday` (or the launchd plist's harvest argument). The user can later run a 90-day backfill on-demand by asking the skill to "harvest the last 90 days"; the dedup state from the 30-day window prevents duplicates (per #5 / #10).
+The first scheduled harvest after install is a 30-day backfill. The wrapper at `tools/scheduled-harvest.py` detects cold-start (no prior runs in `<content_root>/.harvest/runs/`) and widens the prompt's `--since` window. After that, each daily run uses `--since yesterday`. The user can later run a 90-day backfill on-demand by asking the skill to "harvest the last 90 days"; the dedup state from the 30-day window prevents duplicates (per #5 / #10).
+
+### Known limitations of harvest orchestration (per PR #24 review)
+
+- **Slack `has::pencil:` operator may not be a real Slack search operator.** The skill should attempt the search; if no results come back when the user has actually placed pencil reactions, fall back to listing the user's recent threads via `from:@<user>` and inspecting reactions per-thread. The first real harvest will tell us which approach Slack search supports.
+- **`/personal-assistant harvest <args>` is interpreted as a prompt, not parsed as a slash command** (no `.claude/commands/personal-assistant.md` registers a parser). The skill receives the prompt as freeform text; argument resolution (especially time windows like "yesterday") is at the model's discretion. The wrapper at `tools/scheduled-harvest.py` constructs explicit `--since <N>d` strings to keep the time-window discrete.
+- **MCP capability is not pre-checked at run start.** If a tool the skill expects (e.g., `mcp__claude_ai_Slack__slack_search_public_and_private`) has been renamed or removed, the run fails when the call is attempted. The run-status file captures this; the lint-docs CI gate doesn't catch MCP-tool drift. A future child can add a smoke probe at run start.
+- **Bash tool permission inheritance in headless `claude -p` is not guaranteed.** The skill calls `tools/compress.py` via Bash; if the headless session doesn't have Bash permission, compression fails. The wrapper's run-status will show this failure mode if it fires.
 
 ## Open extensions
 

@@ -2,6 +2,22 @@
 
 Scheduled-harvest LaunchAgent for the personal-assistant skill (per [#11](https://github.com/acardote/personal-assistant-ultra/issues/11)).
 
+## What the routine actually invokes
+
+The plist invokes `__PATH_TO_METHOD_REPO__/tools/scheduled-harvest.py`, NOT `claude -p` directly. That wrapper:
+
+- Acquires an fcntl exclusive lock at `<content_root>/.harvest/.lock` so concurrent fires (scheduled at 7:07am while the user is mid-on-demand-harvest at 7:06am) can't race on the dedup state files.
+- Spawns `claude -p` with the harvest prompt.
+- Captures stdout / stderr / returncode into a structured run-status JSON at `<content_root>/.harvest/runs/<utc-ts>.json`. Every fire writes a status file, regardless of success — that's the F1 (silent-failure) defense.
+- On success, commits + pushes the vault repo (skipped if `<content_root>` isn't a git repo, or via `--no-commit`). That's the F2 (cross-machine durability) defense.
+- Detects "first run" (no prior `runs/<...>.json` exists) and widens the harvest window to 30 days for cold-start backfill; subsequent runs default to "since yesterday."
+- Sets non-zero exit if claude failed, or git push failed, or the lock couldn't be acquired. The plist's `StandardErrorPath` log will show the failure; `tools/scheduled-harvest.py --status-only` prints the latest run's full status JSON.
+
+To inspect the latest run's outcome at any time:
+```
+tools/scheduled-harvest.py --status-only
+```
+
 ## Why launchd, not the Claude Code `schedule` skill?
 
 The `schedule` skill / `CronCreate` only fires while a Claude Code session is running and idle (per its tool docs: *"Jobs only fire while the REPL is idle"*). For a daily 7am unattended harvest — where the laptop may be closed and Claude Code not running — that's not viable. See the probe outcome on [issue #11](https://github.com/acardote/personal-assistant-ultra/issues/11) for the full Option-A vs Option-B analysis.
@@ -54,11 +70,21 @@ rm ~/Library/LaunchAgents/com.acardote.personal-assistant-harvest.plist
 
 The plist is per-machine (paths are absolute). On a second machine, repeat the install with that machine's paths. The dedup state in your content vault prevents duplicate harvests across machines (per #5 reopen + #10 multi-fidelity matching).
 
+## Inspecting runs
+
+Every fire produces a structured status JSON. Newest run at `<content_root>/.harvest/runs/<utc-ts>.json`. View the latest:
+
+```
+tools/scheduled-harvest.py --status-only
+```
+
+Stale-detection rule of thumb: if the newest entry in `runs/` is older than 26h, the routine is silently broken (laptop was asleep + RunAtLoad: false + reboot didn't fire it; or claude auth expired and you missed a day; or a configuration regressed). Treat as F1-fired and investigate.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| Routine fires but the log shows `claude: command not found` | `<PATH_TO_CLAUDE>` is wrong. Hard-code the absolute path; launchd's PATH is minimal. |
+| Routine fires but the log shows `claude: command not found` | `__PATH_TO_CLAUDE__` is wrong. Hard-code the absolute path; launchd's PATH is minimal. |
 | Routine fires but `claude -p` waits for interactive auth | First-run claude needs you to authenticate interactively. Run `claude` once manually before scheduling. |
 | Routine appears not to fire at all | Check `launchctl print gui/$(id -u)/com.acardote.personal-assistant-harvest` for state. macOS sometimes pauses agents. Common cause: laptop was asleep AND `RunAtLoad: false` AND Sleep > 1 day, so the calendar-interval window was missed. |
 | Permissions error writing to vault | The agent runs as your user. If `<content_root>` is on a network drive or different mount, ensure your user can write to it from a non-interactive session. |

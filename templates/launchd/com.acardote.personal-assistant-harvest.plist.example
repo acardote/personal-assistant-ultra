@@ -21,14 +21,14 @@
     <key>Label</key>
     <string>com.acardote.personal-assistant-harvest</string>
 
-    <!-- Run claude headlessly, invoking the personal-assistant skill with a
-         "harvest since yesterday" intent. The skill orchestrates the actual
-         per-source MCP calls (see SKILL.md "Harvest orchestration" section). -->
+    <!-- Invoke the wrapper script (NOT claude -p directly). The wrapper
+         acquires an fcntl lock, runs claude -p, captures structured run
+         status under .harvest/runs/, and commits+pushes the vault on
+         success. Without it, claude -p's exit 0 doesn't reflect harvest
+         outcome (challenger F1 on PR #24); the wrapper closes that. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__PATH_TO_CLAUDE__</string>
-        <string>-p</string>
-        <string>/personal-assistant harvest --since yesterday</string>
+        <string>__PATH_TO_METHOD_REPO__/tools/scheduled-harvest.py</string>
     </array>
 
     <!-- Run from the method-repo checkout so relative paths resolve via _config.py -->
@@ -45,10 +45,15 @@
         <integer>7</integer>
     </dict>
 
-    <!-- DO fire on next wake/load if the laptop was asleep at 7:07. RunAtLoad
-         covers the "boot or login while past the scheduled time" case. -->
+    <!-- Default to firing on load (login/wake/boot) AND at the scheduled
+         minute. macOS's StartCalendarInterval may NOT auto-fire missed
+         windows after long sleep, so RunAtLoad: true is the belt to the
+         scheduled-interval suspenders. Trade-off: this also fires on
+         every reboot mid-day, which the wrapper's idempotency-via-flock +
+         dedup-state design tolerates (no duplicate harvests). If your
+         flow is different, flip to <false/>. -->
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 
     <!-- Streams stdout + stderr to a log file under ~/Library/Logs/.
          Inspect via: tail -f ~/Library/Logs/personal-assistant-harvest.log -->
