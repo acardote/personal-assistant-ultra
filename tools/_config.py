@@ -134,9 +134,11 @@ def load_config(*, require_explicit_content_root: bool = False) -> Config:
 
     # Reject relative paths early — almost always a misconfiguration (per challenger
     # suggestion S1 on PR #16): relative paths resolve against process cwd, which is
-    # the F3 portability hazard the per-checkout config is meant to avoid.
+    # the F3 portability hazard the per-checkout config is meant to avoid. Note: if
+    # `os.path.expanduser` could not expand (e.g. `~unknown/...`), the result still
+    # starts with `~` and is_absolute is False — caught by this same check.
     expanded = os.path.expanduser(raw_content_root)
-    if not (os.path.isabs(expanded) or expanded.startswith("~")):
+    if not Path(expanded).is_absolute():
         return _fallback(
             f"paths.content_root must be absolute or ~-prefixed; got '{raw_content_root}'"
         )
@@ -147,15 +149,15 @@ def load_config(*, require_explicit_content_root: bool = False) -> Config:
             f"paths.content_root resolves to {content_root} which is not an existing directory"
         )
 
-    # F1 / C2 (challenger): if content_root === method_root, the user has either
-    # mis-pointed the config at the method checkout or hasn't set up a vault yet.
-    # Either way, refusing here is the right move — letting writers proceed under
-    # an explicit config that points at the method repo is the exact pollution path
-    # F1 was scoped to prevent.
-    if content_root == METHOD_ROOT:
+    # F1 / C2 (challenger): if content_root === method_root OR content_root is anywhere
+    # inside method_root (e.g., `<method_root>/vault`), the F1 pollution path is open —
+    # the user mis-pointed the config at the method checkout or co-located content
+    # inside it. Either way, refuse on the foundation.
+    method_resolved = METHOD_ROOT.resolve()
+    if content_root == method_resolved or content_root.is_relative_to(method_resolved):
         return _fallback(
-            f"paths.content_root resolves to the method root ({METHOD_ROOT}); "
-            f"content must live in a separate vault repo, not co-located with method"
+            f"paths.content_root resolves to {content_root}, which is at or inside the "
+            f"method root ({method_resolved}); content must live in a separate vault repo"
         )
 
     return Config(
