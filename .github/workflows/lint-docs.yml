@@ -11,6 +11,11 @@ on:
       - "docs/**/*.md"
       - "kb-templates/**/*.md"
       - "tools/lint-docs.py"
+      - "tools/harvest.py"
+      - "tools/compress.py"
+      - "tools/_config.py"
+      - "tools/bootstrap.py"
+      - ".assistant.local.json.example"
       - ".github/workflows/lint-docs.yml"
   push:
     branches: [main]
@@ -20,6 +25,11 @@ on:
       - "docs/**/*.md"
       - "kb-templates/**/*.md"
       - "tools/lint-docs.py"
+      - "tools/harvest.py"
+      - "tools/compress.py"
+      - "tools/_config.py"
+      - "tools/bootstrap.py"
+      - ".assistant.local.json.example"
       - ".github/workflows/lint-docs.yml"
 
 permissions:
