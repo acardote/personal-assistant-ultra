@@ -3,9 +3,22 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Wrapper script for the scheduled / on-demand harvest routine.
+"""On-demand / local-fallback harvest wrapper.
 
-Why a wrapper instead of the launchd plist invoking `claude -p` directly:
+Status: this script is no longer the production *primary* scheduled-harvest
+path (see #25). The primary path is now a Claude Code routine, documented at
+`templates/routines/harvest-routine.md`. This script is still the entry
+point for two non-primary uses:
+
+  - **On-demand harvests from a terminal** (e.g. "harvest since lunch")
+    that the user wants to run interactively without consuming a routine
+    slot. Invoked directly from the shell by the user.
+  - **The launchd alternative scheduler** (`templates/launchd/`). The
+    plist invokes this script — it is the body of that path, not a
+    fallback for it. Available for users on plan tiers without routine
+    access or who prefer strictly local execution.
+
+Why a wrapper instead of `claude -p` directly:
   - `claude -p` exits 0 when the session ran, regardless of what the skill
     accomplished inside. Without this wrapper, harvest-failed runs would
     not surface in any user-visible signal — exactly the F1 silent-failure
@@ -152,6 +165,7 @@ def main(argv: list[str]) -> int:
         "method_root": str(method_root),
         "content_root": str(content_root),
         "ok": False,
+        "scheduler": "launchd",
         "phase": "init",
         "error": None,
     }

@@ -1,6 +1,8 @@
-# launchd templates
+# launchd templates (alternative scheduler)
 
-Scheduled-harvest LaunchAgent for the personal-assistant skill (per [#11](https://github.com/acardote/personal-assistant-ultra/issues/11)).
+> **Read first**: the production scheduled-harvest path is now a Claude Code routine — see [`templates/routines/harvest-routine.md`](../routines/harvest-routine.md). This launchd path remains available as an **alternative** for users on tiers without routine access, or who explicitly want strictly local execution. If you have routine access, use that path; configuring both at once is not supported (they race on `git push` to the vault).
+
+Scheduled-harvest LaunchAgent for the personal-assistant skill (originally tracked in [#11](https://github.com/acardote/personal-assistant-ultra/issues/11); demoted from primary in [#25](https://github.com/acardote/personal-assistant-ultra/issues/25)).
 
 ## What the routine actually invokes
 
