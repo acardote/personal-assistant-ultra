@@ -210,6 +210,40 @@ def main(argv: list[str]) -> int:
     if "tags" not in front or front["tags"] is None:
         front["tags"] = []
 
+    # Multi-fidelity event clustering (per #10). Runs before write so the
+    # newly-landed memo carries event_id / is_canonical_for_event / superseded_by
+    # at write time, and any displaced canonical gets demoted in the same pass.
+    import dedup as _dedup
+    dedup_cfg = _dedup.load_config()
+    new_summary = _dedup.MemoSummary(
+        id=front["id"],
+        path=out_path,
+        source_kind=front["source_kind"],
+        created_at=datetime.fromisoformat(front["created_at"].replace("Z", "+00:00"))
+            if isinstance(front["created_at"], str)
+            else front["created_at"],
+        body_tokens=_dedup.tokenize(body),
+        event_id=None,
+        is_canonical_for_event=False,
+        superseded_by=None,
+    )
+    if new_summary.created_at.tzinfo is None:
+        new_summary.created_at = new_summary.created_at.replace(tzinfo=timezone.utc)
+    corpus = [m for m in _dedup.load_corpus(MEMORY_ROOT) if m.id != new_summary.id and m.path != out_path]
+    cluster = _dedup.cluster_with_existing(new_summary, corpus, dedup_cfg)
+    front["event_id"] = cluster.event_id
+    front["is_canonical_for_event"] = cluster.role == "canonical"
+    if cluster.role == "alternate":
+        # Find current canonical to point at via superseded_by.
+        members = _dedup.cluster_members(corpus, cluster.event_id)
+        flagged = next((m for m in members if m.is_canonical_for_event), None)
+        canonical = flagged or (
+            _dedup.pick_canonical(members, dedup_cfg) if members else None
+        )
+        front["superseded_by"] = canonical.id if canonical else None
+    else:
+        front["superseded_by"] = None
+
     rendered = render_memo(front, body)
 
     # Validate before writing.
@@ -226,6 +260,44 @@ def main(argv: list[str]) -> int:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(rendered, encoding="utf-8")
+
+    # If the new memo displaced an existing canonical, rewrite the demoted
+    # memo's frontmatter so it reflects its alternate status.
+    if cluster.demoted_id:
+        for m in corpus:
+            if m.id == cluster.demoted_id:
+                d_front, d_body = _dedup.parse_memo_file(m.path)
+                d_front["is_canonical_for_event"] = False
+                d_front["superseded_by"] = front["id"]
+                d_front["event_id"] = cluster.event_id  # ensure cluster membership
+                m.path.write_text(render_memo(d_front, d_body), encoding="utf-8")
+                print(f"[dedup] demoted previous canonical: {m.path}", file=sys.stderr)
+                break
+
+    # If the cluster was seeded by a legacy memo (one that had no prior
+    # event_id), backfill the seed's event_id on disk so cluster membership
+    # is queryable from frontmatter alone (per reviewer C1 on PR #20).
+    # Skip this when the seed is already the demoted canonical we just rewrote.
+    if cluster.seeded_id and cluster.seeded_id != cluster.demoted_id:
+        for m in corpus:
+            if m.id == cluster.seeded_id:
+                s_front, s_body = _dedup.parse_memo_file(m.path)
+                if not s_front.get("event_id"):
+                    s_front["event_id"] = cluster.event_id
+                    # The seed was the cluster's de-facto canonical until
+                    # this new memo arrived; preserve that role unless the
+                    # new memo took it.
+                    if cluster.role == "alternate":
+                        s_front.setdefault("is_canonical_for_event", True)
+                        s_front.setdefault("superseded_by", None)
+                    m.path.write_text(render_memo(s_front, s_body), encoding="utf-8")
+                    print(f"[dedup] backfilled event_id on seed: {m.path}", file=sys.stderr)
+                break
+
+    print(
+        f"[dedup] event_id={cluster.event_id[:12]}... role={cluster.role} score={cluster.score:.3f}",
+        file=sys.stderr,
+    )
 
     # Soft-warn on token budget (real cl100k_base count via tiktoken).
     body_tokens = count_tokens(body)

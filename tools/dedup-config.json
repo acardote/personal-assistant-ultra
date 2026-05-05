@@ -1,0 +1,24 @@
+{
+  "$schema_version": 1,
+  "$comment": "Configuration for tools/dedup.py — multi-fidelity event matching + ranked retrieval (issue #10). Per-source authority is the C-model dedup ranking agreed in chat: emailed meeting notes are most deliberate (1 = highest), followed by Slack meeting-note posts, Granola, Meet transcript, generic transcript drop. Authority numbers are absolute ranks, lower-is-better.",
+  "source_authority": {
+    "gmail_thread": 1,
+    "slack_thread_note": 2,
+    "slack_thread": 2,
+    "granola_note": 3,
+    "gmeet_transcript": 4,
+    "transcript_file": 5,
+    "doc": 3,
+    "thread": 4,
+    "note": 4,
+    "manual_note": 3,
+    "deck": 3
+  },
+  "default_authority_for_unknown_kind": 5,
+  "thresholds": {
+    "$comment": "Cluster decision uses 0.3*date_score + 0.7*cosine_score. Cluster if combined >= cluster_threshold. Bumped from 0.4 to 0.55 after PR #20 challenger reproduced an F1 false-merge at 0.511 (contradictory week-2 follow-up to a templated Q3 review). T1's same-event scores are 0.83/0.86 — well above 0.55 — so the tightening doesn't regress legitimate clustering.",
+    "date_window_days": 7,
+    "cosine_min_for_consideration": 0.2,
+    "cluster_threshold": 0.55
+  }
+}

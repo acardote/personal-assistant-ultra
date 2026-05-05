@@ -46,6 +46,10 @@ Files live under `memory/`. Subdirectories are organizational and do not carry s
 |---|---|---|
 | `title` | string | Human-readable title for retrieval display. |
 | `summary` | string | One-sentence summary distinct from the body. |
+| `event_id` | string | Cluster id from #10's multi-fidelity event matching. Memory objects representing the same real-world event share an `event_id`. Absent for unclustered items. |
+| `is_canonical_for_event` | boolean | At most one canonical per `event_id` — the highest-authority source per `tools/dedup-config.json`. Alternates have `is_canonical_for_event: false` and a `superseded_by` pointer. |
+| `superseded_by` | string | When this memory is an alternate, the id of the canonical memory in its cluster. Null/absent when canonical (or unclustered). |
+| `expiry_locked` | boolean | When true, `tools/prune.py` will NOT auto-archive this memory regardless of `expires_at`. Set when the user has manually curated this memory and wants their override preserved. F3 mitigation from #8. |
 
 Source-specific metadata (e.g., `slack_channel_id`, `gmail_thread_id`, `meet_event_id`) is allowed via `additionalProperties: true` in the JSON Schema. Adapters in children [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) and [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) define their own conventions.
 
