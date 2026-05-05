@@ -69,9 +69,15 @@ The script reads `content_root` from `.assistant.local.json` and lands the outpu
 
 Idempotent harvesters for Slack/Gmail/Granola/Meet/file-drop are tracked in [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) / [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) (orchestrated through this skill via MCPs once those reopen close); scheduled harvest in [#11](https://github.com/acardote/personal-assistant-ultra/issues/11).
 
-## Harvest orchestration (per [#11](https://github.com/acardote/personal-assistant-ultra/issues/11))
+## Harvest orchestration (per [#11](https://github.com/acardote/personal-assistant-ultra/issues/11) + [#25](https://github.com/acardote/personal-assistant-ultra/issues/25))
 
-When the user asks the skill to harvest (or the launchd routine fires `/personal-assistant harvest --since <when>`), follow this procedure source-by-source. Each source uses its MCP — Python-side Web-API and OAuth classes have been retired (#5/#6 reopen).
+The production scheduled trigger is a **Claude Code routine** — not launchd. The routine fires on Anthropic web infrastructure on its cron schedule, clones both the method and content-vault repos into its workspace, runs the orchestration below, and commits+pushes the vault. See `templates/routines/harvest-routine.md` for the canonical configuration the user creates via `/schedule`.
+
+The launchd path (`templates/launchd/`) and `tools/scheduled-harvest.py` are alternatives for users on tiers without routine access or who want local-only execution.
+
+Whether triggered by a routine, by launchd, or by an interactive Claude Code session ("/personal-assistant harvest since lunch"), the orchestration is the same — what differs is the trigger mechanism, the working-directory model, and the commit+push step (the routine's runtime handles git auth automatically; launchd inherits the user's gh; interactive sessions commit on the user's local machine).
+
+When the user asks the skill to harvest (or the routine prompt invokes the skill's orchestration), follow this procedure source-by-source. Each source uses its MCP — Python-side Web-API and OAuth classes have been retired (#5/#6 reopen).
 
 ### Slack (via Slack MCP)
 

@@ -55,7 +55,7 @@ Real content (`memory/{...}`, `kb/{people,org,decisions}.md`, `raw/`, `.harvest/
 
 ## Status
 
-The system is built and Bruno-tracked. Closed children: #2, #3, #4, #5, #6, #7, #8, #10, #12, #13, #18. In flight: #11 (scheduled harvest routine), #14 (this PR — setup docs + bootstrap), #9 (real-data eval harness — gates on harvest producing real content).
+The system is built and Bruno-tracked. Closed children: #2, #3, #4, #5, #6, #7, #8, #10, #11, #12, #13, #14, #18. In flight: #25 (migrate scheduled harvest to Claude Code routines — verified Granola+Slack+Gmail reach the routine sandbox 2026-05-05), #9 (real-data eval harness — gates on harvest producing real content).
 
 See [parent #1](https://github.com/acardote/personal-assistant-ultra/issues/1) for the live sequence map and assumption ledger.
 

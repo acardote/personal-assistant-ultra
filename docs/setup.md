@@ -92,10 +92,16 @@ If this completes without errors, your full pipeline works. The next step (live 
 
 ## Step 6 — first real harvest
 
-This step is **gated on #11** ([scheduled harvest routine](https://github.com/acardote/personal-assistant-ultra/issues/11)) which lands the skill-orchestrated MCP harvest path. Until #11 ships:
+The production scheduled trigger is a **Claude Code routine** (verified end-to-end against the auto-attached Slack/Gmail/Granola MCPs on 2026-05-05). Configure it via `/schedule` in Claude Code or at https://claude.ai/code/routines, following [`templates/routines/harvest-routine.md`](../templates/routines/harvest-routine.md) — it documents the cron, repos, MCP expectations, and the self-contained routine prompt.
 
-- File-based sources (Granola folder, Meet transcripts folder, generic transcript drop) work via `tools/harvest.py --source <granola|gmeet|transcripts> --folder <path>`.
-- MCP-based sources (Slack live, Gmail live, Granola via MCP) run inside Claude Code through the `personal-assistant` skill. Open a Claude Code session in your method-repo checkout, invoke `/personal-assistant`, and ask it to harvest.
+Once the routine is configured, you can:
+
+- Wait for the next scheduled fire, or click **Run now** in the routines UI for an immediate harvest.
+- Run on-demand harvests from your terminal with `tools/scheduled-harvest.py` — useful for "harvest since lunch" without consuming routine quota.
+
+If you're on a tier without routine access (or want strictly local execution), the launchd alternative is documented at [`templates/launchd/`](../templates/launchd/). Same orchestration, different scheduler.
+
+For ad-hoc manual harvests, you can also open a Claude Code session in your method-repo checkout, invoke `/personal-assistant`, and ask it to harvest interactively — same skill, same code path.
 
 ## Step 7 — query
 
