@@ -19,6 +19,8 @@ Tests:
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import shutil
 import subprocess
 import sys
@@ -134,6 +136,83 @@ def main() -> int:
         # Credentials still excluded unless --include-credentials also given.
         assert ".harvest/gmail-credentials.json" not in arc_names_raw
         print("  PASS — --include-raw scoops up gitignored raw/ contents (F3)\n")
+
+        # T5 — restore refuses path-traversal manifest entries (CVE-class)
+        print("Test T5 — restore refuses path-traversal manifest entries")
+        evil_archive = tmp / "evil.tar.gz"
+        with tarfile.open(evil_archive, "w:gz") as tf:
+            payload = b"malicious"
+            info = tarfile.TarInfo("../escape.md")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+            evil_manifest = {
+                "schema_version": 1,
+                "timestamp_utc": "2026-05-05T00:00:00Z",
+                "content_root_at_backup_time": "/tmp/anywhere",
+                "included_raw": False,
+                "included_credentials": False,
+                "files": [{"path": "../escape.md", "size_bytes": len(payload),
+                           "sha256": "0" * 64}],  # sha doesn't matter — path check fires first
+            }
+            mb = json.dumps(evil_manifest).encode("utf-8")
+            mi = tarfile.TarInfo("manifest.json")
+            mi.size = len(mb)
+            tf.addfile(mi, io.BytesIO(mb))
+        evil_target = tmp / "evil-target"
+        evil_target.mkdir()
+        rc, _, err = run(str(method / "tools" / "backup-content.py"),
+                         "--restore", str(evil_archive), "--target", str(evil_target), "--force")
+        print(f"  exit={rc}; stderr tail: {err.strip().splitlines()[-1] if err.strip() else '<empty>'}")
+        assert rc == 1, "expected restore to refuse path-traversal manifest"
+        assert "escapes" in err or "not safe" in err
+        # Confirm nothing was written outside target.
+        assert not (tmp / "escape.md").exists(), "PATH TRAVERSAL: file written outside target"
+        print("  PASS — path-traversal manifest correctly rejected\n")
+
+        # T6 — restore refuses tampered checksum
+        print("Test T6 — restore refuses tampered checksum")
+        # Re-use the legit archive but tamper one byte by extracting + re-tarring with bad SHA.
+        tampered_archive = tmp / "tampered.tar.gz"
+        with tarfile.open(out_path, "r:gz") as src:
+            with tarfile.open(tampered_archive, "w:gz") as dst:
+                for m in src.getmembers():
+                    data = src.extractfile(m).read() if m.isreg() else b""
+                    if m.name == "manifest.json":
+                        manifest = json.loads(data)
+                        # Flip one SHA in the manifest
+                        if manifest["files"]:
+                            manifest["files"][0]["sha256"] = "deadbeef" + "0" * 56
+                        data = json.dumps(manifest).encode("utf-8")
+                        m.size = len(data)
+                    dst.addfile(m, io.BytesIO(data) if m.isreg() else None)
+        rc, _, err = run(str(method / "tools" / "backup-content.py"),
+                         "--restore", str(tampered_archive),
+                         "--target", str(tmp / "tampered-target"), "--force")
+        print(f"  exit={rc}; stderr tail: {err.strip().splitlines()[-1] if err.strip() else '<empty>'}")
+        assert rc == 1
+        assert "checksum mismatch" in err
+        print("  PASS — tampered manifest checksum correctly rejected\n")
+
+        # T7 — restore refuses schema-version mismatch
+        print("Test T7 — restore refuses schema-version mismatch")
+        wrong_schema_archive = tmp / "wrong-schema.tar.gz"
+        with tarfile.open(out_path, "r:gz") as src:
+            with tarfile.open(wrong_schema_archive, "w:gz") as dst:
+                for m in src.getmembers():
+                    data = src.extractfile(m).read() if m.isreg() else b""
+                    if m.name == "manifest.json":
+                        manifest = json.loads(data)
+                        manifest["schema_version"] = 99
+                        data = json.dumps(manifest).encode("utf-8")
+                        m.size = len(data)
+                    dst.addfile(m, io.BytesIO(data) if m.isreg() else None)
+        rc, _, err = run(str(method / "tools" / "backup-content.py"),
+                         "--restore", str(wrong_schema_archive),
+                         "--target", str(tmp / "wrong-schema-target"), "--force")
+        print(f"  exit={rc}; stderr tail: {err.strip().splitlines()[-1] if err.strip() else '<empty>'}")
+        assert rc == 1
+        assert "schema_version" in err
+        print("  PASS — schema-version mismatch correctly rejected\n")
 
         print("=== All #13 acceptance tests passed ===")
         return 0

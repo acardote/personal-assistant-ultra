@@ -121,8 +121,14 @@ def build_manifest(spec: BackupSpec, files: list[Path]) -> dict:
 def do_backup(spec: BackupSpec) -> int:
     files = discover_files(spec)
     if not files:
-        print(f"[backup] no files to back up under {spec.content_root}", file=sys.stderr)
-        return 1
+        # Empty vault is an unusual but valid state (e.g., fresh setup) —
+        # print a warning, not an error. Manifest-only backup so restore
+        # still works. Per challenger non-blocking suggestion on PR #22.
+        print(
+            f"[backup] WARNING: no files to back up under {spec.content_root} "
+            "(creating manifest-only archive)",
+            file=sys.stderr,
+        )
     manifest = build_manifest(spec, files)
     spec.out_path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(spec.out_path, "w:gz") as tf:
@@ -142,11 +148,34 @@ def do_backup(spec: BackupSpec) -> int:
     return 0
 
 
+def _is_safe_relative_path(rel: str) -> bool:
+    """Reject manifest paths that escape the restore target.
+    Path-traversal hardening per challenger CVE-class finding on PR #22:
+    a tampered manifest with `../etc/passwd` or `/etc/passwd` must NOT
+    be written outside the target directory."""
+    if not rel:
+        return False
+    # Reject absolute paths (POSIX or Windows-drive).
+    if os.path.isabs(rel):
+        return False
+    p = Path(rel)
+    if p.is_absolute():
+        return False
+    # Reject any path with a `..` component (not just at start).
+    if any(part in ("..", "") for part in p.parts):
+        return False
+    return True
+
+
 def do_restore(archive_path: Path, target: Path, force: bool) -> int:
     if not archive_path.exists():
         print(f"[restore] archive not found: {archive_path}", file=sys.stderr)
         return 1
     target = target.resolve()
+    # Defend against target being a file (not a directory) — iterdir() would raise.
+    if target.exists() and not target.is_dir():
+        print(f"[restore] target {target} exists but is not a directory.", file=sys.stderr)
+        return 1
     if target.exists() and any(target.iterdir()) and not force:
         print(
             f"[restore] target {target} is non-empty. Refusing to extract on top of existing content. "
@@ -174,13 +203,29 @@ def do_restore(archive_path: Path, target: Path, force: bool) -> int:
                 file=sys.stderr,
             )
             return 1
+        if "files" not in manifest:
+            print("[restore] manifest is missing required 'files' key.", file=sys.stderr)
+            return 1
 
-        # Pre-validate checksums against archive contents BEFORE extracting.
-        members_by_path = {m.name: m for m in tf.getmembers()}
+        # Pre-validate ALL manifest entries (path safety, file presence, regular-file
+        # tar members, checksum) BEFORE writing anything. F2 + path-traversal hardening.
+        members_by_path = {m.name: m for m in tf.getmembers() if m.isreg()}
         for entry in manifest.get("files", []):
             rel = entry["path"]
+            if not _is_safe_relative_path(rel):
+                print(
+                    f"[restore] manifest path '{rel}' escapes target or is not safe. "
+                    "Refusing to extract.",
+                    file=sys.stderr,
+                )
+                return 1
             if rel not in members_by_path:
-                print(f"[restore] manifest references {rel} but archive doesn't contain it.", file=sys.stderr)
+                print(
+                    f"[restore] manifest references {rel} but archive doesn't contain a "
+                    f"regular-file entry by that name (could be missing, a symlink, or a "
+                    f"non-regular member — refusing).",
+                    file=sys.stderr,
+                )
                 return 1
             data = tf.extractfile(members_by_path[rel]).read()
             actual = hashlib.sha256(data).hexdigest()
@@ -192,13 +237,19 @@ def do_restore(archive_path: Path, target: Path, force: bool) -> int:
                 )
                 return 1
 
-        # Extract.
+        # Extract — all entries pre-validated as safe + present + checksum-OK.
         target.mkdir(parents=True, exist_ok=True)
         for entry in manifest.get("files", []):
             rel = entry["path"]
             member = members_by_path[rel]
             data = tf.extractfile(member).read()
-            dest = target / rel
+            dest = (target / rel).resolve()
+            # Belt-and-suspenders: re-verify the resolved dest stays inside target.
+            try:
+                dest.relative_to(target)
+            except ValueError:
+                print(f"[restore] resolved path {dest} escapes target {target}; refusing.", file=sys.stderr)
+                return 1
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
 
