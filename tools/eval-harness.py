@@ -69,8 +69,17 @@ class QuestionEval:
     blinding: dict[str, str] = field(default_factory=dict)  # blinded_label -> config
 
 
-def call_claude(prompt: str) -> str:
-    result = subprocess.run(["claude", "-p", prompt], check=True, capture_output=True, text=True)
+def call_claude(prompt: str, *, bare: bool = False) -> str:
+    """Invoke `claude -p`. With bare=True, pass `--bare` to skip CLAUDE.md
+    auto-discovery, hooks, LSP, plugin sync, auto-memory, and other context
+    inheritance. Required for the no-memory config — without it, `claude -p`
+    inherits the user's CLAUDE.md and tool access, and the resulting baseline
+    isn't actually no-memory (per #37)."""
+    cmd = ["claude", "-p"]
+    if bare:
+        cmd.append("--bare")
+    cmd.append(prompt)
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return result.stdout.strip()
 
 
@@ -84,7 +93,10 @@ def count_tokens(text: str) -> int:
 
 def run_no_memory(question: str) -> Run:
     prompt = question
-    resp = call_claude(prompt)
+    # bare=True suppresses CLAUDE.md auto-discovery, tool access, etc — without
+    # this, `claude -p` runs in the user's local environment and the baseline
+    # isn't actually no-memory (per #37).
+    resp = call_claude(prompt, bare=True)
     return Run(config="no-memory", response=resp, input_tokens=count_tokens(prompt))
 
 
