@@ -51,28 +51,33 @@ DEFAULT_GLOBS = [
     "templates/**/*.md",
 ]
 
-# Regex patterns. Each is (name, pattern, allow-when-same-line-contains).
+# Regex patterns. Each is (name, pattern, allow-when-same-line-contains, path-filter-substring).
 # Allow-terms are matched on the SAME LINE only (not the preceding 2 lines as
 # in v1). Per challenger C2 on PR #19: cross-line context allowed unrelated
 # antecedents to grant immunity to bare references nearby.
 # Allow-terms are also tightened to specific tokens (slash-prefixed or
 # multi-word phrases) so they can't be matched by incidental prose like
 # "for example" — challenger C1/C3 on PR #19.
+# Path-filter-substring (last element): if non-empty, the rule applies ONLY to
+# files whose path contains the substring. Used to scope template-only checks.
 PATTERNS = [
     (
         "kb-people",
         re.compile(r"\bkb/people\.md\b"),
         ("<content_root>/", "your vault", "kb-templates/", ".md.example", "<!-- legacy -->"),
+        "",
     ),
     (
         "kb-org",
         re.compile(r"\bkb/org\.md\b"),
         ("<content_root>/", "your vault", "kb-templates/", ".md.example", "<!-- legacy -->"),
+        "",
     ),
     (
         "kb-decisions",
         re.compile(r"\bkb/decisions\.md\b"),
         ("<content_root>/", "your vault", "kb-templates/", ".md.example", "<!-- legacy -->"),
+        "",
     ),
     # `memory/<source-kind>/` paths in user-facing docs imply the method repo.
     # Source-kind class extended to [a-z0-9_-]+ to catch hyphens (file-drop)
@@ -81,6 +86,21 @@ PATTERNS = [
         "memory-source-kind",
         re.compile(r"\bmemory/[a-z0-9_-]+/[^\s\)\]\"`]+\.md\b"),
         ("<content_root>/", "your vault", "memory/examples/", "<!-- legacy -->"),
+        "",
+    ),
+    # Hardcoded Slack user IDs in TEMPLATE files are footguns: a fork-and-forget
+    # user pastes the literal prompt and silently DMs the original maintainer
+    # instead of themselves. Templates must use `<YOUR_SLACK_USER_ID>` placeholder.
+    # Slack IDs are [UW][A-Z0-9]{8,10} (U=user, W=workspace, plus enterprise).
+    # Per #32 round-1 challenger finding.
+    # Path-filter "templates/routines/" scopes the check to routine templates only —
+    # ADRs, READMEs, and other docs may legitimately reference Slack IDs (e.g., as
+    # examples, in probe results, or in user-specific notes that aren't templates).
+    (
+        "hardcoded-slack-id-in-routine-template",
+        re.compile(r"\b[UW][A-Z0-9]{8,12}\b"),
+        ("<YOUR_SLACK_USER_ID>", "<!-- example -->", "for example", "regex", "[A-Z0-9]"),
+        "templates/routines/",
     ),
 ]
 
@@ -88,19 +108,21 @@ PATTERNS = [
 def lint_file(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
+    try:
+        path_for_filter = str(path.relative_to(METHOD_ROOT))
+    except ValueError:
+        path_for_filter = str(path)
     violations: list[str] = []
     for line_no, line in enumerate(lines, start=1):
-        for name, pattern, allow_terms in PATTERNS:
+        for name, pattern, allow_terms, path_filter in PATTERNS:
+            if path_filter and path_filter not in path_for_filter:
+                continue
             for m in pattern.finditer(line):
                 # Same-line allowance only — see PATTERNS docstring for why.
                 if any(term in line for term in allow_terms):
                     continue
-                try:
-                    disp = str(path.relative_to(METHOD_ROOT))
-                except ValueError:
-                    disp = str(path)
                 violations.append(
-                    f"{disp}:{line_no}: [{name}] {line.strip()}"
+                    f"{path_for_filter}:{line_no}: [{name}] {line.strip()}"
                 )
     return violations
 

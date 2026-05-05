@@ -8,9 +8,23 @@ The in-skill check fires only when the user starts a Claude Code session and inv
 
 Architecture:
 - **Main routine** (per `harvest-routine.md`): fires daily, runs the harvest, writes run-status JSON to the vault.
-- **Watchdog routine** (this file): fires daily at a different time, runs `tools/check-harvest-freshness.py --json`, sends Slack DM only on non-PASS states.
+- **Watchdog routine** (this file): fires daily at a different time, runs `tools/check-harvest-freshness.py --json`, sends Slack DM only on non-PASS states (plus a weekly Sunday heartbeat — see "Liveness signal" below).
 
-The two routines are independent. If the main routine stops firing entirely, the watchdog still fires and surfaces STALE/MISSING. If the watchdog itself stops firing, the in-skill check (one of the failure-detection layers) still surfaces issues when the user invokes the skill — that's the bottom of the recursion.
+The two routines are independent. If the main routine stops firing entirely, the watchdog still fires and surfaces STALE/MISSING.
+
+### Honest scope: this reduces F1, does not eliminate it
+
+This watchdog **reduces** F1 (silent failure of the harvest pipeline) — it does NOT eliminate it. There are still failure modes that escape detection:
+
+- **Watchdog itself stops firing** (auth lapse on Slack MCP, quota exhaustion, Anthropic infra blip). With the watchdog dead, the system reverts to pre-#31 behavior — the in-skill check still works on next user invocation but it inherits the same user-cadence dependency the watchdog was meant to escape. The weekly heartbeat (below) makes this detectable: if the user notices "haven't received my Sunday pulse for three weeks," that's the signal.
+- **Slack MCP misconfigured** (user deauthed Slack at the account level). Watchdog runs successfully but the DM silently fails to send. No other surface alerts. Same recursion problem one level deeper.
+- **Both routines fail simultaneously** (account-level auth lapse, account suspension). Neither fires; user discovers via /personal-assistant invocation when the in-skill check surfaces. That's the bottom of the recursion — not because there's nothing below it, but because everything below it is on the user's invocation cadence anyway.
+
+The principled framing: the watchdog reduces the worst-case silent-failure window from "bounded by user habit" (could be 7+ days) to "bounded by 24h of watchdog cadence" (assuming the watchdog works). The remaining failure modes are documented, not hidden.
+
+### Liveness signal — weekly heartbeat
+
+Pure silent-on-PASS has no positive signal that the alerting works. To address this, the watchdog **also sends a weekly heartbeat DM on Sundays** even when state is PASS — a single short "watchdog is alive" message. Six days of the week PASS is silent (no notification fatigue); on Sunday a healthy run produces a brief pulse. If the user notices the Sunday pulse hasn't arrived for two weeks running, that's a signal that the watchdog itself broke.
 
 ## Configuration
 
@@ -18,7 +32,7 @@ When you create the watchdog routine via `/schedule`, configure it as below. Arc
 
 ### Schedule
 
-- **Recurring cron**: `7 18 * * *` (daily at 18:07 UTC). The 12-hour offset from the main routine (`7 6 * * *`) means a main-routine failure at the morning fire is detected by the watchdog within 12 hours, well below the 26-hour staleness threshold. Adjust to your timezone if you want the DM at a specific local time — e.g., for 7pm Europe/Lisbon DST, use `7 18 * * *` (since UTC is 1h behind Lisbon DST, 18:07 UTC = 19:07 Lisbon).
+- **Recurring cron**: `7 18 * * *` (daily at 18:07 UTC). The 12-hour offset from the main routine (`7 6 * * *`) is a defensible default but not derived from any hard constraint — anything in the 6h–20h offset range gives reasonable detection latency. 12h was chosen because it puts the watchdog roughly in the middle of the user's awake window and gives the main routine ~12h of retry headroom before the watchdog might preemptively alert. Adjust to your timezone if you want the DM at a specific local time — e.g., for 7pm Europe/Lisbon DST, `7 18 * * *` resolves to 19:07 Lisbon (UTC+1 in DST).
 - Routines have a 1-hour minimum interval. Daily is the right cadence for this watchdog — more frequent would waste quota and produce noise.
 
 ### Linked repos
@@ -48,7 +62,7 @@ The Granola and Gmail connectors will also auto-attach (they're account-level), 
 
 ### Watchdog prompt
 
-Copy this verbatim into the routine's prompt field. Replace `U03LA1MHLG0` with your own Slack user ID if you're not the original maintainer (`mcp__claude_ai_Slack__slack_search_users` resolves it from your name or email; the slack_send_message tool's description also tells you "the current logged in user's user_id is …").
+**Before pasting**: replace `<YOUR_SLACK_USER_ID>` in the prompt below with your own Slack user ID. To find it, ask your Slack workspace settings, or in Claude Code run `slack_search_users` with your name/email — the `slack_send_message` tool's own description also tells you "the current logged in user's user_id is …" if you're already authenticated. The literal string `<YOUR_SLACK_USER_ID>` is the placeholder; do NOT paste the prompt without substituting it (see `tools/lint-docs.py` — it will refuse to lint clean if a template carries the placeholder *or* a hardcoded `U[A-Z0-9]+` in a watchdog template that isn't this one's example).
 
 ```
 Run the personal-assistant harvest watchdog.
@@ -84,7 +98,15 @@ Run the freshness check and capture its JSON output:
 
 Read the JSON. If `state` is `PASS`, exit silently — do NOT send a Slack DM, do NOT log anything beyond a confirmation line. Notification fatigue is a real failure mode for monitoring; the watchdog only speaks up when there is something to say.
 
-If `state` is anything other than `PASS` (STALE, FAILED, STUCK, STUCK_AND_STALE, MISSING, CORRUPT), send a Slack DM via `slack_send_message` to channel_id `U03LA1MHLG0` (the user's own Slack user ID — DMs to oneself work the same as DMs to any user). Format the message as:
+Determine whether to send a DM:
+
+- If `state` is anything OTHER than `PASS` (STALE, FAILED, STUCK, STUCK_AND_STALE, MISSING, CORRUPT) → send a DM with the alert template below.
+- If `state` is `PASS` AND today is Sunday (`date -u +%u` returns `7`) → send a brief weekly heartbeat DM: `*Harvest watchdog heartbeat* — state: PASS. Watchdog alive; harvest healthy.` This is the liveness signal that disambiguates "no DMs = healthy" from "no DMs = watchdog dead."
+- If `state` is `PASS` AND today is NOT Sunday → exit silently, no DM.
+
+For DMs (alert or heartbeat), use `slack_send_message` with `channel_id: <YOUR_SLACK_USER_ID>` (the user's own Slack user ID — DMs to oneself work the same as DMs to any user). Substitute the placeholder with your actual ID before pasting this prompt into `/schedule`.
+
+For the alert variant, format the message as:
 
   *Harvest watchdog alert* — state: `<state>`
   
