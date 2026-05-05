@@ -6,7 +6,16 @@
 !/raw/examples/
 !/raw/examples/**
 
-# Harvester per-source dedup state. Local-only, regeneratable from raw/.
+# Per-checkout content config (absolute paths, per-machine). Schema documented
+# in .assistant.local.json.example.
+/.assistant.local.json
+
+# Harvester local state stays excluded in Phase 1 of #12. Dedup keys today
+# include absolute filesystem paths (see harvest.py::_FolderSource.dedupe_key)
+# which are NOT cross-machine portable. Phase 2 of #12 will (a) make dedup keys
+# content-root-relative or content-hash-only, and (b) move the state files to
+# the vault repo for cross-machine consistency. Until both land, .harvest/
+# remains local-only.
 /.harvest/
 
 # Standard Python / node detritus (pre-emptive — children #3+ may add tooling).
