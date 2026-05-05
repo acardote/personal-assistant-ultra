@@ -1,7 +1,7 @@
-#!/usr/bin/env -S uv run --quiet --with tiktoken --script
+#!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["tiktoken>=0.7"]
+# dependencies = []
 # ///
 """Multi-agent router: turn one user query into advisor + adversarial critic
 (+ optional specialist) perspectives, all grounded in the layer-3 KB and
@@ -163,9 +163,8 @@ def load_memory_objects(query: str, *, max_items: int = 12) -> tuple[str, int, l
         blocks.append(f"<!-- BEGIN memory: {rel} -->\n{body}\n<!-- END memory: {rel} -->")
     rendered = "\n\n".join(blocks)
 
-    import tiktoken
-    enc = tiktoken.get_encoding("cl100k_base")
-    return rendered, len(enc.encode(rendered)), [_disp(p) for p in selected]
+    from _tokens import estimate_tokens
+    return rendered, estimate_tokens(rendered), [_disp(p) for p in selected]
 
 
 def detect_specialist(query: str) -> str | None:

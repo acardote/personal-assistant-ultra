@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --with jsonschema --with pyyaml --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["jsonschema>=4", "pyyaml>=6", "tiktoken>=0.7"]
+# dependencies = ["jsonschema>=4", "pyyaml>=6"]
 # ///
 """Compress a raw artifact (layer 1) into a memory object (layer 2).
 
@@ -125,12 +125,10 @@ def derive_memory_path(raw_path: Path, source_kind: str) -> Path:
 
 
 def count_tokens(text: str) -> int:
-    """Token count using tiktoken's cl100k_base encoding — a reasonable proxy
-    for Claude tokenization (within ~5% on natural text)."""
-    import tiktoken
+    """Character-based token estimate. See tools/_tokens.py for rationale."""
+    from _tokens import estimate_tokens
 
-    enc = tiktoken.get_encoding("cl100k_base")
-    return len(enc.encode(text))
+    return estimate_tokens(text)
 
 
 def main(argv: list[str]) -> int:
@@ -299,7 +297,7 @@ def main(argv: list[str]) -> int:
         file=sys.stderr,
     )
 
-    # Soft-warn on token budget (real cl100k_base count via tiktoken).
+    # Soft-warn on token budget (rough char-based estimate, see tools/_tokens.py).
     body_tokens = count_tokens(body)
     print(f"body tokens: {body_tokens} (budget {args.token_budget})", file=sys.stderr)
     if body_tokens > args.token_budget:

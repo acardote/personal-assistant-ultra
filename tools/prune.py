@@ -1,7 +1,7 @@
-#!/usr/bin/env -S uv run --quiet --with pyyaml --with tiktoken --script
+#!/usr/bin/env -S uv run --quiet --with pyyaml --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pyyaml>=6", "tiktoken>=0.7"]
+# dependencies = ["pyyaml>=6"]
 # ///
 """Prune expired memory objects from the retrievable layer-2 corpus into a cold archive.
 
@@ -34,11 +34,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import tiktoken
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _tokens import estimate_tokens  # noqa: E402
 
 _CFG = load_config()
 METHOD_ROOT = _CFG.method_root
@@ -46,8 +46,6 @@ MEMORY_ROOT = _CFG.memory_root
 ARCHIVE_ROOT = MEMORY_ROOT / ".archive"
 WINDOWS_PATH = METHOD_ROOT / "tools" / "expiry-windows.json"
 PROJECT_ROOT = METHOD_ROOT  # legacy alias
-
-ENCODER = tiktoken.get_encoding("cl100k_base")
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -110,7 +108,7 @@ def is_locked(front: dict) -> bool:
 
 
 def body_token_count(body: str) -> int:
-    return len(ENCODER.encode(body))
+    return estimate_tokens(body)
 
 
 # ───────────────────────────────────────────────────────────────────────

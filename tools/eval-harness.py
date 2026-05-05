@@ -1,7 +1,7 @@
-#!/usr/bin/env -S uv run --quiet --with tiktoken --with pyyaml --script
+#!/usr/bin/env -S uv run --quiet --with pyyaml --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["tiktoken>=0.7", "pyyaml>=6"]
+# dependencies = ["pyyaml>=6"]
 # ///
 """Evaluation harness for parent #1's A1: is the memory architecture the
 differentiating layer, or would vanilla long-context do as well?
@@ -41,10 +41,9 @@ import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-import tiktoken
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _tokens import estimate_tokens, truncate_to_tokens  # noqa: E402
 
 _CFG = load_config()
 METHOD_ROOT = _CFG.method_root
@@ -52,7 +51,6 @@ RAW_ROOT = _CFG.raw_root
 ROUTE_TOOL = METHOD_ROOT / "tools" / "route.py"
 ASSEMBLE_KB_TOOL = METHOD_ROOT / "tools" / "assemble-kb.py"
 PROJECT_ROOT = METHOD_ROOT  # legacy alias
-ENCODER = tiktoken.get_encoding("cl100k_base")
 
 
 @dataclass
@@ -77,7 +75,7 @@ def call_claude(prompt: str) -> str:
 
 
 def count_tokens(text: str) -> int:
-    return len(ENCODER.encode(text))
+    return estimate_tokens(text)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -129,9 +127,13 @@ def assemble_long_context(question: str, target_tokens: int) -> tuple[str, int]:
             # Truncate this block to fit if it's the first; else stop.
             remaining = target_tokens - used
             if remaining > 200 and not raw_blocks:
-                # Take the first `remaining` tokens of this block.
-                truncated_text = ENCODER.decode(ENCODER.encode(block)[:remaining])
-                raw_blocks.append(truncated_text + "\n[...truncated to fit budget]")
+                # Account for the appended suffix (~7 tokens) so the final
+                # block doesn't exceed the budget. Per round-1 reviewer
+                # suggestion #1 on PR #35.
+                suffix = "\n[...truncated to fit budget]"
+                suffix_tokens = count_tokens(suffix)
+                truncated_text = truncate_to_tokens(block, remaining - suffix_tokens)
+                raw_blocks.append(truncated_text + suffix)
                 used += remaining
             break
         raw_blocks.append(block)

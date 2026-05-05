@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["jsonschema>=4", "pyyaml>=6", "tiktoken>=0.7"]
+# dependencies = ["jsonschema>=4", "pyyaml>=6"]
 # ///
 """Harvest items from a Source into layer 1 (raw archive) and layer 2 (memory objects).
 
