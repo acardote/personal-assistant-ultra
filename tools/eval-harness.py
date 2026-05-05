@@ -43,10 +43,15 @@ from pathlib import Path
 
 import tiktoken
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_ROOT = PROJECT_ROOT / "raw"
-ROUTE_TOOL = PROJECT_ROOT / "tools" / "route.py"
-ASSEMBLE_KB_TOOL = PROJECT_ROOT / "tools" / "assemble-kb.py"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+RAW_ROOT = _CFG.raw_root
+ROUTE_TOOL = METHOD_ROOT / "tools" / "route.py"
+ASSEMBLE_KB_TOOL = METHOD_ROOT / "tools" / "assemble-kb.py"
+PROJECT_ROOT = METHOD_ROOT  # legacy alias
 ENCODER = tiktoken.get_encoding("cl100k_base")
 
 
@@ -111,7 +116,14 @@ def assemble_long_context(question: str, target_tokens: int) -> tuple[str, int]:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        block = f"<!-- raw: {path.relative_to(PROJECT_ROOT)} -->\n{text}\n"
+        try:
+            disp = str(path.relative_to(METHOD_ROOT))
+        except ValueError:
+            try:
+                disp = str(path.relative_to(_CFG.content_root))
+            except ValueError:
+                disp = str(path)
+        block = f"<!-- raw: {disp} -->\n{text}\n"
         block_tokens = count_tokens(block)
         if used + block_tokens > target_tokens:
             # Truncate this block to fit if it's the first; else stop.

@@ -37,10 +37,15 @@ from pathlib import Path
 import tiktoken
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MEMORY_ROOT = PROJECT_ROOT / "memory"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+MEMORY_ROOT = _CFG.memory_root
 ARCHIVE_ROOT = MEMORY_ROOT / ".archive"
-WINDOWS_PATH = PROJECT_ROOT / "tools" / "expiry-windows.json"
+WINDOWS_PATH = METHOD_ROOT / "tools" / "expiry-windows.json"
+PROJECT_ROOT = METHOD_ROOT  # legacy alias
 
 ENCODER = tiktoken.get_encoding("cl100k_base")
 
@@ -186,8 +191,22 @@ def report() -> dict:
                 if ea.tzinfo is None:
                     ea = ea.replace(tzinfo=timezone.utc)
                 if 0 <= (ea - now).days <= 14:
-                    expiring_soon.append(str(path.relative_to(PROJECT_ROOT)))
+                    # Display path relative to method root when possible (fallback mode);
+                    # otherwise relative to content root; otherwise absolute. The two
+                    # try blocks below are SEPARATE from the datetime parse so a path
+                    # outside both roots doesn't silently drop the expiring entry —
+                    # which was the pattern flagged in PR #17 review.
+                    try:
+                        disp = str(path.relative_to(METHOD_ROOT))
+                    except ValueError:
+                        try:
+                            disp = str(path.relative_to(_CFG.content_root))
+                        except ValueError:
+                            disp = str(path)
+                    expiring_soon.append(disp)
             except ValueError:
+                # Malformed expires_at — skip its expiry tracking but keep this
+                # entry in the corpus accounting (token total below).
                 pass
         total_tokens += body_token_count(body)
     return {

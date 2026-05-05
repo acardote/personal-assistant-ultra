@@ -6,6 +6,16 @@
 !/raw/examples/
 !/raw/examples/**
 
+# Layer 2 (memory objects). Same policy as raw: real harvest output is local-only
+# (or lives in the content vault, per #12). Only committed memory under examples/
+# is the worked example + fixture-derived test outputs.
+# This closes the F1 fire path the challenger flagged on PR #17: a fallback-mode
+# harvest writes to memory/<source-kind>/ which would otherwise be a tracked
+# directory next to the fixture outputs, indistinguishable on `git status`.
+/memory/*
+!/memory/examples/
+!/memory/examples/**
+
 # Per-checkout content config (absolute paths, per-machine). Schema documented
 # in .assistant.local.json.example.
 /.assistant.local.json

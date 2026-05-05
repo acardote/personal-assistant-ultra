@@ -48,10 +48,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_ROOT = PROJECT_ROOT / "raw"
-MEMORY_ROOT = PROJECT_ROOT / "memory"
-STATE_DIR = PROJECT_ROOT / ".harvest"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
+_CFG = load_config()
+METHOD_ROOT = _CFG.method_root
+RAW_ROOT = _CFG.raw_root
+MEMORY_ROOT = _CFG.memory_root
+STATE_DIR = _CFG.harvest_state_root
+PROJECT_ROOT = METHOD_ROOT  # legacy alias used by `derive_raw_path` etc. for relative-display
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -316,10 +321,16 @@ class _FolderSource(Source):
         return RawArtifact(content=rendered, extension=self.raw_extension, suggested_kind=self.default_kind)
 
     def dedupe_key(self, ref: ItemRef) -> str:
+        # Content-only sha, NOT path-based — making the key cross-machine portable
+        # per #12 phase 2 (challenger C3 on PR #16): including absolute paths in
+        # dedup keys leaked maintainer-machine paths into committed state and broke
+        # cross-machine consistency. The trade-off: identical-content files in two
+        # different folders dedup together, which is what we want — the same Granola
+        # export saved twice is the same memory.
         import hashlib
         path = Path(ref.meta["path"])
         sha = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-        return f"{self.name}:{path.resolve()}:{sha}"
+        return f"{self.name}:{sha}"
 
     def _render_raw(self, path: Path, content: str, ref: ItemRef) -> str:
         """Default: prepend a provenance header. Override for format-aware rendering."""
@@ -493,6 +504,16 @@ class GmailSource(Source):
 # Harvest loop
 # ───────────────────────────────────────────────────────────────────────
 
+def _disp(p: Path) -> str:
+    """Display a path relative to method root when possible; otherwise absolute.
+    Avoids ValueError when the path is outside the method root (e.g. under
+    content_root in vault mode)."""
+    try:
+        return str(p.relative_to(METHOD_ROOT))
+    except ValueError:
+        return str(p)
+
+
 def derive_raw_path(source: Source, ref: ItemRef, ext: str) -> Path:
     """Stable path under raw/<source-kind>/<title>-<id-hash>.<ext>."""
     safe_id = ref.id.replace(":", "_").replace("/", "_")
@@ -537,15 +558,15 @@ def harvest(source: Source, since: datetime, dry_run: bool = False) -> dict:
         raw_path = derive_raw_path(source, ref, raw.extension)
         memory_path = derive_memory_path(source, ref)
         if dry_run:
-            print(f"[dry-run] would write {raw_path.relative_to(PROJECT_ROOT)} and {memory_path.relative_to(PROJECT_ROOT)}", file=sys.stderr)
+            print(f"[dry-run] would write {_disp(raw_path)} and {_disp(memory_path)}", file=sys.stderr)
             continue
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(raw.content, encoding="utf-8")
         memory_path.parent.mkdir(parents=True, exist_ok=True)
         run_compress(raw_path, kind=raw.suggested_kind, source_kind=source.source_kind, out=memory_path)
-        state.seen[key] = str(memory_path.relative_to(PROJECT_ROOT))
-        summary["new_raw"].append(str(raw_path.relative_to(PROJECT_ROOT)))
-        summary["new_memory"].append(str(memory_path.relative_to(PROJECT_ROOT)))
+        state.seen[key] = _disp(memory_path)
+        summary["new_raw"].append(_disp(raw_path))
+        summary["new_memory"].append(_disp(memory_path))
     if not dry_run:
         state.save()
     return summary
