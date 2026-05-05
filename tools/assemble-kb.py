@@ -13,13 +13,18 @@ Usage:
 The output is the "always-in-context" content that the assistant should load on every
 invocation. It is the materialization of layer 3 in the three-layer memory architecture.
 
-Reproducibility: same input files → same output (file order is alphabetical; no
-timestamps or randomness in the output). This is the basis for acceptance criterion 4.
+Reads from TWO sources per #12's method/content split:
+  - method-repo: `<method_root>/kb/glossary.md` — canonical project terms
+  - content-vault: `<content_root>/kb/{people,org,decisions}.md` (+ any other user files)
+`<content_root>` is resolved via `.assistant.local.json` (see tools/_config.py); when
+absent, both fall back to method root with a loud warning so fixture/test runs still work.
+
+Per #12's challenger F2 ("split-source unreachability must error loudly, not silently
+truncate"), the assembler ALSO refuses to produce output if the user's vault is
+configured but the kb_content_root or kb_method_glossary is unreachable.
 
 The token budget (4K, configurable via --budget) is intended to actively force signal/
-noise tradeoffs in KB curation. If the budget is routinely hit and contributors compress
-load-bearing content, OR is never approached and KB drifts to a dumping ground, falsifier
-F3 on issue #4 fires and the budget design is wrong.
+noise tradeoffs in KB curation.
 """
 
 from __future__ import annotations
@@ -31,8 +36,10 @@ from pathlib import Path
 
 import tiktoken
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-KB_DIR = PROJECT_ROOT / "kb"
+# Local import; sibling of this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _config import load_config  # noqa: E402
+
 DEFAULT_BUDGET = 4_000
 
 # Order is alphabetical for reproducibility, but we hoist 'people' first
@@ -41,14 +48,41 @@ DEFAULT_BUDGET = 4_000
 PRIORITY_ORDER = ("people.md", "org.md", "decisions.md", "glossary.md")
 
 
-def discover_kb_files() -> list[Path]:
-    files = sorted(p for p in KB_DIR.glob("*.md") if p.is_file())
-    in_priority = [KB_DIR / name for name in PRIORITY_ORDER if (KB_DIR / name).exists()]
+def discover_kb_files(content_kb: Path, method_glossary: Path) -> tuple[list[Path], list[str]]:
+    """Return (files_in_priority_order, errors). Errors are non-empty when split-source
+    invariant is violated (per F2): the configured kb directory or the method glossary is
+    unreachable when content_root is explicitly configured.
+    """
+    errors: list[str] = []
+
+    # Method glossary is mandatory if it doesn't exist in the method repo
+    # (i.e. we expect kb/glossary.md to be a committed file). This catches the
+    # "user moved kb/ wholesale into the vault and forgot to leave glossary in method".
+    if not method_glossary.exists():
+        errors.append(f"method-canonical glossary missing at {method_glossary}")
+
+    # Content kb is reachable as long as the directory exists. We don't require
+    # specific files (people.md, org.md, etc.) so the user can curate freely.
+    if not content_kb.exists() or not content_kb.is_dir():
+        errors.append(f"content kb directory missing at {content_kb}")
+
+    files: list[Path] = []
+    if content_kb.is_dir():
+        # Files from content_root/kb (excluding glossary.md if present in vault — method's wins)
+        for path in sorted(content_kb.glob("*.md")):
+            if path.is_file() and path.name != "glossary.md":
+                files.append(path)
+    if method_glossary.exists():
+        files.append(method_glossary)
+
+    # Apply priority order
+    by_name = {p.name: p for p in files}
+    in_priority = [by_name[name] for name in PRIORITY_ORDER if name in by_name]
     rest = [p for p in files if p.name not in PRIORITY_ORDER]
-    return in_priority + rest
+    return in_priority + rest, errors
 
 
-def render(files: list[Path]) -> str:
+def render(files: list[Path], method_root: Path, content_root: Path) -> str:
     sections: list[str] = [
         "# Personal-Assistant Knowledge Base (layer 3)",
         "",
@@ -58,9 +92,19 @@ def render(files: list[Path]) -> str:
         "Never invent KB entries — if a fact isn't here, say so.",
         "",
     ]
+
+    def _disp(p: Path) -> str:
+        try:
+            return f"method:{p.relative_to(method_root)}"
+        except ValueError:
+            try:
+                return f"content:{p.relative_to(content_root)}"
+            except ValueError:
+                return str(p)
+
     for path in files:
         text = path.read_text(encoding="utf-8").rstrip() + "\n"
-        rel = path.relative_to(PROJECT_ROOT)
+        rel = _disp(path)
         sections.append(f"<!-- BEGIN kb-file: {rel} -->")
         sections.append(text)
         sections.append(f"<!-- END kb-file: {rel} -->")
@@ -78,29 +122,60 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--check", action="store_true", help="Exit 1 if the budget is exceeded.")
     parser.add_argument("--json", action="store_true", help="Output JSON with metadata.")
     parser.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="Token budget (default 4000).")
+    parser.add_argument("--strict-config", action="store_true", help="Refuse to fall back to method root when .assistant.local.json is missing/malformed (per #12 F2).")
     args = parser.parse_args(argv[1:])
 
-    files = discover_kb_files()
-    if not files:
-        print(f"no kb files found under {KB_DIR}", file=sys.stderr)
+    cfg = load_config(require_explicit_content_root=args.strict_config)
+    content_kb = cfg.kb_content_root
+    method_glossary = cfg.kb_method_glossary
+
+    files, errors = discover_kb_files(content_kb, method_glossary)
+
+    # Per #12 F2: if either source is unreachable AND we have an explicit config,
+    # refuse to produce output. If we're in fallback mode (no config), the warning
+    # was already emitted by load_config; we still try to assemble what we can find.
+    if cfg.config_source == "file" and errors:
+        for e in errors:
+            print(f"[assemble-kb] ERROR: {e}", file=sys.stderr)
+        print("[assemble-kb] refusing to assemble a partial KB when config is explicit (#12 F2).", file=sys.stderr)
         return 1
 
-    rendered = render(files)
+    if not files:
+        if errors:
+            for e in errors:
+                print(f"[assemble-kb] ERROR: {e}", file=sys.stderr)
+        print(f"[assemble-kb] no kb files found", file=sys.stderr)
+        return 1
+
+    rendered = render(files, cfg.method_root, cfg.content_root)
     tokens = count_tokens(rendered)
+
+    def _disp(p: Path) -> str:
+        try:
+            return f"method:{p.relative_to(cfg.method_root)}"
+        except ValueError:
+            try:
+                return f"content:{p.relative_to(cfg.content_root)}"
+            except ValueError:
+                return str(p)
 
     if args.json:
         payload = {
-            "files": [str(p.relative_to(PROJECT_ROOT)) for p in files],
+            "files": [_disp(p) for p in files],
             "token_count": tokens,
             "budget": args.budget,
             "within_budget": tokens <= args.budget,
+            "config_source": cfg.config_source,
+            "method_root": str(cfg.method_root),
+            "content_root": str(cfg.content_root),
             "rendered": rendered,
         }
         print(json.dumps(payload, indent=2))
     else:
         print(rendered)
         print(
-            f"\n[assemble-kb] {len(files)} files, {tokens} tokens (budget {args.budget})",
+            f"\n[assemble-kb] {len(files)} files, {tokens} tokens (budget {args.budget}); "
+            f"config={cfg.config_source} content_root={cfg.content_root}",
             file=sys.stderr,
         )
 

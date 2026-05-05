@@ -1,0 +1,7 @@
+{
+  "$schema_version": 1,
+  "$comment": "Per-checkout config for the personal-assistant tools. COPY this file to '.assistant.local.json' (gitignored) and edit `paths.content_root` to point at your vault checkout. Do NOT commit the real .assistant.local.json — it is per-machine and contains absolute paths. See tools/_config.py for the loader.",
+  "paths": {
+    "content_root": "/Users/<you>/Projects/<your>-pa-vault"
+  }
+}

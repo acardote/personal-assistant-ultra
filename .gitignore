@@ -6,8 +6,15 @@
 !/raw/examples/
 !/raw/examples/**
 
-# Harvester per-source dedup state. Local-only, regeneratable from raw/.
-/.harvest/
+# Per-checkout content config (absolute paths, per-machine). Schema documented
+# in .assistant.local.json.example.
+/.assistant.local.json
+
+# Harvester credentials only. Dedup state + allow/deny lists + daily digests
+# ARE tracked (in the vault) so cross-machine harvest stays consistent.
+.harvest/*-credentials.json
+.harvest/*-token.json
+.harvest/*-credentials/
 
 # Standard Python / node detritus (pre-emptive — children #3+ may add tooling).
 __pycache__/
