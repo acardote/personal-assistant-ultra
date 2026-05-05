@@ -6,15 +6,29 @@ name: lint-docs
 on:
   pull_request:
     paths:
-      - ".claude/skills/**/SKILL.md"
-      - "README.md"
+      - ".claude/skills/**/*.md"
+      - "*.md"
       - "docs/**/*.md"
+      - "kb-templates/**/*.md"
       - "tools/lint-docs.py"
       - ".github/workflows/lint-docs.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".claude/skills/**/*.md"
+      - "*.md"
+      - "docs/**/*.md"
+      - "kb-templates/**/*.md"
+      - "tools/lint-docs.py"
+      - ".github/workflows/lint-docs.yml"
+
+permissions:
+  contents: read
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

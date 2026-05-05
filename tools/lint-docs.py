@@ -37,41 +37,49 @@ from pathlib import Path
 
 METHOD_ROOT = Path(__file__).resolve().parent.parent
 
-# Default doc-file globs to lint. SKILL.md is the load-bearing one; README and docs/
-# are the broader user-facing surface.
+# Default doc-file globs. Covers all user-facing markdown surfaces:
+#   - SKILL.md and any sibling docs in skill directories
+#   - All top-level markdown (README.md, CLAUDE.md, CONTRIBUTING.md, ...)
+#   - docs/
+#   - kb-templates/ (templates legitimately reference kb/<file>.md but always
+#     same-line-qualified with "your vault" — caught by allow rule)
 DEFAULT_GLOBS = [
-    ".claude/skills/**/SKILL.md",
-    "README.md",
+    ".claude/skills/**/*.md",
+    "*.md",
     "docs/**/*.md",
+    "kb-templates/**/*.md",
 ]
 
-# Regex patterns. Each is (name, pattern, allow-when-context-contains).
-# `allow-when-context-contains` is a substring whose presence in the same line
-# (or the previous 2 lines) marks the reference as intentionally qualified —
-# e.g. "<content_root>/kb/people.md" or "in your vault".
+# Regex patterns. Each is (name, pattern, allow-when-same-line-contains).
+# Allow-terms are matched on the SAME LINE only (not the preceding 2 lines as
+# in v1). Per challenger C2 on PR #19: cross-line context allowed unrelated
+# antecedents to grant immunity to bare references nearby.
+# Allow-terms are also tightened to specific tokens (slash-prefixed or
+# multi-word phrases) so they can't be matched by incidental prose like
+# "for example" — challenger C1/C3 on PR #19.
 PATTERNS = [
     (
         "kb-people",
         re.compile(r"\bkb/people\.md\b"),
-        ("<content_root>", "in your vault", "kb-templates", ".example"),
+        ("<content_root>/", "your vault", "kb-templates/", ".md.example", "<!-- legacy -->"),
     ),
     (
         "kb-org",
         re.compile(r"\bkb/org\.md\b"),
-        ("<content_root>", "in your vault", "kb-templates", ".example"),
+        ("<content_root>/", "your vault", "kb-templates/", ".md.example", "<!-- legacy -->"),
     ),
     (
         "kb-decisions",
         re.compile(r"\bkb/decisions\.md\b"),
-        ("<content_root>", "in your vault", "kb-templates", ".example"),
+        ("<content_root>/", "your vault", "kb-templates/", ".md.example", "<!-- legacy -->"),
     ),
     # `memory/<source-kind>/` paths in user-facing docs imply the method repo.
-    # Allow when explicitly content-rooted, fixture-pathed (memory/examples/), or
-    # tagged as a legacy reference.
+    # Source-kind class extended to [a-z0-9_-]+ to catch hyphens (file-drop)
+    # and digits — challenger S1 on PR #19.
     (
         "memory-source-kind",
-        re.compile(r"\bmemory/[a-z_]+/[^\s\)\]\"`]+\.md\b"),
-        ("<content_root>", "in your vault", "memory/examples/", "<!-- legacy -->"),
+        re.compile(r"\bmemory/[a-z0-9_-]+/[^\s\)\]\"`]+\.md\b"),
+        ("<content_root>/", "your vault", "memory/examples/", "<!-- legacy -->"),
     ),
 ]
 
@@ -81,13 +89,10 @@ def lint_file(path: Path) -> list[str]:
     lines = text.splitlines()
     violations: list[str] = []
     for line_no, line in enumerate(lines, start=1):
-        # Context window: this line + 2 preceding (allows stating a "vault" framing
-        # in the sentence before the reference).
-        ctx_lines = lines[max(0, line_no - 3) : line_no]
-        ctx = "\n".join(ctx_lines)
         for name, pattern, allow_terms in PATTERNS:
             for m in pattern.finditer(line):
-                if any(term in ctx for term in allow_terms):
+                # Same-line allowance only — see PATTERNS docstring for why.
+                if any(term in line for term in allow_terms):
                     continue
                 try:
                     disp = str(path.relative_to(METHOD_ROOT))
@@ -136,8 +141,9 @@ def main(argv: list[str]) -> int:
         print(f"  {v}", file=sys.stderr)
     print(
         "\n[lint-docs] These references imply user content lives in the method repo. "
-        "Qualify with `<content_root>/kb/...` / `in your vault` / `memory/examples/` "
-        "/ `<!-- legacy -->`, or remove. See #18 for the policy.",
+        "Qualify (on the SAME line as the path) with one of: `<content_root>/...`, "
+        "`your vault`, `kb-templates/...`, `.md.example`, `memory/examples/...`, or "
+        "`<!-- legacy -->`. Or remove the reference. See #18 for the policy.",
         file=sys.stderr,
     )
     return 1
