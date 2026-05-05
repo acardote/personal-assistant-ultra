@@ -70,17 +70,21 @@ class Config:
         return self.method_root / "kb" / "glossary.md"
 
 
-def _emit_fallback_warning(reason: str, expected_path: Path) -> None:
+def _emit_fallback_warning(reason: str, expected_path: Path, *, config_existed: bool) -> None:
     """Loud, hard-to-miss stderr warning. Per F1: silent fallback is the failure mode."""
     bar = "=" * 78
     print(f"\n{bar}", file=sys.stderr)
-    print(f"WARNING: personal-assistant config fallback in effect", file=sys.stderr)
+    print("WARNING: personal-assistant config fallback in effect", file=sys.stderr)
     print(f"  reason: {reason}", file=sys.stderr)
     print(f"  expected: {expected_path}", file=sys.stderr)
     print(f"  falling back to: content_root = method_root = {METHOD_ROOT}", file=sys.stderr)
-    print(f"  This is OK for fixtures / tests; NOT OK for real harvest.", file=sys.stderr)
-    print(f"  To set up: copy .assistant.local.json.example to .assistant.local.json", file=sys.stderr)
-    print(f"  and edit `paths.content_root` to point at your vault checkout.", file=sys.stderr)
+    print("  This is OK for fixtures / tests; NOT OK for real harvest.", file=sys.stderr)
+    if config_existed:
+        print("  Your .assistant.local.json was found but is invalid — fix it (do not", file=sys.stderr)
+        print("  re-copy from the example, that would clobber any other settings).", file=sys.stderr)
+    else:
+        print("  To set up: copy .assistant.local.json.example to .assistant.local.json", file=sys.stderr)
+        print("  and edit `paths.content_root` to point at your vault checkout.", file=sys.stderr)
     print(f"{bar}\n", file=sys.stderr)
 
 
@@ -95,6 +99,7 @@ def load_config(*, require_explicit_content_root: bool = False) -> Config:
       - all good                            -> return Config(content_root=resolved path)
     """
     config_path = METHOD_ROOT / CONFIG_FILENAME
+    config_existed_at_start = config_path.exists()
 
     def _fallback(reason: str) -> Config:
         if require_explicit_content_root:
@@ -103,7 +108,7 @@ def load_config(*, require_explicit_content_root: bool = False) -> Config:
                 f"Create .assistant.local.json (see .assistant.local.json.example) and set "
                 f"paths.content_root."
             )
-        _emit_fallback_warning(reason, config_path)
+        _emit_fallback_warning(reason, config_path, config_existed=config_existed_at_start)
         return Config(
             method_root=METHOD_ROOT,
             content_root=METHOD_ROOT,
@@ -111,7 +116,7 @@ def load_config(*, require_explicit_content_root: bool = False) -> Config:
             config_path=config_path,
         )
 
-    if not config_path.exists():
+    if not config_existed_at_start:
         return _fallback(f"{CONFIG_FILENAME} not found at method root")
 
     try:
@@ -127,10 +132,30 @@ def load_config(*, require_explicit_content_root: bool = False) -> Config:
     if not raw_content_root or not isinstance(raw_content_root, str):
         return _fallback(f"{CONFIG_FILENAME} is missing paths.content_root")
 
-    content_root = Path(os.path.expanduser(raw_content_root)).resolve()
+    # Reject relative paths early — almost always a misconfiguration (per challenger
+    # suggestion S1 on PR #16): relative paths resolve against process cwd, which is
+    # the F3 portability hazard the per-checkout config is meant to avoid.
+    expanded = os.path.expanduser(raw_content_root)
+    if not (os.path.isabs(expanded) or expanded.startswith("~")):
+        return _fallback(
+            f"paths.content_root must be absolute or ~-prefixed; got '{raw_content_root}'"
+        )
+    content_root = Path(expanded).resolve()
+
     if not content_root.is_dir():
         return _fallback(
             f"paths.content_root resolves to {content_root} which is not an existing directory"
+        )
+
+    # F1 / C2 (challenger): if content_root === method_root, the user has either
+    # mis-pointed the config at the method checkout or hasn't set up a vault yet.
+    # Either way, refusing here is the right move — letting writers proceed under
+    # an explicit config that points at the method repo is the exact pollution path
+    # F1 was scoped to prevent.
+    if content_root == METHOD_ROOT:
+        return _fallback(
+            f"paths.content_root resolves to the method root ({METHOD_ROOT}); "
+            f"content must live in a separate vault repo, not co-located with method"
         )
 
     return Config(

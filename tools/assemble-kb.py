@@ -51,7 +51,9 @@ PRIORITY_ORDER = ("people.md", "org.md", "decisions.md", "glossary.md")
 def discover_kb_files(content_kb: Path, method_glossary: Path) -> tuple[list[Path], list[str]]:
     """Return (files_in_priority_order, errors). Errors are non-empty when split-source
     invariant is violated (per F2): the configured kb directory or the method glossary is
-    unreachable when content_root is explicitly configured.
+    unreachable, OR the user-content side of the split has zero non-glossary files
+    (challenger C1: empty content_kb is the same silent-truncation failure F2 was
+    scoped to catch).
     """
     errors: list[str] = []
 
@@ -61,19 +63,29 @@ def discover_kb_files(content_kb: Path, method_glossary: Path) -> tuple[list[Pat
     if not method_glossary.exists():
         errors.append(f"method-canonical glossary missing at {method_glossary}")
 
-    # Content kb is reachable as long as the directory exists. We don't require
-    # specific files (people.md, org.md, etc.) so the user can curate freely.
     if not content_kb.exists() or not content_kb.is_dir():
         errors.append(f"content kb directory missing at {content_kb}")
 
     files: list[Path] = []
+    content_files: list[Path] = []
     if content_kb.is_dir():
         # Files from content_root/kb (excluding glossary.md if present in vault — method's wins)
         for path in sorted(content_kb.glob("*.md")):
             if path.is_file() and path.name != "glossary.md":
-                files.append(path)
+                content_files.append(path)
+    files.extend(content_files)
     if method_glossary.exists():
         files.append(method_glossary)
+
+    # C1 (challenger): empty content_kb directory → silently-truncated KB. Treat as
+    # an error so callers under explicit config refuse rather than producing a
+    # glossary-only output that's indistinguishable from "fully assembled".
+    if content_kb.is_dir() and not content_files:
+        errors.append(
+            f"content kb directory at {content_kb} contains no non-glossary files; "
+            f"expected user content like people.md / org.md / decisions.md — "
+            f"did you forget to migrate or author them?"
+        )
 
     # Apply priority order
     by_name = {p.name: p for p in files}
