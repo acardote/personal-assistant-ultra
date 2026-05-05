@@ -48,6 +48,7 @@ DEFAULT_GLOBS = [
     "*.md",
     "docs/**/*.md",
     "kb-templates/**/*.md",
+    "templates/**/*.md",
 ]
 
 # Regex patterns. Each is (name, pattern, allow-when-same-line-contains).

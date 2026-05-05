@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template launchd plist for the personal-assistant scheduled harvest routine.
+  See templates/launchd/README.md for installation instructions and rationale.
+
+  Replace the three placeholders before installing:
+    __YOUR_USERNAME__          your macOS short username (e.g. "acardote")
+    <PATH_TO_CLAUDE>         absolute path to the `claude` binary (typically
+                             `/Users/__YOUR_USERNAME__/.local/bin/claude`)
+    <PATH_TO_METHOD_REPO>    absolute path of your method-repo checkout
+                             (typically `/Users/__YOUR_USERNAME__/Projects/personal-assistant-ultra`)
+
+  After replacing, copy to ~/Library/LaunchAgents/ and run:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.acardote.personal-assistant-harvest.plist
+
+  See README.md in this directory for the full installation walkthrough.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.acardote.personal-assistant-harvest</string>
+
+    <!-- Invoke the wrapper script (NOT claude -p directly). The wrapper
+         acquires an fcntl lock, runs claude -p, captures structured run
+         status under .harvest/runs/, and commits+pushes the vault on
+         success. Without it, claude -p's exit 0 doesn't reflect harvest
+         outcome (challenger F1 on PR #24); the wrapper closes that. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PATH_TO_METHOD_REPO__/tools/scheduled-harvest.py</string>
+    </array>
+
+    <!-- Run from the method-repo checkout so relative paths resolve via _config.py -->
+    <key>WorkingDirectory</key>
+    <string>__PATH_TO_METHOD_REPO__</string>
+
+    <!-- Daily 7:07am local. Off-the-hour minute (7) reduces API stampede risk
+         per the schedule skill's anti-stampede guidance. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>7</integer>
+    </dict>
+
+    <!-- Default to firing on load (login/wake/boot) AND at the scheduled
+         minute. macOS's StartCalendarInterval may NOT auto-fire missed
+         windows after long sleep, so RunAtLoad: true is the belt to the
+         scheduled-interval suspenders. Trade-off: this also fires on
+         every reboot mid-day, which the wrapper's idempotency-via-flock +
+         dedup-state design tolerates (no duplicate harvests). If your
+         flow is different, flip to <false/>. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Streams stdout + stderr to a log file under ~/Library/Logs/.
+         Inspect via: tail -f ~/Library/Logs/personal-assistant-harvest.log -->
+    <key>StandardOutPath</key>
+    <string>/Users/__YOUR_USERNAME__/Library/Logs/personal-assistant-harvest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__YOUR_USERNAME__/Library/Logs/personal-assistant-harvest.log</string>
+
+    <!-- Don't restart on failure (a failed harvest writes an error to the
+         daily digest and we want to investigate, not loop). -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
