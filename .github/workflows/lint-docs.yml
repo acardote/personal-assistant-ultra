@@ -1,0 +1,23 @@
+name: lint-docs
+
+# Catches stale method/content references in user-facing docs (per #18 F3).
+# Runs on PRs that touch SKILL.md, README, or docs/.
+
+on:
+  pull_request:
+    paths:
+      - ".claude/skills/**/SKILL.md"
+      - "README.md"
+      - "docs/**/*.md"
+      - "tools/lint-docs.py"
+      - ".github/workflows/lint-docs.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Run lint-docs
+        run: tools/lint-docs.py

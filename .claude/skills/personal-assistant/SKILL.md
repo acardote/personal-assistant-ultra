@@ -7,13 +7,24 @@ description: Personal assistant grounded in the layer-3 knowledge base — peopl
 
 A Claude Code skill implementing the three-layer memory architecture defined in [issue #1](https://github.com/acardote/personal-assistant-ultra/issues/1) (Sei's "Your AI Assistant Has Amnesia" model adapted to a personal context).
 
+## Method vs. content (per [#12](https://github.com/acardote/personal-assistant-ultra/issues/12))
+
+This skill operates against **two repos**:
+
+- **Method repo** (`acardote/personal-assistant-ultra`): code, schemas, prompts, ADRs, **`kb/glossary.md`** (canonical project terms). The skill itself lives here.
+- **Content vault** (`getnexar/acardote-pa-vault`): your real `memory/`, `kb/{people,org,decisions}.md`, `.harvest/` state, `raw/`. Per-checkout location resolved from `<method-root>/.assistant.local.json`'s `paths.content_root`.
+
+Tools resolve paths via `tools/_config.py`. When `.assistant.local.json` is missing or malformed, tools emit a LOUD stderr warning and fall back to the method root (OK for fixtures/tests; **NOT OK for real harvest** — it's the F1 pollution path #12 was scoped to close). Setup: copy `.assistant.local.json.example` → `.assistant.local.json` and edit `paths.content_root` to point at your vault checkout. End-to-end setup walkthrough lives in [#14](https://github.com/acardote/personal-assistant-ultra/issues/14)'s deliverables (`docs/setup.md` + `tools/bootstrap.py`).
+
 ## What "always in context" means here
 
-The layer-3 knowledge base under `kb/` is the assistant's ground truth on the user, the user's org, the user's durable decisions, and project-specific terms. It must be loaded on every invocation. Three layers:
+The layer-3 knowledge base is the assistant's ground truth on the user, the user's org, the user's durable decisions, and project-specific terms. It must be loaded on every invocation.
 
-1. **Layer 1 — `raw/`** (mostly git-ignored): unmodified raw artifacts. NOT loaded directly into context.
-2. **Layer 2 — `memory/`** (git-tracked): editorially compressed memory objects. Loaded selectively per query (retrieval logic to be filled in by [#7](https://github.com/acardote/personal-assistant-ultra/issues/7)'s router).
-3. **Layer 3 — `kb/`** (git-tracked): always loaded. People, org, decisions, glossary. Token budget ≤4K total.
+| Layer | Lives at | Tracked? | What it holds |
+|---|---|---|---|
+| **Layer 1 — raw archive** | `<content_root>/raw/` | local-only by default (PII) | Unmodified raw artifacts (Slack threads, Gmail bodies, Meet transcripts). NOT loaded directly into context. |
+| **Layer 2 — memory objects** | `<content_root>/memory/` | vault-tracked (real harvest); method's `memory/examples/` holds fixture-derived test outputs only | Editorially compressed memory objects. Loaded selectively per query (retrieval in `tools/route.py`; ranked retrieval in [#10](https://github.com/acardote/personal-assistant-ultra/issues/10)). |
+| **Layer 3 — split** | `<method_root>/kb/glossary.md` (canonical project terms) + `<content_root>/kb/{people,org,decisions}.md` (your content) | both tracked | Always loaded. Combined assembly via `tools/assemble-kb.py`. Token budget ≤4K total. |
 
 ## Activation contract — load layer 3 first
 
@@ -23,34 +34,47 @@ When this skill is invoked, your **first action** is to load layer-3 by running:
 tools/assemble-kb.py
 ```
 
-(executed from the project root). The output is the user's ground truth. Treat its content as authoritative for facts about the user, the user's people, the user's org, the user's durable decisions, and project-specific terms. Quote KB entries by their `## <heading>` when citing.
+(executed from the method-repo root). The output is the user's ground truth — combined from method-side `kb/glossary.md` and content-side `<content_root>/kb/{people,org,decisions}.md`. Treat its content as authoritative for facts about the user, the user's people, the user's org, the user's durable decisions, and project-specific terms. Quote KB entries by their `## <heading>` when citing.
 
-Do not proceed with the user's request until layer 3 is loaded into your working context. If `tools/assemble-kb.py` fails or produces empty output, surface the failure to the user and stop — operating without layer 3 violates the "always-in-context" invariant on issue #4.
+Do not proceed with the user's request until layer 3 is loaded into your working context. If `tools/assemble-kb.py` fails or produces empty output, surface the failure to the user and stop — operating without layer 3 violates the "always-in-context" invariant on issue #4. If `.assistant.local.json` is missing, the assembler will emit a loud warning + fall back to method-root: that's fixture/test mode, not production; if you see the warning during a real session, **stop and tell the user to set up the config** before proceeding.
 
 ## Editorial discipline
 
 - **Never invent KB entries.** If the user asks about something that isn't in the KB and isn't derivable from layer-2 memory objects (when retrieval lands), say so explicitly. Hallucinated grounding is the failure mode that poisons every downstream consumer (see falsifier F2 on issue #3 / #4).
 - **Cite the KB.** When a claim about the user, their org, or a durable decision rests on a KB entry, mention which file/heading it came from. This makes drift detectable.
-- **Honor the Bruno Method discipline** documented in `kb/decisions.md`. Don't propose closing claims without reconciliation against landed state; don't accept work without explicit falsifiers.
+- **Honor the Bruno Method discipline.** Method-architectural decisions live in `<method_root>/docs/adr/*` (immutable, ADR-style); user-domain durable decisions live in `<content_root>/kb/decisions.md`. Don't propose closing claims without reconciliation against landed state; don't accept work without explicit falsifiers.
 
 ## How to extend the KB
 
-- Add or revise entries by editing `kb/people.md`, `kb/org.md`, `kb/decisions.md`, `kb/glossary.md`.
-- Each entry should carry `Last verified` and `Expires` metadata. The expiry-rules child ([#8](https://github.com/acardote/personal-assistant-ultra/issues/8)) will operationalize automatic decay.
-- After editing, run `tools/assemble-kb.py --check` to verify the 4K token budget is still respected.
+The KB is split between method (canonical project terms) and content vault (user-specific). Edit the right side based on what you're adding:
+
+- **Add a person, org/team entry, or durable user decision** — edit the file in your content vault, NOT the method repo:
+  - `<content_root>/kb/people.md`
+  - `<content_root>/kb/org.md`
+  - `<content_root>/kb/decisions.md`
+  - If you don't have these files yet, copy `<method_root>/kb-templates/{people,org,decisions}.md.example` into `<content_root>/kb/` as a starting scaffolding.
+- **Update a project-specific term** (e.g., a glossary definition like "memory object", "harvester") — edit `<method_root>/kb/glossary.md`. These are method-canonical; everyone using the skill should share the same definitions.
+
+After editing either side, run `tools/assemble-kb.py --check` from the method-repo root to verify the 4K token budget is still respected.
 
 ## How to add memory objects
 
-The compression pipeline lives at `tools/compress.py` (see [issue #3](https://github.com/acardote/personal-assistant-ultra/issues/3)). Run:
+The compression pipeline lives at `<method_root>/tools/compress.py` (see [issue #3](https://github.com/acardote/personal-assistant-ultra/issues/3)). Run from the method-repo root:
 
 ```
-tools/compress.py raw/<source-kind>/<artifact>.md --kind <strategy|weekly|...>
+tools/compress.py <content_root>/raw/<source-kind>/<artifact>.md --kind <strategy|weekly|...>
 ```
 
-to ingest a raw artifact and land its memory object under `memory/`. Idempotent harvesters for Slack/Gmail/Granola/Meet/file-drop are tracked in [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) / [#6](https://github.com/acardote/personal-assistant-ultra/issues/6).
+The script reads `content_root` from `.assistant.local.json` and lands the output at `<content_root>/memory/<source-kind>/...`. With config missing it falls back to method's `memory/` with a loud warning — same fixture/test caveat as above.
+
+Idempotent harvesters for Slack/Gmail/Granola/Meet/file-drop are tracked in [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) / [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) (orchestrated through this skill via MCPs once those reopen close); scheduled harvest in [#11](https://github.com/acardote/personal-assistant-ultra/issues/11).
 
 ## Open extensions
 
-- Multi-agent router with adversarial critic: [#7](https://github.com/acardote/personal-assistant-ultra/issues/7).
-- Per-document-type expiry rules: [#8](https://github.com/acardote/personal-assistant-ultra/issues/8).
+- Multi-fidelity event matching + ranked retrieval: [#10](https://github.com/acardote/personal-assistant-ultra/issues/10).
+- Slack/Gmail/Granola/Meet via MCPs (skill orchestration): [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) + [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) reopens.
+- Scheduled harvest routine + daily digest: [#11](https://github.com/acardote/personal-assistant-ultra/issues/11).
+- Per-document-type expiry rules: [#8](https://github.com/acardote/personal-assistant-ultra/issues/8) (closed; integrated).
+- Backup/migrate tooling: [#13](https://github.com/acardote/personal-assistant-ultra/issues/13).
+- Setup docs + bootstrap: [#14](https://github.com/acardote/personal-assistant-ultra/issues/14).
 - Evaluation harness: [#9](https://github.com/acardote/personal-assistant-ultra/issues/9).
