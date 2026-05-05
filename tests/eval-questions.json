@@ -1,67 +1,160 @@
 {
-  "_README": "These are PLACEHOLDER questions. Per acceptance criterion 1 of issue #9, the real evaluation requires 10 questions the user actually asks recurringly today, frozen BEFORE running the harness. The user must replace these with real questions before treating the harness output as evidence for or against A1 ('architecture > model'). Falsifier F1 specifically requires each question to be traceable to ≥2 prior occurrences in the user's chat/search/note history.",
-  "_status": "PLACEHOLDER — awaiting user's real recurring questions",
-  "_frozen_date": null,
+  "_README": "These are the 10 frozen real recurring questions for the evaluation harness (#9). Per acceptance criterion 1, this set was agreed in chat and locked here on the date below; do NOT edit ad-hoc — changes invalidate the harness's prior-run comparability. Per F1 from challenger, each question carries `_recurring_evidence` pointing at ≥2 prior occurrences in the user's actual working corpus that predate the lock date. The evidence paths reference the user's existing personal_assistant project corpus (which will become a content-vault input).",
+  "_status": "FROZEN",
+  "_frozen_date": "2026-05-05",
+  "_locked_in_issue": "https://github.com/acardote/personal-assistant-ultra/issues/9",
   "questions": [
     {
       "id": "q01",
-      "text": "What's the current Q2 platform strategy decision on integration?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's the latest on BADAS (training, deployment, product roadmap)?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Documents BADAS (training, deployment, product roadmap) as a recurring Granola query area for the weekly product update — query is run every week"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
+          "note": "Dedicated BADAS section in the most recent weekly update; same shape recurs across week_03..week_17 (15 weeks of evidence)"
+        }
+      ]
     },
     {
       "id": "q02",
-      "text": "What's the Q1 2026 baseline pilot conversion rate I should compare against?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's the latest on Scenario Reconstruction / Waabi delivery?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Granola query area: Scenario reconstruction / Waabi"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
+          "note": "Scene Reconstruction section in week 17 covers Waabi delivery, May Mobility POC, Qualcomm; same shape across multiple weeks"
+        }
+      ]
     },
     {
       "id": "q03",
-      "text": "What were the lessons from the v1 spine pre-prod incident?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's the latest on DMS (driver monitoring, eyes-off-road, phone detection)?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Granola query area: DMS (driver monitoring, eyes off road, phone detection)"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_15_2026.md",
+          "note": "DMS-themed content recurs across weekly updates as part of the weekly digest pattern"
+        }
+      ]
     },
     {
       "id": "q04",
-      "text": "When does the legacy event vocabulary migration window close?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "Where are we on Acko Pico launch (cameras, production, certification, connected-camera strategy)?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Granola query area: Acko (cameras, production, certification, connected camera strategy)"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/2026-02-05_Acko_Nexar_Connected_Cameras_Weekly.md",
+          "note": "Standalone Acko weekly meeting record; topic recurs as a Problems-section blocker in weekly_updates (BIS NOC certification)"
+        }
+      ]
     },
     {
       "id": "q05",
-      "text": "Should we accept a 60-day customer migration extension?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's the latest on CityStream Intelligence (risk index, driver scoring, IBM workzones)?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Granola query area: CityStream Intelligence (risk index, driver scoring, IBM)"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
+          "note": "IBM / Workzones section in week 17 covers the demo + role split"
+        }
+      ]
     },
     {
       "id": "q06",
-      "text": "What's the v2 spine ship-or-slip rule?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's the latest on Atlas (platform, UI/UX, deployment, search)?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Granola query area: Atlas (platform, UI/UX, deployment)"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/scratchpad/atlas_search_action_plan_2apr2026.md",
+          "note": "Atlas search action plan (April); recurring Atlas content across atlas-big-push/ and weekly updates"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/2026-02-05_Atlas_UI_UX.md",
+          "note": "Standalone Atlas UI/UX doc from February — Atlas is a multi-month recurring concern"
+        }
+      ]
     },
     {
       "id": "q07",
-      "text": "Why was the personal-assistant harvester rollout deferred to Q4?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What are this week's blockers / problems across programs?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
+          "note": "### Problems: section is a structural part of every weekly update"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_03_2026.md",
+          "note": "Same Problems-section structure 14 weeks earlier — proves recurrence across the year"
+        }
+      ]
     },
     {
       "id": "q08",
-      "text": "What's the decision on field naming conventions for v2 spine?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What did I discuss / commit to in my last 1-1 with Leonor?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/2026-02-05_1-1_Leonor_Andre.md",
+          "note": "Recorded 1-1 with Leonor (manager); recurring 1-1 cadence — this is the artifact pattern"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
+          "note": "Manager-relationship work shows up implicitly in weekly updates as decisions / commitments that surfaced during 1-1s"
+        }
+      ]
     },
     {
       "id": "q09",
-      "text": "Who owns the layer-1 retention policy work and when is it due?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's the latest in the active customer/partner conversations (Waymo, Nuro, Meta, TomTom, Axon, State Farm)?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/Nexar_TomTom_Collaboration_Draft.md",
+          "note": "TomTom collaboration draft — partner conversation"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/axon_partnership_summary.md",
+          "note": "Axon partnership summary — partner conversation"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/misc/State Farm Post Meeting email .md",
+          "note": "State Farm post-meeting email"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
+          "note": "Active conversations section in week 17 covers Waymo / Nuro / Meta — recurring shape"
+        }
+      ]
     },
     {
       "id": "q10",
-      "text": "What does Bruno discipline require before closing a parent issue in this project?",
-      "_placeholder": true,
-      "_recurring_evidence": null
+      "text": "What's flagged in #product-update-inbox this week that needs to land in my next product update?",
+      "_recurring_evidence": [
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
+          "note": "Slash-command explicitly reads #product-update-inbox (channel ID C0ADETXQS67) every week as part of the weekly-update generation flow"
+        },
+        {
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_15_2026.md",
+          "note": "Weekly updates incorporate flagged Slack content via the inbox channel — recurring intake"
+        }
+      ]
     }
   ]
 }
