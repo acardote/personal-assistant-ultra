@@ -94,6 +94,8 @@ If this completes without errors, your full pipeline works. The next step (live 
 
 The production scheduled trigger is a **Claude Code routine** (verified end-to-end against the auto-attached Slack/Gmail/Granola MCPs on 2026-05-05). Configure it via `/schedule` in Claude Code or at https://claude.ai/code/routines, following [`templates/routines/harvest-routine.md`](../templates/routines/harvest-routine.md) — it documents the cron, repos, MCP expectations, and the self-contained routine prompt.
 
+For full silent-failure coverage, also configure the watchdog routine documented in [`templates/routines/watchdog-routine.md`](../templates/routines/watchdog-routine.md). It fires daily at a different time, runs the freshness check, and DMs you on Slack when state ≠ PASS — the in-skill freshness check (per #27) only fires when you invoke `/personal-assistant`, so the watchdog is what closes the rest of F1.
+
 Once the routine is configured, you can:
 
 - Wait for the next scheduled fire, or click **Run now** in the routines UI for an immediate harvest.
