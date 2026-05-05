@@ -14,14 +14,16 @@ follow-up work.
 
 Reads `<content_root>/.harvest/runs/*.json`, finds the newest entry, and
 decides:
-  - PASS:    newest run is `ok: true` AND younger than the staleness threshold
-  - STALE:   newest run is older than the threshold (no successful run lately)
-  - FAILED:  newest run is `ok: false` (most recent fire errored out)
-  - STUCK:   N consecutive `ok: false` runs with the same error (issue is
-             chronic, not transient — surfaces a different message)
-  - MISSING: no runs/ directory or no .json files in it
-  - CORRUPT: newest .json file is unparseable (truncated write or manual
-             corruption — likely indicates the last run crashed mid-write)
+  - PASS:             newest run is `ok: true` AND younger than threshold
+  - STALE:            newest run is older than threshold (no successful run lately)
+  - FAILED:           newest run is `ok: false` (most recent fire errored out)
+  - STUCK:            N consecutive `ok: false` runs with the same error
+                      (chronic, not transient — different remediation)
+  - STUCK_AND_STALE:  STUCK conditions hold AND newest run also exceeds the
+                      staleness threshold (two distinct problems, both surfaced)
+  - MISSING:          no runs/ directory or no .json files in it
+  - CORRUPT:          newest .json file is unparseable (truncated write or
+                      manual corruption — likely the last run crashed mid-write)
 
 Age clock: prefers the `started_at` field from the run-status JSON payload,
 falling back to filesystem mtime if the payload is absent or unparseable.
@@ -36,7 +38,8 @@ The check is scheduler-agnostic — it cares about freshness, not provenance.
 
 Exit codes:
   0 — PASS
-  1 — STALE / FAILED / STUCK / MISSING / CORRUPT (any reason to investigate)
+  1 — STALE / FAILED / STUCK / STUCK_AND_STALE / MISSING / CORRUPT
+      (any reason to investigate)
   2 — config error (couldn't load .assistant.local.json)
 
 Output formats:
@@ -232,20 +235,24 @@ def assess_freshness(
     consecutive_failures, stuck_error = _count_consecutive_failures(files)
     if consecutive_failures >= stuck_threshold:
         also_stale = age_hours > max_age_hours
-        stale_suffix = (
-            f" Also STALE: {age_hours:.1f}h since the most recent fire (threshold "
-            f"{max_age_hours}h) — no successful run is masking the chronic failure."
-        ) if also_stale else ""
+        # When both STUCK and STALE hold, surface both in the headline state so
+        # a user scanning the banner doesn't miss the staleness signal.
+        state_label = "STUCK_AND_STALE" if also_stale else "STUCK"
+        headline = (
+            f"BOTH STUCK AND STALE: last {consecutive_failures} consecutive runs "
+            f"failed with the same error AND it has been {age_hours:.1f}h since "
+            f"the most recent fire (threshold {max_age_hours}h)."
+            if also_stale else
+            f"STUCK: last {consecutive_failures} consecutive runs failed with the same error."
+        )
         return FreshnessResult(
-            state="STUCK", newest_path=newest, age_hours=age_hours, age_source=age_source,
+            state=state_label, newest_path=newest, age_hours=age_hours, age_source=age_source,
             scheduler=scheduler, payload_ok=payload_ok, error=stuck_error,
             consecutive_failures=consecutive_failures,
             summary=(
-                f"Last {consecutive_failures} consecutive harvest runs all reported "
-                f"the same error: '{stuck_error or '<no error message>'}'. This is "
-                f"chronic, not transient — fix the underlying issue (often a "
+                f"{headline} Error: '{stuck_error or '<no error message>'}'. "
+                f"Chronic, not transient — fix the underlying issue (often a "
                 f"connector that needs re-authentication) before the next fire."
-                + stale_suffix
             ),
         )
 
@@ -302,6 +309,7 @@ def _format_human_banner(result: FreshnessResult) -> str:
         "STALE": "⚠️",
         "FAILED": "❌",
         "STUCK": "🔁",
+        "STUCK_AND_STALE": "🔁⚠️",
         "MISSING": "❓",
         "CORRUPT": "⚠️",
     }.get(result.state, "⚠️")
@@ -331,13 +339,19 @@ def main(argv: list[str]) -> int:
         default=STUCK_CONSECUTIVE_THRESHOLD,
         help=(
             f"Number of consecutive same-error failures before STUCK fires "
-            f"(default: {STUCK_CONSECUTIVE_THRESHOLD}). For sub-daily routines "
+            f"(default: {STUCK_CONSECUTIVE_THRESHOLD}, minimum: 1). For sub-daily routines "
             f"(e.g. hourly) you may want a higher value; for monthly cadences, lower."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Emit structured JSON instead of a human banner.")
     parser.add_argument("--quiet", action="store_true", help="On PASS, suppress output (still exits 0).")
     args = parser.parse_args(argv[1:])
+
+    if args.stuck_threshold < 1:
+        parser.error(
+            f"--stuck-threshold must be ≥ 1 (got {args.stuck_threshold}); "
+            f"a threshold of 0 or negative would fire STUCK on every healthy run."
+        )
 
     try:
         cfg = load_config(require_explicit_content_root=False)

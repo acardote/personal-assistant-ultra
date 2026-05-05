@@ -211,7 +211,7 @@ def test_stuck_three_same_error():
         result = cf.assess_freshness(runs, max_age_hours=26)
     assert result.state == "STUCK", f"expected STUCK, got {result.state}: {result.summary}"
     assert result.consecutive_failures == 3
-    assert "chronic" in result.summary
+    assert "hronic" in result.summary, f"expected 'chronic' (any case) in summary: {result.summary}"
     print("  T9 PASS — 3 consecutive same-error failures detected as STUCK.")
 
 
@@ -309,7 +309,7 @@ def test_malformed_started_at_falls_back_to_mtime():
 
 
 def test_stuck_and_stale_collision():
-    """T15: STUCK + STALE both true → STUCK with stale-suffix in summary (round-2 challenger)."""
+    """T15: STUCK + STALE both true → STUCK_AND_STALE state (round-2 fix, round-3 prominence)."""
     cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
     with tempfile.TemporaryDirectory() as td:
         runs = Path(td) / "runs"
@@ -322,11 +322,13 @@ def test_stuck_and_stale_collision():
                 "error": "critical connector missing: granola",
             }, mtime=time.time() - (hours_ago * 3600))
         result = cf.assess_freshness(runs, max_age_hours=26)
-    assert result.state == "STUCK", f"expected STUCK, got {result.state}"
-    assert "Also STALE" in result.summary, (
-        f"STUCK+STALE collision should surface both: {result.summary}"
+    assert result.state == "STUCK_AND_STALE", (
+        f"STUCK+STALE collision should produce distinct state, got {result.state}"
     )
-    print("  T15 PASS — STUCK+STALE collision surfaces both signals in summary.")
+    assert "BOTH STUCK AND STALE" in result.summary, (
+        f"summary should lead with both signals, got: {result.summary}"
+    )
+    print("  T15 PASS — STUCK+STALE collision produces distinct state with prominent summary.")
 
 
 def test_stuck_threshold_configurable():
@@ -349,6 +351,44 @@ def test_stuck_threshold_configurable():
     assert r3.state == "FAILED", f"threshold=3 should keep state=FAILED, got {r3.state}"
     assert r2.state == "STUCK", f"threshold=2 should produce STUCK, got {r2.state}"
     print("  T16 PASS — stuck_threshold parameter overrides default.")
+
+
+def test_stuck_and_stale_state_label():
+    """T15b: when STUCK and STALE both hold, state label is STUCK_AND_STALE (round-3 fix)."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        for i, hours_ago in enumerate([120, 96, 72]):
+            write_run(runs, f"2026-04-3{i}T060700Z.json", {
+                "started_at": iso_hours_ago(hours_ago),
+                "ok": False,
+                "scheduler": "routine",
+                "error": "critical connector missing: granola",
+            }, mtime=time.time() - (hours_ago * 3600))
+        result = cf.assess_freshness(runs, max_age_hours=26)
+    assert result.state == "STUCK_AND_STALE", (
+        f"expected STUCK_AND_STALE state label (round-3 fix for prominence), got {result.state}"
+    )
+    assert "BOTH STUCK AND STALE" in result.summary
+    print("  T15b PASS — STUCK+STALE collision now surfaces as distinct state label.")
+
+
+def test_stuck_only_when_not_stale():
+    """T15c: STUCK without STALE still produces state=STUCK (not STUCK_AND_STALE)."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        # 3 consecutive same-error failures, all RECENT (so not stale)
+        for i, hours_ago in enumerate([5, 3, 1]):
+            write_run(runs, f"2026-05-05T0{i}0700Z.json", {
+                "started_at": iso_hours_ago(hours_ago),
+                "ok": False,
+                "scheduler": "routine",
+                "error": "critical connector missing: granola",
+            }, mtime=time.time() - (hours_ago * 3600))
+        result = cf.assess_freshness(runs, max_age_hours=26)
+    assert result.state == "STUCK", f"expected STUCK (not also stale), got {result.state}"
+    print("  T15c PASS — STUCK alone (not stale) keeps state=STUCK.")
 
 
 def test_corrupt_in_middle_of_failures_does_not_break_count():
@@ -387,6 +427,74 @@ def test_corrupt_in_middle_of_failures_does_not_break_count():
     print("  T17 PASS — corrupt file mid-streak doesn't reset consecutive-failure count.")
 
 
+def test_corrupt_streak_with_different_error_breaks():
+    """T18: corrupt files don't extend a streak across error boundaries.
+
+    Sequence: [fail-A, corrupt, corrupt, fail-B] — newest fail-A starts the
+    streak with error A; corrupt files are skipped (don't advance, don't reset);
+    fail-B has different error → break. Result: count=1, state=FAILED. This
+    documents the intent that corrupt files are inert in the walk.
+    """
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        write_run(runs, "2026-05-05T060700Z.json", {
+            "started_at": iso_hours_ago(0.5),
+            "ok": False, "scheduler": "routine", "error": "error A",
+        }, mtime=time.time() - 1800)
+        write_run(runs, "2026-05-04T060700Z.json", "{ corrupt", mtime=time.time() - (24 * 3600))
+        write_run(runs, "2026-05-03T060700Z.json", "{ corrupt", mtime=time.time() - (48 * 3600))
+        write_run(runs, "2026-05-02T060700Z.json", {
+            "started_at": iso_hours_ago(72),
+            "ok": False, "scheduler": "routine", "error": "error B",
+        }, mtime=time.time() - (72 * 3600))
+        result = cf.assess_freshness(runs, max_age_hours=26, stuck_threshold=3)
+    assert result.state == "FAILED", (
+        f"different errors with corrupt-in-middle should NOT escalate to STUCK; got {result.state}"
+    )
+    assert result.consecutive_failures == 1
+    print("  T18 PASS — corrupt files are inert; different-error streak still breaks the count.")
+
+
+def test_cli_main_exit_codes():
+    """T19: CLI surface — exit codes, --json, --quiet, --stuck-threshold validation."""
+    import subprocess
+    cli = str(PROJ / "tools" / "check-harvest-freshness.py")
+
+    # --stuck-threshold 0 should fail with parser error
+    result = subprocess.run(
+        [cli, "--stuck-threshold", "0"], capture_output=True, text=True
+    )
+    assert result.returncode == 2, (
+        f"--stuck-threshold 0 should exit 2 (argparse error), got {result.returncode}; "
+        f"stderr={result.stderr!r}"
+    )
+    assert "must be ≥ 1" in result.stderr or "must be" in result.stderr
+    print("  T19a PASS — --stuck-threshold 0 rejected with parser error.")
+
+    # --stuck-threshold -1 should fail
+    result = subprocess.run(
+        [cli, "--stuck-threshold", "-1"], capture_output=True, text=True
+    )
+    assert result.returncode == 2, f"--stuck-threshold -1 should exit 2, got {result.returncode}"
+    print("  T19b PASS — --stuck-threshold -1 rejected.")
+
+    # --json should emit parseable JSON regardless of state
+    # (uses real config, so depends on the user's vault state — we just verify shape)
+    result = subprocess.run([cli, "--json"], capture_output=True, text=True)
+    assert result.returncode in (0, 1, 2), f"unexpected exit code {result.returncode}"
+    if result.returncode != 2:  # config-error path doesn't emit JSON
+        try:
+            payload = json.loads(result.stdout)
+            assert "state" in payload
+            assert payload["state"] in {"PASS", "STALE", "FAILED", "STUCK", "STUCK_AND_STALE", "MISSING", "CORRUPT"}
+        except json.JSONDecodeError:
+            raise AssertionError(f"--json output not parseable: {result.stdout!r}")
+    print("  T19c PASS — --json emits structured payload with valid state.")
+
+    print("  T19 PASS — CLI surface tests cover exit codes, --json shape, --stuck-threshold validation.")
+
+
 if __name__ == "__main__":
     print("Running test_harvest_freshness_acceptance.py...")
     test_pass_recent_ok()
@@ -404,6 +512,10 @@ if __name__ == "__main__":
     test_stale_includes_last_error()
     test_malformed_started_at_falls_back_to_mtime()
     test_stuck_and_stale_collision()
+    test_stuck_and_stale_state_label()
+    test_stuck_only_when_not_stale()
     test_stuck_threshold_configurable()
     test_corrupt_in_middle_of_failures_does_not_break_count()
+    test_corrupt_streak_with_different_error_breaks()
+    test_cli_main_exit_codes()
     print("All harvest-freshness tests passed.")

@@ -51,6 +51,7 @@ tools/check-harvest-freshness.py --quiet
 - **STALE** — no successful run lately (older than threshold).
 - **FAILED** — most recent run reported `ok: false`.
 - **STUCK** — N (default 3) consecutive `ok: false` runs with the same `error`. The issue is chronic, not transient.
+- **STUCK_AND_STALE** — STUCK conditions hold AND the newest run also exceeds the staleness threshold. Two distinct problems present.
 - **MISSING** — no runs/ directory or no .json files in it (normal for a freshly-configured setup before the routine fires for the first time).
 - **CORRUPT** — newest .json file is unparseable (truncated write or manual corruption — likely the last run crashed mid-write).
 
@@ -59,6 +60,7 @@ When the check exits non-zero, the banner already includes a state-appropriate s
 - **STALE**: the routine may have stopped firing — direct the user to https://claude.ai/code/routines (or their launchd plist if they're on the alternative path). If the banner also surfaces a last-run error (e.g., "git push failed"), pass that along too.
 - **FAILED**: relay the banner's error inline; the most common cause is "critical connector enabled but not authenticated" (per the #25 / #26 §11 caveat).
 - **STUCK**: more urgent than FAILED — same error repeated N times. Tell the user to fix the underlying issue *before* the next fire (re-auth a connector, fix a config typo, etc.). Don't suggest "wait and see."
+- **STUCK_AND_STALE**: most urgent. The chronic error is masking a stalled scheduler — both problems need attention. Address the chronic error first (so the next fire might succeed), then verify the routine is actually firing.
 - **MISSING**: the harvest has never run — in real use this either means the routine hasn't been configured yet (point the user at `templates/routines/harvest-routine.md`), or this is a fresh clone on a new machine and the user hasn't yet pulled the vault's first runs.
 - **CORRUPT**: ask the user to inspect the file directly. Don't auto-fix or auto-delete.
 
