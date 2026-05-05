@@ -136,7 +136,9 @@ The Granola MCP exposes a single tool `query_granola_meetings` with shape `{quer
 4. Dedup matching from #10 will cluster across sources — Granola + Meet + Gmail of the same meeting produce one canonical + alternates.
 5. Update `<content_root>/.harvest/granola.json`.
 
-**Hard floor**: probe 5 (2026-05-05) showed 40 meetings in 14 days. A 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, set `ok: false` with `error: "incomplete_granola_enumeration"`. Gate, not log. Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most; if the enumeration query times out twice, fall back to weekly-paginated enumeration (4 separate calls each scoped to one week of the cutoff window).
+**Hard floor**: probe 5 (2026-05-05) showed 40 meetings in 14 days. A 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, set `ok: false` with `error: "incomplete_granola_enumeration"`. Gate, not log.
+
+**Retry policy on the enumeration query** (apply mechanically): single-meeting body queries are fast. The enumeration query is the risky one. If the enumeration query times out, wait 30s and retry once with the same query. If THAT also times out (2 timeouts on the same query), fall back to weekly pagination: 4 separate `query_granola_meetings` calls each with `{"query": "List all my meetings between <YYYY-MM-DD> and <YYYY-MM-DD>"}` substituting explicit week boundaries. Each weekly call gets its own retry-once-on-timeout budget. Concatenate results before per-meeting fetch. If a weekly call fails twice, log that week to errors and skip — partial coverage beats nothing.
 
 ### Google Meet transcripts
 

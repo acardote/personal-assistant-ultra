@@ -116,38 +116,76 @@ def test_truncate_oversized():
     print("  T6 PASS — truncate_to_tokens with oversized budget returns full input unchanged.")
 
 
-def test_no_network_dependency():
-    """T7: the module imports and runs without any network access.
+def test_no_tiktoken_in_caller_import_graphs():
+    """T7: callers' import graphs no longer include tiktoken.
 
-    This is the load-bearing test for the #34 fix — tiktoken would have failed
-    here on first call when the BPE cache was unavailable. The char-estimator
-    must NOT depend on any network resource.
+    Per round-2 challenger feedback on PR #35: the previous version of this test
+    just verified that pure-Python arithmetic doesn't make network calls (which
+    is true of all arithmetic). The actual fix was removing tiktoken from the
+    callers' imports. This test inspects each caller's source for any tiktoken
+    reference — failing if it's reintroduced.
+
+    This is a structural test, not a runtime sandbox test. It catches regressions
+    where a future commit re-adds `import tiktoken` to a hot-path tool, which
+    would silently re-introduce the network-cache failure mode.
     """
-    tk = load_module("tk", PROJ / "tools" / "_tokens.py")
-    # Disable network at the env level (sets common no-network env vars).
-    saved = {
-        "http_proxy": os.environ.pop("http_proxy", None),
-        "https_proxy": os.environ.pop("https_proxy", None),
-        "HTTP_PROXY": os.environ.pop("HTTP_PROXY", None),
-        "HTTPS_PROXY": os.environ.pop("HTTPS_PROXY", None),
-    }
+    callers = [
+        PROJ / "tools" / "compress.py",
+        PROJ / "tools" / "assemble-kb.py",
+        PROJ / "tools" / "prune.py",
+        PROJ / "tools" / "route.py",
+        PROJ / "tools" / "eval-harness.py",
+        PROJ / "tools" / "harvest.py",
+    ]
+    for caller in callers:
+        text = caller.read_text(encoding="utf-8")
+        # Allowed: comments / docstrings / dependency-list strings can mention
+        # tiktoken historically, but no `import tiktoken` should remain in code.
+        assert "import tiktoken" not in text, (
+            f"{caller.name} still imports tiktoken — the #34 fix has regressed."
+        )
+        # Also catch the uv inline-dep declaration (the script header line).
+        # Format: `# dependencies = [..., "tiktoken>=...", ...]`
+        for line in text.splitlines()[:10]:
+            if line.startswith("# dependencies"):
+                assert "tiktoken" not in line, (
+                    f"{caller.name} declares tiktoken in uv dependencies "
+                    f"— the #34 fix has regressed: {line!r}"
+                )
+    print(f"  T7 PASS — none of {len(callers)} callers re-import tiktoken or declare it in deps.")
+
+
+def test_estimator_used_under_no_network():
+    """T7b: import a caller that depended on tiktoken (assemble-kb.py)
+    under a no-network sandbox env, and verify it loads + computes a token
+    count without crashing.
+
+    This is the closer-to-production test: actually exercise a hot-path tool
+    in conditions matching the routine sandbox where tiktoken's BPE download
+    would fail.
+    """
+    # Set a non-routable proxy so any network call would fail fast.
+    saved = {k: os.environ.pop(k, None) for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")}
     try:
-        # Set proxy to a non-routable address so any network attempt fails fast.
         os.environ["http_proxy"] = "http://127.0.0.1:1"
         os.environ["https_proxy"] = "http://127.0.0.1:1"
-        # Now exercise the estimator.
-        result = tk.estimate_tokens("test text without network")
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:1"
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:1"
+        # Importing the module is the load-bearing assertion. If tiktoken were
+        # still imported at module top, this would attempt a network call.
+        # assemble-kb.py uses `from _tokens import estimate_tokens` instead.
+        akb = load_module("akb", PROJ / "tools" / "assemble-kb.py")
+        assert callable(akb.count_tokens)
+        # Exercise it.
+        result = akb.count_tokens("the quick brown fox")
         assert result > 0
-        result2 = tk.truncate_to_tokens("test text without network", 5)
-        assert len(result2) == 20
     finally:
-        # Restore.
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
             else:
                 os.environ.pop(k, None)
-    print("  T7 PASS — _tokens.py works with no-network env (the actual #34 fix).")
+    print("  T7b PASS — assemble-kb.py imports + count_tokens works under no-network env.")
 
 
 def test_truncate_with_suffix_budget():
@@ -186,6 +224,7 @@ if __name__ == "__main__":
     test_truncate_zero()
     test_truncate_length()
     test_truncate_oversized()
-    test_no_network_dependency()
+    test_no_tiktoken_in_caller_import_graphs()
+    test_estimator_used_under_no_network()
     test_truncate_with_suffix_budget()
     print("All token-estimator tests passed.")

@@ -153,7 +153,12 @@ Per-source instructions (in this order):
 - **Step 3 — write each**: render each meeting body to `$VAULT/raw/granola_note/<meeting-uuid-or-slug>.md`, compress with `--kind note --source-kind granola_note`.
 - Probe 5 (2026-05-05) showed 40 meetings in 14 days — a 30-day cold-start should yield 30+ meetings unless the user has gaps.
 - **Hard floor (gate, not log)**: on cold-start, if you produce <10 Granola memory objects, set `ok: false` on the run-status JSON with `error: "incomplete_granola_enumeration"`. The freshness check will surface it on the next user invocation; the watchdog routine will DM the user.
-- Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most. The single-meeting body queries are fast. If the enumeration query times out twice, fall back to weekly-paginated enumeration: 4 separate calls each scoped to one week of the cutoff window.
+- Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries.
+- **Retry policy** (apply mechanically — no judgment): the single-meeting body queries are fast. The enumeration query is the risky one. For the enumeration call: if the first attempt times out, wait 30s and retry once with the same query. If THAT also times out (i.e., 2 timeouts on the same query), fall back to weekly-paginated enumeration:
+  - Issue 4 separate `query_granola_meetings` calls, each with `{"query": "List all my meetings between <week-start> and <week-end>"}` substituting an explicit YYYY-MM-DD range for each of the 4 weeks of the 30-day cutoff window.
+  - Each weekly call gets its own retry-once-on-timeout budget (i.e., up to 8 calls total in the worst case).
+  - Concatenate results from all 4 weekly calls before proceeding to step 2 (per-meeting body fetch). The body-fetch loop is unchanged.
+  - If a weekly call fails twice on the same week, log that week to errors and skip it (do not abort the whole harvest — partial coverage beats nothing).
 
 **Google Meet transcripts**: skip in routine context — folder-watch path, needs local Meet-export sync.
 **Generic transcript drop**: skip in routine context — same reason.
