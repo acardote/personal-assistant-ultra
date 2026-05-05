@@ -90,13 +90,32 @@ Write a per-checkout config so the method-repo tools resolve content paths again
   {"paths": {"content_root": "$VAULT"}}
   EOF
 
-Preflight your MCP connectors. The harvest expects all enabled connectors to be authenticated — not merely connected — at the account level. Check each:
+**PREFLIGHT — run BEFORE any harvest work. This is a binary gate, not a soft check.**
 
-- Slack: confirm `mcp__<uuid>__slack_search_users` (or any `slack_*` tool) is in the deferred tool list.
-- Gmail: confirm `mcp__<uuid>__search_threads` (or any other Gmail tool) is in the deferred tool list.
-- Granola: confirm `mcp__<uuid>__query_granola_meetings` is in the deferred tool list. **If absent and the user has the Granola connector enabled at the account level, the connector is enabled but unauthenticated — fail loudly into the run-status JSON's `errors` key with the explicit message "granola connector enabled but unauthenticated" so the user can re-auth.**
+Apply these rules mechanically. Do not exercise judgment about whether a failure is "probably fine to skip."
 
-If a critical connector is unreachable (Slack OR Granola, the two highest-volume sources), set `ok: false` on the run-status JSON. A "skip with note" for a single low-volume source is acceptable; a missing high-volume source is not.
+For each critical connector (Slack and Granola — the two highest-volume sources), attempt one cheap probe call:
+
+- Slack probe: invoke `slack_search_users` with `{"query": "preflight"}` (any user query — return result is irrelevant).
+- Granola probe: invoke `query_granola_meetings` with `{"query": "preflight"}`.
+
+For Gmail (medium volume), make a probe call as well but treat failure as warning-only (skip Gmail with note, continue with others).
+
+Decision rules:
+
+1. If a probe call errors with "tool not found" / "no such tool" / "not in tool list" / a discovery-level error, treat the connector as missing.
+2. If a probe call returns a normal response (any payload, any size), preflight passes for that connector.
+3. If a probe call returns a transient error (timeout, 5xx, rate limit, network error), wait 30 seconds and retry once. If it fails twice, treat as missing.
+
+**Abort condition**: if Slack OR Granola is missing after the rules above, immediately:
+
+  - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`
+  - Commit + push that file (so dual-machine setups can see the failure).
+  - Exit. **Do NOT proceed to harvest.** A successful-looking partial run with a critical source missing is worse than a clean failure.
+
+The most likely cause of a missing critical connector is "the connector is enabled in claude.ai but not authenticated." Surface that explicitly in the error so the user knows where to look.
+
+Also detect dual-active scheduler conflict. List `$VAULT/.harvest/runs/*.json` files modified within the last 60 minutes. If any has `"scheduler": "launchd"`, that means launchd ran recently — append a `"warnings": ["launchd active alongside routine — pick one to avoid race conditions on git push and dedup state"]` entry to your run-status JSON. (Do not abort — the user may intentionally have both running for the Meet/transcript-drop workaround. Just surface the conflict.)
 
 Determine harvest cutoff:
 - If `$VAULT/.harvest/runs/` contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
@@ -105,7 +124,7 @@ Determine harvest cutoff:
 Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source, in this order:
 - Slack (via Slack MCP — UUID-namespaced `slack_search_*`/`slack_read_*` tools)
 - Gmail (via Gmail MCP — UUID-namespaced `search_threads`/`get_thread`/etc.)
-- Granola (via Granola MCP — `mcp__<uuid>__query_granola_meetings` as the entry point; for body extraction, see the argument shape recommended by probe 6 captured in `templates/routines/harvest-routine.md`'s "Granola argument shape" addendum)
+- Granola (via Granola MCP — `mcp__<uuid>__query_granola_meetings` as the entry point. For cold-start cycling: `{"query": "Show me the full notes from my most recent meeting"}` returns the most recent meeting body. For title-targeted retrieval: `{"query": "Show me all notes and action items from <meeting title>"}`. For UUID-targeted: `{"document_ids": ["<uuid>"]}`. Beware ~60s timeout on long natural-language queries — back off and retry once at most. Verified by probe 6 on 2026-05-05.)
 - Google Meet transcripts (skip in routine context — folder-watch path, needs local Meet-export sync)
 - Generic transcript drop (skip in routine context — same reason)
 
@@ -117,7 +136,9 @@ Compress writes to $VAULT/memory/<source-kind>/, applies #10's clustering (event
 
 Update $VAULT/.harvest/<source>.json dedup state. Append today's section to $VAULT/.harvest/daily/$(date -u +%Y-%m-%d).md following SKILL.md's daily digest format. Create $VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json with structured run status:
 
-  {"started_at": "...", "ok": true|false, "sources": {"slack": {"new": N, "errors": []}, ...}, "ended_at": "..."}
+  {"started_at": "...", "ok": true|false, "scheduler": "routine", "sources": {"slack": {"new": N, "errors": []}, ...}, "ended_at": "..."}
+
+The `"scheduler": "routine"` field is mandatory — it is the marker the dual-active detection above grep's for. Match it exactly.
 
 Bound the run to ~10 minutes total. If a source is unreachable (MCP auth expired, tool not available), log to the digest's "errors:" line and the run-status JSON's "errors" key, then continue with other sources — do NOT retry.
 

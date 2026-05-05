@@ -101,6 +101,8 @@ Once the routine is configured, you can:
 
 If you're on a tier without routine access (or want strictly local execution), the launchd alternative is documented at [`templates/launchd/`](../templates/launchd/). Same orchestration, different scheduler.
 
+**Sources NOT covered by the routine path**: Google Meet folder watch and generic transcript drop. These are file-system-based — they need either local Meet-export sync or a folder you drop transcripts into — and neither exists in the routine sandbox. If you depend on those sources, run them ad-hoc via `tools/harvest.py --source gmeet --folder <path>` or `tools/harvest.py --source transcripts --folder <path>` from a Mac session, OR keep launchd active for those sources only. Pick one scheduler per vault — running both simultaneously will race on git push and dedup state (per the warning in `templates/routines/harvest-routine.md`).
+
 For ad-hoc manual harvests, you can also open a Claude Code session in your method-repo checkout, invoke `/personal-assistant`, and ask it to harvest interactively — same skill, same code path.
 
 ## Step 7 — query

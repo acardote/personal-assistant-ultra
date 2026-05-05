@@ -165,6 +165,7 @@ def main(argv: list[str]) -> int:
         "method_root": str(method_root),
         "content_root": str(content_root),
         "ok": False,
+        "scheduler": "launchd",
         "phase": "init",
         "error": None,
     }
