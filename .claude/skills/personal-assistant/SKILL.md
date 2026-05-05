@@ -38,6 +38,23 @@ tools/assemble-kb.py
 
 Do not proceed with the user's request until layer 3 is loaded into your working context. If `tools/assemble-kb.py` fails or produces empty output, surface the failure to the user and stop — operating without layer 3 violates the "always-in-context" invariant on issue #4. If `.assistant.local.json` is missing, the assembler will emit a loud warning + fall back to method-root: that's fixture/test mode, not production; if you see the warning during a real session, **stop and tell the user to set up the config** before proceeding.
 
+### Pre-flight: harvest freshness check (per [#27](https://github.com/acardote/personal-assistant-ultra/issues/27))
+
+Immediately after layer-3 loads, run:
+
+```
+tools/check-harvest-freshness.py --quiet
+```
+
+(also from the method-repo root). The check reads `<content_root>/.harvest/runs/*.json`, finds the newest by mtime, and exits 0 if the most recent run is `ok: true` AND younger than 26 hours. It exits 1 with a stderr banner on `STALE` (no successful run lately), `FAILED` (most recent fire errored out), or `MISSING` (harvest never ran).
+
+If the check exits non-zero, surface its banner verbatim to the user **before answering their request** and offer remediation:
+- **STALE**: the routine may have stopped firing — direct the user to https://claude.ai/code/routines (or their launchd plist if they're on the alternative path).
+- **FAILED**: paste the `error` field's content; the most common cause is "critical connector enabled but not authenticated" (per #25 / #26 §11 caveat).
+- **MISSING**: the harvest has never run — in real use this means the routine hasn't been configured yet; point the user at `templates/routines/harvest-routine.md`.
+
+If the check exits 0 silently, proceed with the user's request — the harvest is healthy and there's nothing to surface.
+
 ## Editorial discipline
 
 - **Never invent KB entries.** If the user asks about something that isn't in the KB and isn't derivable from layer-2 memory objects (when retrieval lands), say so explicitly. Hallucinated grounding is the failure mode that poisons every downstream consumer (see falsifier F2 on issue #3 / #4).
