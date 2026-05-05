@@ -61,6 +61,23 @@
       "type": "string",
       "minLength": 1,
       "description": "Optional one-sentence summary distinct from body."
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional. Cluster id (per #10 — multi-fidelity event matching). Memory objects representing the same real-world event share an event_id; absent for unclustered items."
+    },
+    "is_canonical_for_event": {
+      "type": "boolean",
+      "description": "Optional. True if this memory is the canonical (highest-authority) member of its event cluster. At most one canonical per event_id; the rest are alternates with `superseded_by` pointing at this memory's id."
+    },
+    "superseded_by": {
+      "type": ["string", "null"],
+      "description": "Optional. When this memory is an alternate in a multi-source cluster, points at the canonical memory's id. Null/absent when this memory is canonical (or unclustered)."
+    },
+    "expiry_locked": {
+      "type": "boolean",
+      "description": "Optional. When true, prune.py respects the user-set expires_at and will NOT auto-archive this memory regardless of expiry policy. F3 mitigation from issue #8."
     }
   },
   "additionalProperties": true,

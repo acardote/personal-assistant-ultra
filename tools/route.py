@@ -127,7 +127,24 @@ def load_memory_objects(query: str, *, max_items: int = 12) -> tuple[str, int, l
             relevance += sum(1 for n in needles if n in lower)
         age_days = max(0.0, (now - created_at).total_seconds() / 86400.0)
         recency = _math.exp(-age_days * _math.log(2) / half_life_days)
-        score = float(relevance) * recency
+
+        # Per #10's multi-fidelity dedup: canonical (or unclustered) memos get
+        # a small bonus so they surface ahead of alternates at equal relevance.
+        # Alternates remain reachable on alternate-only-content queries because
+        # the bonus is multiplicative and modest, not a filter (per F3 from #10).
+        canonical_bonus = 1.0
+        if text.startswith("---\n"):
+            parts = text.split("\n---\n", 1)
+            if len(parts) == 2:
+                front_text = parts[0][4:]
+                m_canon = re.search(r"^is_canonical_for_event:\s*(true|false|True|False)", front_text, re.MULTILINE)
+                if m_canon:
+                    is_canonical = m_canon.group(1).lower() == "true"
+                    if not is_canonical:
+                        canonical_bonus = 0.85  # alternate
+                # If the field is absent, treat as unclustered → keep bonus 1.0
+
+        score = float(relevance) * recency * canonical_bonus
         scored.append((score, path, created_at))
 
     scored.sort(key=lambda t: (-t[0], -t[2].timestamp()))
