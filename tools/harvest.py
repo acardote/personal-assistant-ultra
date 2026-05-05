@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --quiet --with jsonschema --with pyyaml --with tiktoken --with slack-sdk --script
+#!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["jsonschema>=4", "pyyaml>=6", "tiktoken>=0.7"]
@@ -145,7 +145,7 @@ def _slugify(text: str, max_len: int = 60) -> str:
 # routine that drives the MCP-orchestrated harvest unattended.
 
 
-def _legacy_slack_dedupe_key(channel: str, thread_ts: str) -> str:
+def _slack_dedupe_key(channel: str, thread_ts: str) -> str:
     """Kept for SlackFixtureSource compatibility (it used SlackSource's
     classmethod; inlining preserves dedupe-key shape across reads of old
     state files)."""
@@ -176,26 +176,6 @@ class _RemovedSlackSourceMarker(Source):
 
     def dedupe_key(self, ref):  # pragma: no cover
         return ""
-        # Render thread as a structured Markdown document — preserves speaker
-        # attribution per F3, and is human-readable in the layer-1 archive.
-        lines = [f"# Slack thread {ref.id}", ""]
-        for msg in resp.get("messages", []):
-            user = msg.get("user", "?")
-            ts = msg.get("ts", "?")
-            iso = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat() if ts != "?" else "?"
-            text = msg.get("text", "")
-            lines.append(f"## {iso} — user:{user} (ts:{ts})")
-            lines.append("")
-            lines.append(text)
-            lines.append("")
-        return RawArtifact(content="\n".join(lines), extension=".md", suggested_kind="thread")
-
-    def dedupe_key(self, ref: ItemRef) -> str:
-        return self._dedupe_key_for(ref.meta["channel"], ref.meta["thread_ts"])
-
-    @staticmethod
-    def _dedupe_key_for(channel: str, thread_ts: str) -> str:
-        return f"slack:{channel}:{thread_ts}"
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -251,7 +231,7 @@ class SlackFixtureSource(Source):
         return RawArtifact(content="\n".join(lines), extension=".md", suggested_kind="thread")
 
     def dedupe_key(self, ref: ItemRef) -> str:
-        return _legacy_slack_dedupe_key(ref.meta["channel"], ref.meta["thread_ts"])
+        return _slack_dedupe_key(ref.meta["channel"], ref.meta["thread_ts"])
 
 
 # ───────────────────────────────────────────────────────────────────────
