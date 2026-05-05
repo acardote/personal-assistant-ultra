@@ -132,12 +132,25 @@ def _read_payload(path: Path) -> tuple[dict | None, bool]:
 def _count_consecutive_failures(files: list[Path]) -> tuple[int, str | None]:
     """Walk newest-to-oldest, count how many consecutive runs reported ok=false
     with the same `error` text. Returns (count, error_text) — count is 0 if the
-    newest run was ok=true or unparseable; count is 1 for an isolated failure."""
+    newest run was ok=true; count is 1 for an isolated failure.
+
+    Unparseable (corrupt) files in the middle of the walk are SKIPPED, not
+    treated as a break condition. Rationale: a corrupt status file in the
+    middle of a streak of real failures shouldn't mask the real failure
+    pattern. Treating corrupt as a break would silently under-report STUCK.
+
+    The walk DOES break on the first ok=true run, on a different error,
+    or on a payload that successfully parsed but isn't a dict."""
     error_text: str | None = None
     count = 0
     for path in files:
         payload, parse_ok = _read_payload(path)
-        if not parse_ok or not payload:
+        if not parse_ok:
+            # Skip corrupt files — they don't reset the counter, they don't
+            # extend it either. Just keep walking.
+            continue
+        if not payload:
+            # Successfully parsed but not a dict — break.
             break
         if payload.get("ok") is False:
             this_error = payload.get("error") or ""
@@ -153,7 +166,9 @@ def _count_consecutive_failures(files: list[Path]) -> tuple[int, str | None]:
     return count, error_text
 
 
-def assess_freshness(runs_dir: Path, max_age_hours: float) -> FreshnessResult:
+def assess_freshness(
+    runs_dir: Path, max_age_hours: float, stuck_threshold: int = STUCK_CONSECUTIVE_THRESHOLD
+) -> FreshnessResult:
     if not runs_dir.is_dir():
         return FreshnessResult(
             state="MISSING", newest_path=None, age_hours=None, age_source=None,
@@ -212,8 +227,15 @@ def assess_freshness(runs_dir: Path, max_age_hours: float) -> FreshnessResult:
     payload_error = payload.get("error") if payload else None
 
     # STUCK takes precedence over FAILED if N consecutive same-error failures.
+    # If both STUCK and STALE conditions hold, surface both signals — the user
+    # has two distinct problems (chronic error AND no successful run lately).
     consecutive_failures, stuck_error = _count_consecutive_failures(files)
-    if consecutive_failures >= STUCK_CONSECUTIVE_THRESHOLD:
+    if consecutive_failures >= stuck_threshold:
+        also_stale = age_hours > max_age_hours
+        stale_suffix = (
+            f" Also STALE: {age_hours:.1f}h since the most recent fire (threshold "
+            f"{max_age_hours}h) — no successful run is masking the chronic failure."
+        ) if also_stale else ""
         return FreshnessResult(
             state="STUCK", newest_path=newest, age_hours=age_hours, age_source=age_source,
             scheduler=scheduler, payload_ok=payload_ok, error=stuck_error,
@@ -223,6 +245,7 @@ def assess_freshness(runs_dir: Path, max_age_hours: float) -> FreshnessResult:
                 f"the same error: '{stuck_error or '<no error message>'}'. This is "
                 f"chronic, not transient — fix the underlying issue (often a "
                 f"connector that needs re-authentication) before the next fire."
+                + stale_suffix
             ),
         )
 
@@ -302,6 +325,16 @@ def main(argv: list[str]) -> int:
         default=DEFAULT_MAX_AGE_HOURS,
         help=f"Staleness threshold in hours (default: {DEFAULT_MAX_AGE_HOURS}).",
     )
+    parser.add_argument(
+        "--stuck-threshold",
+        type=int,
+        default=STUCK_CONSECUTIVE_THRESHOLD,
+        help=(
+            f"Number of consecutive same-error failures before STUCK fires "
+            f"(default: {STUCK_CONSECUTIVE_THRESHOLD}). For sub-daily routines "
+            f"(e.g. hourly) you may want a higher value; for monthly cadences, lower."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit structured JSON instead of a human banner.")
     parser.add_argument("--quiet", action="store_true", help="On PASS, suppress output (still exits 0).")
     args = parser.parse_args(argv[1:])
@@ -314,7 +347,9 @@ def main(argv: list[str]) -> int:
         return 2
 
     runs_dir = cfg.harvest_state_root / "runs"
-    result = assess_freshness(runs_dir, max_age_hours=args.max_age_hours)
+    result = assess_freshness(
+        runs_dir, max_age_hours=args.max_age_hours, stuck_threshold=args.stuck_threshold
+    )
 
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))

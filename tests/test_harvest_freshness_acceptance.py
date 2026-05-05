@@ -287,6 +287,106 @@ def test_stale_includes_last_error():
     print("  T13 PASS — STALE banner surfaces last error when payload_ok=false.")
 
 
+def test_malformed_started_at_falls_back_to_mtime():
+    """T14: malformed-but-present started_at falls back to mtime (round-2 challenger gap)."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    for bad_value in ["yesterday", 1234567890, "", "2026-13-99T99:99:99Z"]:
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            write_run(runs, "2026-05-05T060700Z.json", {
+                "started_at": bad_value,
+                "ok": True,
+                "scheduler": "routine",
+            }, mtime=time.time() - 3600)
+            result = cf.assess_freshness(runs, max_age_hours=26)
+        assert result.state == "PASS", (
+            f"malformed started_at={bad_value!r} should fall back to mtime, got {result.state}"
+        )
+        assert result.age_source == "mtime", (
+            f"malformed started_at={bad_value!r} should use mtime, got age_source={result.age_source}"
+        )
+    print("  T14 PASS — malformed started_at values fall back to mtime cleanly.")
+
+
+def test_stuck_and_stale_collision():
+    """T15: STUCK + STALE both true → STUCK with stale-suffix in summary (round-2 challenger)."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        # 3 consecutive same-error failures, all old enough to also be STALE
+        for i, hours_ago in enumerate([120, 96, 72]):
+            write_run(runs, f"2026-04-3{i}T060700Z.json", {
+                "started_at": iso_hours_ago(hours_ago),
+                "ok": False,
+                "scheduler": "routine",
+                "error": "critical connector missing: granola",
+            }, mtime=time.time() - (hours_ago * 3600))
+        result = cf.assess_freshness(runs, max_age_hours=26)
+    assert result.state == "STUCK", f"expected STUCK, got {result.state}"
+    assert "Also STALE" in result.summary, (
+        f"STUCK+STALE collision should surface both: {result.summary}"
+    )
+    print("  T15 PASS — STUCK+STALE collision surfaces both signals in summary.")
+
+
+def test_stuck_threshold_configurable():
+    """T16: stuck_threshold parameter changes when STUCK fires (round-2 challenger)."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        # Two consecutive same-error failures
+        for i, hours_ago in enumerate([24, 0.5]):
+            write_run(runs, f"2026-05-0{4+i}T060700Z.json", {
+                "started_at": iso_hours_ago(hours_ago),
+                "ok": False,
+                "scheduler": "routine",
+                "error": "transient timeout",
+            }, mtime=time.time() - (hours_ago * 3600))
+        # Default threshold (3): stays FAILED
+        r3 = cf.assess_freshness(runs, max_age_hours=26, stuck_threshold=3)
+        # Custom threshold of 2: now STUCK
+        r2 = cf.assess_freshness(runs, max_age_hours=26, stuck_threshold=2)
+    assert r3.state == "FAILED", f"threshold=3 should keep state=FAILED, got {r3.state}"
+    assert r2.state == "STUCK", f"threshold=2 should produce STUCK, got {r2.state}"
+    print("  T16 PASS — stuck_threshold parameter overrides default.")
+
+
+def test_corrupt_in_middle_of_failures_does_not_break_count():
+    """T17: corrupt file mid-failure-streak doesn't break the consecutive-failure count."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        # Newest: a real failure
+        write_run(runs, "2026-05-05T060700Z.json", {
+            "started_at": iso_hours_ago(0.5),
+            "ok": False,
+            "scheduler": "routine",
+            "error": "critical connector missing: granola",
+        }, mtime=time.time() - 1800)
+        # Middle: corrupt file
+        write_run(runs, "2026-05-04T060700Z.json", "{ truncated", mtime=time.time() - (24 * 3600))
+        # Older: two more real failures with same error
+        write_run(runs, "2026-05-03T060700Z.json", {
+            "started_at": iso_hours_ago(48),
+            "ok": False,
+            "scheduler": "routine",
+            "error": "critical connector missing: granola",
+        }, mtime=time.time() - (48 * 3600))
+        write_run(runs, "2026-05-02T060700Z.json", {
+            "started_at": iso_hours_ago(72),
+            "ok": False,
+            "scheduler": "routine",
+            "error": "critical connector missing: granola",
+        }, mtime=time.time() - (72 * 3600))
+        result = cf.assess_freshness(runs, max_age_hours=26, stuck_threshold=3)
+    # Walk should skip the corrupt file in the middle and find 3 real failures.
+    assert result.state == "STUCK", f"corrupt file in middle shouldn't break STUCK detection, got {result.state}"
+    assert result.consecutive_failures == 3, (
+        f"expected 3 consecutive failures (corrupt skipped), got {result.consecutive_failures}"
+    )
+    print("  T17 PASS — corrupt file mid-streak doesn't reset consecutive-failure count.")
+
+
 if __name__ == "__main__":
     print("Running test_harvest_freshness_acceptance.py...")
     test_pass_recent_ok()
@@ -302,4 +402,8 @@ if __name__ == "__main__":
     test_age_from_started_at_not_mtime()
     test_age_fallback_to_mtime()
     test_stale_includes_last_error()
+    test_malformed_started_at_falls_back_to_mtime()
+    test_stuck_and_stale_collision()
+    test_stuck_threshold_configurable()
+    test_corrupt_in_middle_of_failures_does_not_break_count()
     print("All harvest-freshness tests passed.")
