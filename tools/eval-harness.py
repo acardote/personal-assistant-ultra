@@ -127,9 +127,13 @@ def assemble_long_context(question: str, target_tokens: int) -> tuple[str, int]:
             # Truncate this block to fit if it's the first; else stop.
             remaining = target_tokens - used
             if remaining > 200 and not raw_blocks:
-                # Take the first `remaining` tokens of this block.
-                truncated_text = truncate_to_tokens(block, remaining)
-                raw_blocks.append(truncated_text + "\n[...truncated to fit budget]")
+                # Account for the appended suffix (~7 tokens) so the final
+                # block doesn't exceed the budget. Per round-1 reviewer
+                # suggestion #1 on PR #35.
+                suffix = "\n[...truncated to fit budget]"
+                suffix_tokens = count_tokens(suffix)
+                truncated_text = truncate_to_tokens(block, remaining - suffix_tokens)
+                raw_blocks.append(truncated_text + suffix)
                 used += remaining
             break
         raw_blocks.append(block)

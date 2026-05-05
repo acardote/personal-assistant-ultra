@@ -117,7 +117,7 @@ When the user asks the skill to harvest (or the routine prompt invokes the skill
 4. Run `tools/compress.py <raw-path> --kind thread --source-kind slack_thread` to produce the memory object. Compress writes to `<content_root>/memory/slack_thread/...` and applies clustering per #10.
 5. Update `<content_root>/.harvest/slack.json` with the new dedup_keys.
 6. Append a per-thread line to today's daily digest (see digest format below).
-7. **Failure-mode floor (per [#34](https://github.com/acardote/personal-assistant-ultra/issues/34))**: if a 30-day cold-start produces <5 Slack memory objects despite the user having known active channels, log "incomplete-enumeration suspected" to the run-status `errors` key. The right-shape number is dozens (channels × threads), not single digits.
+7. **Hard floor (per [#34](https://github.com/acardote/personal-assistant-ultra/issues/34))**: if a 30-day cold-start produces <5 Slack memory objects despite the user having known active channels, set `ok: false` on the run-status JSON with `error: "incomplete_slack_enumeration"`. This is a gate, not a log line — the freshness check + watchdog will surface the failure to the user. Right-shape number is dozens (channels × threads), not single digits.
 
 ### Gmail (via Gmail MCP)
 
@@ -136,7 +136,7 @@ The Granola MCP exposes a single tool `query_granola_meetings` with shape `{quer
 4. Dedup matching from #10 will cluster across sources — Granola + Meet + Gmail of the same meeting produce one canonical + alternates.
 5. Update `<content_root>/.harvest/granola.json`.
 
-**Failure-mode floor**: probe 5 (2026-05-05) showed 40 meetings in 14 days. A 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, log "incomplete-enumeration suspected" to the run-status `errors` key. Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most. Single-meeting body queries are fast.
+**Hard floor**: probe 5 (2026-05-05) showed 40 meetings in 14 days. A 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, set `ok: false` with `error: "incomplete_granola_enumeration"`. Gate, not log. Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most; if the enumeration query times out twice, fall back to weekly-paginated enumeration (4 separate calls each scoped to one week of the cutoff window).
 
 ### Google Meet transcripts
 

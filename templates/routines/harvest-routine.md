@@ -139,7 +139,8 @@ Per-source instructions (in this order):
 - Additionally: search for threads carrying the user's `:pencil:` reaction (flag) regardless of channel.
 - For each unique channel discovered, list threads since cutoff and call `slack_read_thread` per thread. Render each to `$VAULT/raw/slack_thread/<channel>-<thread_ts>.md`.
 - Compress each via `tools/compress.py --kind thread --source-kind slack_thread`.
-- Expected order of magnitude: tens of channels × multiple threads each = dozens of memory objects on a 30-day cold-start. If you produce <5 Slack memory objects on cold-start, something went wrong — log to errors.
+- Expected order of magnitude: tens of channels × multiple threads each = dozens of memory objects on a 30-day cold-start.
+- **Hard floor (gate, not log)**: on cold-start, if you produce <5 Slack memory objects, this is a sign the enumeration was incomplete. Set `ok: false` on the run-status JSON with `error: "incomplete_slack_enumeration"` so the freshness check / watchdog surface it. Do NOT silently complete with low counts.
 
 **Gmail** (via Gmail MCP — UUID-namespaced tools):
 - Use `search_threads` with `label:important newer_than:<since>` (or per-user override). Iterate paginated results until exhausted.
@@ -150,8 +151,9 @@ Per-source instructions (in this order):
 - **Step 1 — enumerate**: call `query_granola_meetings` with `{"query": "List all my meetings since <cutoff-date>"}` (substitute `<cutoff-date>` with the actual ISO date, e.g. "2026-04-05"). Parse the response to extract titles, dates, and any UUIDs.
 - **Step 2 — fetch each body**: for every meeting in the enumeration, call `query_granola_meetings` again with either `{"document_ids": ["<uuid>"]}` (preferred when UUIDs are returned) or `{"query": "Show me the full notes from <title> on <date>"}` (fallback when only titles are visible). Each call returns the body for ONE meeting.
 - **Step 3 — write each**: render each meeting body to `$VAULT/raw/granola_note/<meeting-uuid-or-slug>.md`, compress with `--kind note --source-kind granola_note`.
-- Probe 5 (2026-05-05) showed 40 meetings in 14 days — a 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, log to errors.
-- Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most. The single-meeting body queries are fast.
+- Probe 5 (2026-05-05) showed 40 meetings in 14 days — a 30-day cold-start should yield 30+ meetings unless the user has gaps.
+- **Hard floor (gate, not log)**: on cold-start, if you produce <10 Granola memory objects, set `ok: false` on the run-status JSON with `error: "incomplete_granola_enumeration"`. The freshness check will surface it on the next user invocation; the watchdog routine will DM the user.
+- Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most. The single-meeting body queries are fast. If the enumeration query times out twice, fall back to weekly-paginated enumeration: 4 separate calls each scoped to one week of the cutoff window.
 
 **Google Meet transcripts**: skip in routine context — folder-watch path, needs local Meet-export sync.
 **Generic transcript drop**: skip in routine context — same reason.
