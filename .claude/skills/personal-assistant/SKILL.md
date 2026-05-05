@@ -112,12 +112,12 @@ When the user asks the skill to harvest (or the routine prompt invokes the skill
 ### Slack (via Slack MCP)
 
 1. Read `<content_root>/.harvest/slack-allow.txt` if it exists for the user's explicit channel allow-list (one channel ID or `#name` per line). If absent, fall back to discovery via search.
-2. **Discovery (when no allow-list)**: call `mcp__claude_ai_Slack__slack_search_channels` with name patterns `external-*`, `customer-*`, `partner-*` to find structurally-relevant channels. Combine with `mcp__claude_ai_Slack__slack_search_public_and_private` for `from:@me` posts since the cutoff to find activity-driven channels.
-3. **Flagged threads**: search `has::pencil:` reactions placed by the user. Threads carrying the user's pencil reaction get harvested regardless of channel. (If the search operator isn't reliable, fall back to listing recent threads by the user and inspecting reactions per-thread.)
-4. **Per thread to harvest**: call `mcp__claude_ai_Slack__slack_read_thread`. Render to a Markdown file with `## <iso> — user:<id>` headers per message (preserves speaker attribution per F3). Write to `<content_root>/raw/slack_thread/<channel>-<thread_ts>.md`.
-5. Run `tools/compress.py <raw-path> --kind thread --source-kind slack_thread` to produce the memory object. Compress writes to `<content_root>/memory/slack_thread/...` and applies clustering per #10.
-6. Update `<content_root>/.harvest/slack.json` with the new dedup_keys.
-7. Append a per-thread line to today's daily digest (see digest format below).
+2. **Discovery (when no allow-list)**: enumerate **comprehensively** — not just a sample. Call `slack_search_channels` with name patterns `external-*`, `customer-*`, `partner-*`, paginating via `cursor` until exhausted. Then `slack_search_public_and_private` for `from:@me after:<cutoff>` to find activity-driven channels not matching the prefix patterns. Then channels whose threads carry the user's `:pencil:` reaction (flagged threads) regardless of channel name.
+3. **Per thread to harvest**: call `mcp__claude_ai_Slack__slack_read_thread`. Render to a Markdown file with `## <iso> — user:<id>` headers per message (preserves speaker attribution per F3). Write to `<content_root>/raw/slack_thread/<channel>-<thread_ts>.md`.
+4. Run `tools/compress.py <raw-path> --kind thread --source-kind slack_thread` to produce the memory object. Compress writes to `<content_root>/memory/slack_thread/...` and applies clustering per #10.
+5. Update `<content_root>/.harvest/slack.json` with the new dedup_keys.
+6. Append a per-thread line to today's daily digest (see digest format below).
+7. **Failure-mode floor (per [#34](https://github.com/acardote/personal-assistant-ultra/issues/34))**: if a 30-day cold-start produces <5 Slack memory objects despite the user having known active channels, log "incomplete-enumeration suspected" to the run-status `errors` key. The right-shape number is dozens (channels × threads), not single digits.
 
 ### Gmail (via Gmail MCP)
 
@@ -128,11 +128,15 @@ When the user asks the skill to harvest (or the routine prompt invokes the skill
 
 ### Granola (via Granola MCP)
 
-1. Call `mcp__granola__list_meetings` (or `query_granola_meetings` if available) for items since the cutoff.
-2. For each meeting: call `mcp__granola__get_meeting_transcript` (or equivalent) to fetch full content.
-3. Render + write to `<content_root>/raw/granola_note/<meeting-id>.md`.
-4. Compress + dedup. The dedup matching from #10 will cluster across sources — Granola + Meet + Gmail of the same meeting produce one canonical + alternates.
+The Granola MCP exposes a single tool `query_granola_meetings` with shape `{query: string, document_ids?: uuid[]}`. Per #34, the cold-start harvest produced only 1 Granola memory object because the prior orchestration phrasing led the model to fetch a single most-recent meeting. Use the explicit two-step pattern:
+
+1. **Enumerate**: call `query_granola_meetings` with `{"query": "List all my meetings since <cutoff-date>"}` (substitute cutoff). The response is a list of meeting metadata (titles, dates, possibly UUIDs). Parse and accumulate.
+2. **Fetch each body**: for every meeting in the enumeration, call `query_granola_meetings` again with either `{"document_ids": ["<uuid>"]}` (preferred when UUIDs are visible) or `{"query": "Show me the full notes from <title> on <date>"}` (fallback). Each call returns ONE meeting's body.
+3. **Write each**: render to `<content_root>/raw/granola_note/<meeting-uuid-or-slug>.md`, compress with `--kind note --source-kind granola_note`.
+4. Dedup matching from #10 will cluster across sources — Granola + Meet + Gmail of the same meeting produce one canonical + alternates.
 5. Update `<content_root>/.harvest/granola.json`.
+
+**Failure-mode floor**: probe 5 (2026-05-05) showed 40 meetings in 14 days. A 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, log "incomplete-enumeration suspected" to the run-status `errors` key. Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most. Single-meeting body queries are fast.
 
 ### Google Meet transcripts
 

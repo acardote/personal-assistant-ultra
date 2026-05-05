@@ -1,7 +1,7 @@
-#!/usr/bin/env -S uv run --quiet --with tiktoken --script
+#!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["tiktoken>=0.7"]
+# dependencies = []
 # ///
 """Assemble layer-3 knowledge base files into a single rendered prompt slice.
 
@@ -34,11 +34,10 @@ import json
 import sys
 from pathlib import Path
 
-import tiktoken
-
 # Local import; sibling of this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _tokens import estimate_tokens  # noqa: E402
 
 DEFAULT_BUDGET = 4_000
 
@@ -125,8 +124,7 @@ def render(files: list[Path], method_root: Path, content_root: Path) -> str:
 
 
 def count_tokens(text: str) -> int:
-    enc = tiktoken.get_encoding("cl100k_base")
-    return len(enc.encode(text))
+    return estimate_tokens(text)
 
 
 def main(argv: list[str]) -> int:

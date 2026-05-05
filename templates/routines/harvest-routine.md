@@ -129,12 +129,32 @@ Determine harvest cutoff:
 - If `$VAULT/.harvest/runs/` contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
 - Otherwise: this IS a cold start: use "since 30 days ago".
 
-Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source, in this order:
-- Slack (via Slack MCP — UUID-namespaced `slack_search_*`/`slack_read_*` tools)
-- Gmail (via Gmail MCP — UUID-namespaced `search_threads`/`get_thread`/etc.)
-- Granola (via Granola MCP — `mcp__<uuid>__query_granola_meetings` as the entry point. For cold-start cycling: `{"query": "Show me the full notes from my most recent meeting"}` returns the most recent meeting body. For title-targeted retrieval: `{"query": "Show me all notes and action items from <meeting title>"}`. For UUID-targeted: `{"document_ids": ["<uuid>"]}`. Beware ~60s timeout on long natural-language queries — back off and retry once at most. Verified by probe 6 on 2026-05-05.)
-- Google Meet transcripts (skip in routine context — folder-watch path, needs local Meet-export sync)
-- Generic transcript drop (skip in routine context — same reason)
+Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source. **Do not stop at the first few items per source — enumerate and fetch comprehensively** (per #34 — the original cold-start fetched only 9 items because the prompt was vague about completeness).
+
+Per-source instructions (in this order):
+
+**Slack** (via Slack MCP — UUID-namespaced tools):
+- Use `slack_search_channels` with name patterns `external-*`, `customer-*`, `partner-*` to enumerate **ALL** matching channels — not just a few. Iterate `cursor` pagination until exhausted.
+- Additionally: use `slack_search_public_and_private` for `from:@me after:<cutoff>` to find activity-driven channels not matching the prefix patterns.
+- Additionally: search for threads carrying the user's `:pencil:` reaction (flag) regardless of channel.
+- For each unique channel discovered, list threads since cutoff and call `slack_read_thread` per thread. Render each to `$VAULT/raw/slack_thread/<channel>-<thread_ts>.md`.
+- Compress each via `tools/compress.py --kind thread --source-kind slack_thread`.
+- Expected order of magnitude: tens of channels × multiple threads each = dozens of memory objects on a 30-day cold-start. If you produce <5 Slack memory objects on cold-start, something went wrong — log to errors.
+
+**Gmail** (via Gmail MCP — UUID-namespaced tools):
+- Use `search_threads` with `label:important newer_than:<since>` (or per-user override). Iterate paginated results until exhausted.
+- For each: fetch via `get_thread`, render to `$VAULT/raw/gmail_thread/<thread-id>.md`, compress with `--kind email --source-kind gmail_thread`.
+- Refuse broad inbox harvesting (F2 from #6) — `important` labeling is the user's curation signal.
+
+**Granola** (via Granola MCP — `query_granola_meetings`):
+- **Step 1 — enumerate**: call `query_granola_meetings` with `{"query": "List all my meetings since <cutoff-date>"}` (substitute `<cutoff-date>` with the actual ISO date, e.g. "2026-04-05"). Parse the response to extract titles, dates, and any UUIDs.
+- **Step 2 — fetch each body**: for every meeting in the enumeration, call `query_granola_meetings` again with either `{"document_ids": ["<uuid>"]}` (preferred when UUIDs are returned) or `{"query": "Show me the full notes from <title> on <date>"}` (fallback when only titles are visible). Each call returns the body for ONE meeting.
+- **Step 3 — write each**: render each meeting body to `$VAULT/raw/granola_note/<meeting-uuid-or-slug>.md`, compress with `--kind note --source-kind granola_note`.
+- Probe 5 (2026-05-05) showed 40 meetings in 14 days — a 30-day cold-start should yield 30+ meetings unless the user has gaps. If you produce <10 Granola memory objects on cold-start, log to errors.
+- Caveat: `query_granola_meetings` has a ~60s timeout on long natural-language queries — back off and retry once at most. The single-meeting body queries are fast.
+
+**Google Meet transcripts**: skip in routine context — folder-watch path, needs local Meet-export sync.
+**Generic transcript drop**: skip in routine context — same reason.
 
 For each source's discovered items: write raw artifact to $VAULT/raw/<source-kind>/<id>.md, then invoke the compression pipeline:
 
@@ -148,7 +168,12 @@ Update $VAULT/.harvest/<source>.json dedup state. Append today's section to $VAU
 
 The `"scheduler": "routine"` field is mandatory — it is the marker the dual-active detection above grep's for. Match it exactly.
 
-Bound the run to ~10 minutes total. If a source is unreachable (MCP auth expired, tool not available), log to the digest's "errors:" line and the run-status JSON's "errors" key, then continue with other sources — do NOT retry.
+Bound the run by cadence:
+
+- **Cold-start (no prior `runs/*.json` exists)**: budget ~30 minutes. A 30-day backfill across multiple sources with per-item compress.py LLM calls genuinely takes that long. Per #34, the original 10-minute budget caused the routine to stop at 9 items (vs. expected dozens-to-hundreds).
+- **Steady-state (prior runs exist)**: budget ~10 minutes. Daily incremental harvest of 24h of new activity is small.
+
+If a source is unreachable (MCP auth expired, tool not available), log to the digest's "errors:" line and the run-status JSON's "errors" key, then continue with other sources — do NOT retry.
 
 After all sources complete, from $VAULT:
 

@@ -1,7 +1,7 @@
-#!/usr/bin/env -S uv run --quiet --with pyyaml --with tiktoken --script
+#!/usr/bin/env -S uv run --quiet --with pyyaml --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pyyaml>=6", "tiktoken>=0.7"]
+# dependencies = ["pyyaml>=6"]
 # ///
 """Acceptance tests for #8 — expiry_locked behavior + retrieval recency decay.
 
