@@ -85,6 +85,7 @@ Stale-detection rule of thumb: if the newest entry in `runs/` is older than 26h,
 | Symptom | Likely cause |
 |---|---|
 | Routine fires but the log shows `claude: command not found` | `__PATH_TO_CLAUDE__` is wrong. Hard-code the absolute path; launchd's PATH is minimal. |
+| Routine fires but the log shows `env: uv: No such file or directory` (or similar) | The wrapper's shebang relies on `uv` being on launchd's PATH, which is minimal. Either add `EnvironmentVariables` to the plist setting `PATH` to include `/opt/homebrew/bin` (M-series) or `/usr/local/bin` (Intel), or change the wrapper's shebang to call `uv` by absolute path. |
 | Routine fires but `claude -p` waits for interactive auth | First-run claude needs you to authenticate interactively. Run `claude` once manually before scheduling. |
 | Routine appears not to fire at all | Check `launchctl print gui/$(id -u)/com.acardote.personal-assistant-harvest` for state. macOS sometimes pauses agents. Common cause: laptop was asleep AND `RunAtLoad: false` AND Sleep > 1 day, so the calendar-interval window was missed. |
 | Permissions error writing to vault | The agent runs as your user. If `<content_root>` is on a network drive or different mount, ensure your user can write to it from a non-interactive session. |

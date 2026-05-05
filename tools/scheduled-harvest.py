@@ -85,14 +85,6 @@ def acquire_lock(lock_path: Path):
         fh.close()
 
 
-def is_first_run(runs_dir: Path) -> bool:
-    """Cold-start detection: no prior run-status files means we should
-    do the 30-day backfill on this first invocation."""
-    if not runs_dir.exists():
-        return True
-    return not any(runs_dir.glob("*.json"))
-
-
 def git_commit_and_push(content_root: Path, message: str) -> tuple[bool, str]:
     """Best-effort git commit + push from content_root. Returns (ok, detail)."""
     if not (content_root / ".git").is_dir():
@@ -165,9 +157,8 @@ def main(argv: list[str]) -> int:
     }
     write_status(status_path, status)
 
-    # Cold-start detection
-    cold_start = is_first_run(runs_dir.parent / "runs")  # before status_path was written? Already in runs/
-    # status_path was just written, so we have at least 1 file. Check for OTHER files.
+    # Cold-start detection: status_path was already written above (so runs/
+    # has ≥1 file), filter to OTHER files to see if any prior run exists.
     other_files = [p for p in runs_dir.glob("*.json") if p != status_path]
     cold_start = not other_files
 
