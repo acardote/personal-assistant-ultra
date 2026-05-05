@@ -38,6 +38,36 @@ tools/assemble-kb.py
 
 Do not proceed with the user's request until layer 3 is loaded into your working context. If `tools/assemble-kb.py` fails or produces empty output, surface the failure to the user and stop — operating without layer 3 violates the "always-in-context" invariant on issue #4. If `.assistant.local.json` is missing, the assembler will emit a loud warning + fall back to method-root: that's fixture/test mode, not production; if you see the warning during a real session, **stop and tell the user to set up the config** before proceeding.
 
+### Pre-flight: harvest freshness check (per [#27](https://github.com/acardote/personal-assistant-ultra/issues/27))
+
+Immediately after layer-3 loads, run:
+
+```
+tools/check-harvest-freshness.py --quiet
+```
+
+(also from the method-repo root). The check reads `<content_root>/.harvest/runs/*.json`, finds the newest by mtime, and exits 0 only if the most recent run is `ok: true` AND younger than 26 hours (using `started_at` from the run-status payload, falling back to filesystem mtime). On non-zero exit it emits a stderr banner with one of these states:
+
+- **STALE** — no successful run lately (older than threshold).
+- **FAILED** — most recent run reported `ok: false`.
+- **STUCK** — N (default 3) consecutive `ok: false` runs with the same `error`. The issue is chronic, not transient.
+- **STUCK_AND_STALE** — STUCK conditions hold AND the newest run also exceeds the staleness threshold. Two distinct problems present.
+- **MISSING** — no runs/ directory or no .json files in it (normal for a freshly-configured setup before the routine fires for the first time).
+- **CORRUPT** — newest .json file is unparseable (truncated write or manual corruption — likely the last run crashed mid-write).
+
+When the check exits non-zero, the banner already includes a state-appropriate summary (the `error` field is inlined, no extraction needed). Surface the banner verbatim to the user **before answering their request** and add remediation:
+
+- **STALE**: the routine may have stopped firing — direct the user to https://claude.ai/code/routines (or their launchd plist if they're on the alternative path). If the banner also surfaces a last-run error (e.g., "git push failed"), pass that along too.
+- **FAILED**: relay the banner's error inline; the most common cause is "critical connector enabled but not authenticated" (per the #25 / #26 §11 caveat).
+- **STUCK**: more urgent than FAILED — same error repeated N times. Tell the user to fix the underlying issue *before* the next fire (re-auth a connector, fix a config typo, etc.). Don't suggest "wait and see."
+- **STUCK_AND_STALE**: most urgent. The chronic error is masking a stalled scheduler — both problems need attention. Address the chronic error first (so the next fire might succeed), then verify the routine is actually firing.
+- **MISSING**: the harvest has never run — in real use this either means the routine hasn't been configured yet (point the user at `templates/routines/harvest-routine.md`), or this is a fresh clone on a new machine and the user hasn't yet pulled the vault's first runs.
+- **CORRUPT**: ask the user to inspect the file directly. Don't auto-fix or auto-delete.
+
+If the check exits 0 silently, proceed with the user's request — the harvest is healthy.
+
+**Honest scope note**: this check fires *only* when the user invokes the skill. It does not provide a true 26h SLA on detection — the detection window is bounded by user invocation cadence, not by the threshold. Out-of-band alerting (Slack self-DM from the harvest itself, daily-digest entry consumed by another surface) is tracked separately as follow-up work to fully close F1.
+
 ## Editorial discipline
 
 - **Never invent KB entries.** If the user asks about something that isn't in the KB and isn't derivable from layer-2 memory objects (when retrieval lands), say so explicitly. Hallucinated grounding is the failure mode that poisons every downstream consumer (see falsifier F2 on issue #3 / #4).
