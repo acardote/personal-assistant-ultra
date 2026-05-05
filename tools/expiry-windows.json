@@ -1,0 +1,19 @@
+{
+  "$comment": "Per-kind default TTL windows in days. null means no expiry. Operationalized in tools/prune.py and tools/compress.py. The recommended values follow Sei (strategy ~6mo, weekly ~3mo, legal never) plus 5 additional kinds the user is most likely to encounter via the harvester.",
+  "windows": {
+    "strategy": 180,
+    "weekly": 90,
+    "retrospective": 180,
+    "decision": null,
+    "legal": null,
+    "thread": 90,
+    "note": 90,
+    "glossary_term": null,
+    "incident": 365,
+    "customer_call": 180
+  },
+  "default_for_unknown_kind": 90,
+  "_overrides": {
+    "$comment": "Frontmatter convention: setting `expiry_locked: true` on a memory object prevents the compression pipeline from overwriting `expires_at` on re-compression. F3 mitigation."
+  }
+}

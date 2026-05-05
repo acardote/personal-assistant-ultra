@@ -1,0 +1,43 @@
+WEBVTT
+
+NOTE Quarterly planning — platform team
+NOTE 2026-04-22 15:00 UTC
+
+00:00:00.000 --> 00:00:08.500
+<v Alice>OK, let's lock the Q3 priorities. Three items on the agenda — spine v2 ship decision, retro on the v1 incident, and the harvester rollout.
+
+00:00:08.500 --> 00:00:24.300
+<v Bob>I'd flip the order. The harvester rollout is blocked on a security review I haven't been able to get on the calendar, so it's the only one with an external dependency. Let's push it to first so we can identify whether we need to cut scope.
+
+00:00:24.300 --> 00:00:42.800
+<v Alice>Fair. Bob, what's the harvester rollout decision we're trying to make?
+
+00:00:42.800 --> 00:01:08.000
+<v Bob>Whether to expose the personal-assistant harvester to the wider org as opt-in beta in Q3 or hold for Q4. Security review is blocked because they want a layer-1 retention policy before they'll sign off, and we don't have one — layer 1 is just "local-only, never committed." That works for one user but not for org-scale.
+
+00:01:08.000 --> 00:01:30.500
+<v Chris>I think the answer there is hold. Layer-1 retention is a real piece of work, and shipping opt-in beta without it is the kind of thing that comes back as a six-month migration. Better to define the retention policy first, even if it slips Q3.
+
+00:01:30.500 --> 00:01:42.000
+<v Alice>Agreed. Decision: hold harvester rollout to Q4, define layer-1 retention policy as a Q3 deliverable. Bob owns the policy doc.
+
+00:01:42.000 --> 00:02:01.300
+<v Bob>Understood. Target date for the retention policy?
+
+00:02:01.300 --> 00:02:18.700
+<v Alice>End of Q3. 2026-09-30. That gives us a quarter to draft, review with security, and run it past the data-governance team.
+
+00:02:18.700 --> 00:02:38.000
+<v Alice>OK, item two — spine v2 ship decision. Bob, what's your read?
+
+00:02:38.000 --> 00:03:05.500
+<v Bob>v2 ships in Q3 if and only if no v1 incidents between now and 2026-08-15. The 2026-04-18 incident is the baseline; if we have another one, that's a signal v1 isn't stable enough to deprecate yet, and v2 slips to Q4. If we go a clean 4 months, ship v2.
+
+00:03:05.500 --> 00:03:14.000
+<v Alice>Decision recorded. Item three — retro on the 2026-04-18 incident.
+
+00:03:14.000 --> 00:03:42.500
+<v Chris>Brief retro: detection was fast — 6 minutes, fastest on this surface. The drift between published draft and customer-implemented adapter is the recurring failure mode. Mitigation already in flight: v2 ships with explicit "common mistakes" callouts. No additional process change recommended.
+
+00:03:42.500 --> 00:03:55.000
+<v Alice>Thanks. We're done. Action items recorded in the doc. Adjourning.

@@ -1,0 +1,55 @@
+name: Bruno Parent
+description: Coordination issue. Holds goal, scope, target, assumption ledger, sequence map.
+title: "[parent] "
+labels: ["parent", "move:1"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: One sentence — what should be true after compilation.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What must change, and what must NOT change.
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      description: The system this compiles against (service, repo, surface).
+    validations:
+      required: true
+  - type: textarea
+    id: assumptions
+    attributes:
+      label: Assumption ledger
+      description: |
+        For this to work, what must be true? For it to fail, what must be true?
+      placeholder: |
+        - A1: ...
+        - A2: ...
+        - A3: ...
+    validations:
+      required: true
+  - type: textarea
+    id: sequence
+    attributes:
+      label: Sequence map
+      description: Children, in order. Use task-list syntax so GitHub renders progress.
+      placeholder: |
+        - [ ] #N: child summary
+        - [ ] #N+1: ...
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Constraints, references, links. Optional.
+    validations:
+      required: false

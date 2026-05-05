@@ -1,0 +1,54 @@
+{
+  "channel": "C0SPINE",
+  "thread_ts": "1745000000.000100",
+  "messages": [
+    {
+      "type": "message",
+      "user": "U0ALICE",
+      "ts": "1745000000.000100",
+      "text": "Spine v1 contract pre-prod canary went red at 14:02 UTC. Rolling back. Cause looks like the SCIM provisioning callback expecting `external_id` but our customer auth flow is sending `externalId`. We documented the contract as `external_id` snake_case in the published draft on 2026-05-12. Customer's adapter must have been written against an earlier draft."
+    },
+    {
+      "type": "message",
+      "user": "U0BOB",
+      "ts": "1745000060.000200",
+      "text": "Rollback confirmed at 14:08 UTC. Pre-prod is green. We went from `decided` -> `incident` in 6 minutes — that's actually the fastest detection we've ever had on this surface."
+    },
+    {
+      "type": "message",
+      "user": "U0ALICE",
+      "ts": "1745000180.000300",
+      "text": "Decision: we'll keep `external_id` (snake_case) as canonical and backport a translation shim that accepts `externalId` for 30 days, with a deprecation header. After 2026-06-15, only snake_case is accepted. This buys us a known migration window without forcing a contract rev."
+    },
+    {
+      "type": "message",
+      "user": "U0CHRIS",
+      "ts": "1745000300.000400",
+      "text": "Concern: 30 days might be tight for the 4 already-converted accounts. Per the Q2 strategy they keep custom contracts at current scope, but the `externalId` issue affects them too — at least 2 of them ship updates monthly and might miss the window."
+    },
+    {
+      "type": "message",
+      "user": "U0ALICE",
+      "ts": "1745000420.000500",
+      "text": "Good catch. Amended decision: 30-day shim + an explicit ping to those 4 accounts on day 7 reminding them of the deadline. SE team owns the ping per the Q2 SE allocation policy. If any of them haven't responded by day 21, we extend their personal deadline by another 30 days, no renegotiation on the canonical contract."
+    },
+    {
+      "type": "message",
+      "user": "U0BOB",
+      "ts": "1745000540.000600",
+      "text": "Logging this as an evidence point for the 2026-09-30 falsification check on Q2 strategy — the spine v1 contract had a real-world drift between published and customer-implemented, and the recovery cost was 6 minutes of incident time + a 30-day shim. Doesn't fire any of the four falsification criteria but worth tracking for the Q3 review."
+    },
+    {
+      "type": "message",
+      "user": "U0CHRIS",
+      "ts": "1745000700.000700",
+      "text": "Open question: do we update the published contract docs to call out snake_case explicitly with a 'common mistake' callout? I'd vote yes — the cost is one paragraph, the failure mode is real-deploy."
+    },
+    {
+      "type": "message",
+      "user": "U0ALICE",
+      "ts": "1745000820.000800",
+      "text": "Yes — Bob, can you own the doc update by EOD tomorrow (2026-04-16)? I'll handle the customer ping. Chris, you're not on either of these so feel free to focus on the v2 spine planning thread."
+    }
+  ]
+}

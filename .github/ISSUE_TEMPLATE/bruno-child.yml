@@ -1,0 +1,64 @@
+name: Bruno Child
+description: Delivery unit. One scope, one commit, one acceptance, ≥1 falsifier.
+title: "[child] "
+labels: ["child", "move:3"]
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Parent issue
+      description: "The parent issue number (e.g. #12)."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: One slice of the parent. What this child changes.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Specific, testable claims that must hold against landed state.
+    validations:
+      required: true
+  - type: textarea
+    id: falsifiers
+    attributes:
+      label: Falsifiers
+      description: |
+        At least one. A falsifier is a contract about reality that retracts this work if violated.
+        Format: "If <observable>, retract."
+      placeholder: |
+        - F1: If migration touches tables outside [users, sessions], retract.
+        - F2: If new query latency exceeds 1.5x baseline at p95, retract.
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: Owner
+      description: GitHub handle accountable for this child.
+    validations:
+      required: true
+  - type: dropdown
+    id: weight
+    attributes:
+      label: Weight
+      description: Determines review depth and adversarial linker pass.
+      options:
+        - trivial
+        - standard
+        - heavy
+      default: 1
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Optional context.
+    validations:
+      required: false

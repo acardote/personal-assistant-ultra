@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/acardote/personal-assistant-ultra/main/docs/schemas/memory-object.schema.json",
+  "title": "Memory Object",
+  "description": "Layer-2 representation in the three-layer memory architecture. The editorially compressed, structured form of a layer-1 raw artifact, retaining provenance back to the original.",
+  "type": "object",
+  "required": [
+    "id",
+    "source_uri",
+    "source_kind",
+    "created_at",
+    "expires_at",
+    "kind",
+    "tags"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier. UUID v4 or content-derived hash. Must be unique within the memory store."
+    },
+    "source_uri": {
+      "type": "string",
+      "format": "uri-reference",
+      "minLength": 1,
+      "description": "Resolvable pointer to the layer-1 raw artifact. Must dereference at write time."
+    },
+    "source_kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Origin classifier (open vocabulary). Recommended values: slack_thread, gmail_thread, gmeet_transcript, granola_note, transcript_file, deck, doc, manual_note."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 datetime when the memory object was written (not when the source was created)."
+    },
+    "expires_at": {
+      "type": ["string", "null"],
+      "description": "ISO 8601 datetime when this memory object should be pruned/demoted, or null for no expiry."
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Content classifier driving expiry windows and retrieval ranking (open vocabulary). Recommended values: strategy, weekly, retrospective, decision, legal, thread, note, glossary_term."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Free-form labels. Empty array allowed."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional human-readable title for retrieval display."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional one-sentence summary distinct from body."
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "expires_at": { "type": "string" } },
+        "required": ["expires_at"]
+      },
+      "then": {
+        "properties": {
+          "expires_at": { "format": "date-time" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,264 @@
+# Bruno close-gate
+#
+# Mechanically enforces SPEC §5.5 (Move 5 — Closure Against Reality):
+# a bruno-labeled issue cannot close without ALL of:
+#   - `state:reconciled` label
+#   - a `## Reconciliation` comment whose latest version contains a
+#     real provenance reference NEAR the word "Provenance" (URL,
+#     backtick-quoted ≥4-char token, or #N issue ref)
+#   - for `child` issues: a `## Falsifiers (move:4)` comment (or body)
+#   - for `child` issues: a `Parent: #<n>` reference in the issue body
+#
+# SCOPE: this gate fires only for issues labeled `parent` or `child`.
+# Plain (un-bruno-labeled) issues bypass — by design.
+#
+# THREAT MODEL: this gate is honest-author defense, not adversary defense.
+#
+# Permissions required: `issues: write` (to reopen + comment + label).
+# If `permissions:` is missing or insufficient, the API calls fail loudly
+# with "Resource not accessible" (this is intentional — see falsifier F4
+# on issue #2 of bruno-method: the workflow MUST fail loudly rather than
+# silently no-op in repos with restricted GITHUB_TOKEN scopes).
+
+name: Bruno close-gate
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  enforce-reconciliation:
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.issue.labels.*.name, 'parent') ||
+      contains(github.event.issue.labels.*.name, 'child')
+    steps:
+      - name: Enforce v0.2 reconciliation gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+
+            const labels = (context.payload.issue.labels || []).map(l => l.name);
+            const isChild = labels.includes('child');
+            const isParent = labels.includes('parent');
+            const issueBody = context.payload.issue.body || '';
+
+            // Helper: strip fenced code AND blockquoted lines, applied uniformly.
+            const stripBody = (b) =>
+              (b || '')
+                .replace(/```[\s\S]*?```/g, '')
+                .replace(/^>.*$/gm, '');
+
+            // Fetch comments fresh — F3 (issue #2): event payload may not include them.
+            // S3 race mitigation (#22): when a user closes via `gh issue close
+            // --comment "..."`, GitHub processes the close and the comment as
+            // separate operations and the close webhook can fire before the
+            // comment is in `listComments`. Sleep briefly and retry once if
+            // we don't see a `## Reconciliation` on the first read.
+            const reconRe = /^#{2,4}\s*reconciliation\b/im;
+            const fetchComments = () => github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            );
+            await new Promise(r => setTimeout(r, 3000));
+            let comments = await fetchComments();
+            const stripBodyEarly = (b) =>
+              (b || '').replace(/```[\s\S]*?```/g, '').replace(/^>.*$/gm, '');
+            const seemsReconciled = comments.some(c => reconRe.test(stripBodyEarly(c.body)));
+            if (!seemsReconciled) {
+              await new Promise(r => setTimeout(r, 4000));
+              comments = await fetchComments();
+            }
+
+            // F-gate-bot-self-reject (#27): filter bot-authored comments out
+            // of gate consideration. Defense in depth — today's gate complaint
+            // doesn't accidentally satisfy any check, but a future bot
+            // (Dependabot, Copilot, etc.) commenting with Bruno-shaped text
+            // shouldn't qualify either.
+            const isBot = (c) =>
+              (c.user && (c.user.type === 'Bot' || c.user.login === 'github-actions[bot]'));
+            comments = comments.filter(c => !isBot(c));
+
+            // ---- Check 1: at least one `## Reconciliation` heading ----
+            // F5: tolerant — ##/###/####, any case. Apply uniform strip
+            // so a quoted/fenced reconciliation in unrelated comments
+            // doesn't shadow a real one (#15 Finding I2).
+            const reconHeadingRe = /^#{2,4}\s*reconciliation\b/im;
+            const reconComments = comments
+              .filter(c => reconHeadingRe.test(stripBody(c.body)))
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const hasReconciliation = reconComments.length > 0;
+
+            // ---- Check 2: state:reconciled label (C3 from #6) ----
+            const hasReconciledLabel = labels.includes('state:reconciled');
+
+            // ---- Check 2.5 (v0.3): multi-author actor check ----
+            // Per #31: the latest reconciliation comment's author must be
+            // - an issue assignee, OR
+            // - have push permission on the repo (admin/maintain/write), OR
+            // - be the issue creator AND assignees is empty (F1 of #31), OR
+            // - the issue carries the `allow-third-party-reconcile`
+            //   escape-hatch label.
+            // Bot comments are already filtered upstream.
+            let actorOK = !hasReconciliation;
+            let actorDetail = '';
+            const escapeLabel = labels.includes('allow-third-party-reconcile');
+            if (hasReconciliation && !escapeLabel) {
+              const latest = reconComments[0];
+              const author = latest.user && latest.user.login;
+              const assignees = (context.payload.issue.assignees || []).map(a => a.login);
+              const issueCreator = context.payload.issue.user && context.payload.issue.user.login;
+              if (assignees.includes(author)) {
+                actorOK = true;
+              } else if (assignees.length === 0 && author === issueCreator) {
+                // F1 mitigation: forgot to self-assign; author == creator is OK.
+                actorOK = true;
+              } else {
+                try {
+                  const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+                    owner, repo, username: author,
+                  });
+                  const level = perm.data.permission;  // admin|maintain|write|triage|read|none
+                  if (['admin', 'maintain', 'write'].includes(level)) {
+                    actorOK = true;
+                  } else {
+                    actorDetail = `latest \`## Reconciliation\` author \`${author}\` is not an assignee and has \`${level}\` permission (need write or higher)`;
+                  }
+                } catch (e) {
+                  actorDetail = `latest \`## Reconciliation\` author \`${author}\` could not be permission-checked (API error: ${e.message})`;
+                }
+              }
+            } else if (escapeLabel) {
+              core.info('allow-third-party-reconcile label present; skipping actor check.');
+              actorOK = true;
+            }
+
+            // ---- Check 3 (NEW v0.2): latest reconciliation has provenance ----
+            // Tightened (#15 Critical Finding 1): require Provenance keyword
+            // AND a meaningful reference NEAR it (within 500 chars window).
+            // Reference = URL OR backtick-quoted ≥4 chars OR #N issue ref.
+            // Sentinels like `TBD` (3 chars) won't satisfy.
+            let provenanceOK = false;
+            if (hasReconciliation) {
+              const latest = reconComments[0];
+              const stripped = stripBody(latest.body);
+              const provIdx = stripped.search(/\bprovenance\b/i);
+              if (provIdx >= 0) {
+                const window = stripped.slice(provIdx, provIdx + 500);
+                provenanceOK =
+                  /https?:\/\/\S+/.test(window)
+                  // Backtick-quoted content of ≥4 non-whitespace, non-backtick chars.
+                  // Permissive enough to accept paths with `~` (e.g. `~/path/file`),
+                  // section headings (with spaces, captured separately below), commit
+                  // SHAs, run ids, etc. Rejects empty backticks and short sentinels.
+                  || /`[^`\s][^`]{2,}[^`\s]`/.test(window)
+                  || /#\d+/.test(window);
+              }
+            }
+
+            // ---- Check 4 (v0.2 / v0.3): for `child` issues, ≥1 `## Falsifiers` heading ----
+            // v0.3 (#26): accept the heading in either the issue BODY or any comment.
+            // The `(move:4)` suffix is optional (the bruno-child issue template uses
+            // bare `## Falsifiers`; `/bruno falsify` produces `## Falsifiers (move:4)`).
+            // Both are valid Move-4 evidence.
+            const falsifiersRe = /^#{2,4}\s*falsifiers\b/im;
+            const hasFalsifiers = !isChild || (
+              falsifiersRe.test(stripBody(issueBody))
+              || comments.some(c => falsifiersRe.test(stripBody(c.body)))
+            );
+
+            // ---- Check 5 (v0.2 / v0.3): for `child` issues, body contains Parent: #N ----
+            // v0.3 (#28): API-validate the referenced issue exists AND has the
+            // `parent` label. Structural-only check accepted Parent: #999999
+            // and other nonsense.
+            const parentRefRe = /(?:^|\n)\s*\*{0,2}\s*parent\s*\*{0,2}\s*:\s*#(\d+)/i;
+            let hasParentRef = !isChild;
+            let parentRefDetail = '';
+            if (isChild) {
+              const match = stripBody(issueBody).match(parentRefRe);
+              if (!match) {
+                parentRefDetail = 'no `Parent: #<n>` reference in body';
+              } else {
+                const parentNum = parseInt(match[1], 10);
+                try {
+                  const parent = await github.rest.issues.get({
+                    owner, repo, issue_number: parentNum,
+                  });
+                  const parentLabels = (parent.data.labels || []).map(l => typeof l === 'string' ? l : l.name);
+                  if (parentLabels.includes('parent')) {
+                    hasParentRef = true;
+                  } else {
+                    parentRefDetail = `Parent: #${parentNum} exists but lacks the \`parent\` label (labels: ${parentLabels.join(', ') || 'none'})`;
+                  }
+                } catch (e) {
+                  if (e.status === 404) {
+                    parentRefDetail = `Parent: #${parentNum} does not exist`;
+                  } else {
+                    // Fail closed on other API errors — see #28 F2.
+                    parentRefDetail = `Parent: #${parentNum} could not be validated (API error: ${e.message})`;
+                  }
+                }
+              }
+            }
+
+            const allOK = hasReconciliation && hasReconciledLabel && provenanceOK
+                          && hasFalsifiers && hasParentRef && actorOK;
+
+            if (allOK) {
+              core.info('Bruno close-gate v0.2 — all checks passed; close stands.');
+              return;
+            }
+
+            const missing = [];
+            if (!hasReconciliation) missing.push('a `## Reconciliation` comment');
+            if (!hasReconciledLabel) missing.push('the `state:reconciled` label');
+            if (hasReconciliation && !provenanceOK) missing.push('at least one non-empty `Provenance:` line in the latest `## Reconciliation` comment');
+            if (!hasFalsifiers) missing.push('a `## Falsifiers (move:4)` comment (children must show Move-4 work)');
+            if (!hasParentRef) missing.push(parentRefDetail || 'a `Parent: #<n>` reference in the issue body (children must link to a parent)');
+            if (!actorOK) missing.push(actorDetail || 'reconciliation comment author must be an assignee or have push permission (or apply `allow-third-party-reconcile`)');
+
+            const explanation = [
+              `⚠️ **Bruno close-gate fired** — closure requires ALL of: ${missing.join('; ')}.`,
+              '',
+              'Per [SPEC §5.5](https://github.com/acardote/bruno-method/blob/main/SPEC.md#55-move-5--closure-against-reality), an issue cannot close without reconciling acceptance against landed state. v0.2 additionally requires evidence of Move-4 (falsifiers) and parent linkage for children.',
+              '',
+              'To proceed:',
+              '1. Address each missing item above.',
+              '2. Run `/bruno reconcile` (which posts the comment AND adds `state:reconciled` only when all criteria match with non-empty provenance).',
+              '3. Close again.',
+              '',
+              `_The gate fired at ${new Date().toISOString()}._`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number, body: explanation
+            });
+
+            await github.rest.issues.update({
+              owner, repo, issue_number, state: 'open'
+            });
+
+            // S4 (#22): keep `state:*` labels mutually exclusive. Remove any
+            // existing state:* label before adding state:reviewing.
+            for (const ln of labels) {
+              if (ln.startsWith('state:') && ln !== 'state:reviewing') {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number, name: ln,
+                  });
+                } catch (e) {
+                  core.warning(`Could not remove ${ln}: ${e.message}`);
+                }
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number, labels: ['state:reviewing']
+            });
+
+            core.setFailed(`Issue reopened: missing ${missing.join('; ')}.`);

@@ -1,0 +1,67 @@
+{
+  "_README": "These are PLACEHOLDER questions. Per acceptance criterion 1 of issue #9, the real evaluation requires 10 questions the user actually asks recurringly today, frozen BEFORE running the harness. The user must replace these with real questions before treating the harness output as evidence for or against A1 ('architecture > model'). Falsifier F1 specifically requires each question to be traceable to ≥2 prior occurrences in the user's chat/search/note history.",
+  "_status": "PLACEHOLDER — awaiting user's real recurring questions",
+  "_frozen_date": null,
+  "questions": [
+    {
+      "id": "q01",
+      "text": "What's the current Q2 platform strategy decision on integration?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q02",
+      "text": "What's the Q1 2026 baseline pilot conversion rate I should compare against?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q03",
+      "text": "What were the lessons from the v1 spine pre-prod incident?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q04",
+      "text": "When does the legacy event vocabulary migration window close?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q05",
+      "text": "Should we accept a 60-day customer migration extension?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q06",
+      "text": "What's the v2 spine ship-or-slip rule?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q07",
+      "text": "Why was the personal-assistant harvester rollout deferred to Q4?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q08",
+      "text": "What's the decision on field naming conventions for v2 spine?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q09",
+      "text": "Who owns the layer-1 retention policy work and when is it due?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    },
+    {
+      "id": "q10",
+      "text": "What does Bruno discipline require before closing a parent issue in this project?",
+      "_placeholder": true,
+      "_recurring_evidence": null
+    }
+  ]
+}

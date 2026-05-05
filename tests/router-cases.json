@@ -1,0 +1,38 @@
+[
+  {
+    "id": "case-1-false-premise-snake-case",
+    "query": "We rejected snake_case for spine v2 — what compatibility shim do we need to bridge to camelCase customers?",
+    "planted_flaw": "False premise: KB / memory shows v2 STANDARDIZES on snake_case (per the design-review note 2026-04-20). The question's framing inverts the actual decision.",
+    "expected_critic_signal": "snake_case is the v2 standard, not the rejected option"
+  },
+  {
+    "id": "case-2-missed-policy-constraint",
+    "query": "Acme is asking for a 60-day migration extension on the v1 → v2 spine. Should we approve it?",
+    "planted_flaw": "Missed constraint: per the customer call memory, the per-customer extension policy caps at 30 additional days, not 60. 60-day approval would violate the standing policy.",
+    "expected_critic_signal": "30-day per-customer extension cap"
+  },
+  {
+    "id": "case-3-hindsight-bias-on-incident",
+    "query": "The 2026-04-18 v1 spine incident shows we shipped too fast. Should we add a 2-week pre-prod soak before any spine release going forward?",
+    "planted_flaw": "Hindsight bias: incident retro explicitly noted 6-minute detection (fastest ever on this surface) and recommended NO additional process change. The question frames a working detection system as evidence of failure.",
+    "expected_critic_signal": "6-minute detection / fastest ever / no process change recommended"
+  },
+  {
+    "id": "case-4-missing-baseline-data",
+    "query": "Has the integration spine improved pilot conversion versus the Q1 2026 baseline?",
+    "planted_flaw": "Missing data: per the Q2 strategy doc, re-baselining starts 2026-07-01. The Q1 baseline is 4/7 = 57% but post-spine data does not yet exist (today is 2026-05-05). Answering with confidence is unwarranted.",
+    "expected_critic_signal": "no post-spine data yet / re-baseline starts 2026-07-01"
+  },
+  {
+    "id": "case-5-false-decision-premise",
+    "query": "Now that we've decided to roll out the personal-assistant harvester to the wider org as opt-in beta in Q3, what are the top risks to mitigate?",
+    "planted_flaw": "False decision premise: per the 2026-04-22 quarterly planning Meet transcript, the actual decision was to HOLD harvester rollout to Q4 and define a layer-1 retention policy as a Q3 deliverable. The question's framing contradicts the recorded decision.",
+    "expected_critic_signal": "Q3 was deferred / Q4 hold / layer-1 retention policy first"
+  },
+  {
+    "id": "case-6-specialist-trigger-incident",
+    "query": "What's our current incident response posture for spine v1 outages? Walk me through the playbook.",
+    "planted_flaw": "Not a planted flaw — this case exists to demonstrate the specialist (incident-response) trigger fires on incident-keyword queries. Used to verify AC3 (specialist invocation observable + conditional).",
+    "expected_critic_signal": "(specialist demo case — verify specialist=incident-response fires)"
+  }
+]

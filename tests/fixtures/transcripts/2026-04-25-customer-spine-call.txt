@@ -1,0 +1,25 @@
+Customer call transcript — Acme Corp, integration kickoff
+2026-04-25 16:00 UTC
+Attendees: Alice (platform-spine), Erin (Acme integration lead), Frank (Acme architect)
+
+Erin: Thanks for hopping on. We got the spine v1 contract docs you sent over last week. We've started implementing against the snake_case fields after the camelCase incident your team had — saw the deprecation note. Question on the audit export schema: the bucket-write IAM permissions you're requiring — we'd prefer to grant a service account rather than a per-user OAuth grant. Is that supported?
+
+Alice: Yes. The audit export supports both. Service account is actually our recommended path for production. The user OAuth grant is for the integration test phase only — most customers move to service accounts within the first month.
+
+Frank: Good. Second question: the rate limit on the webhook endpoint. We saw 100 events per second per customer in the docs. Acme's volume during quarterly cycles spikes to about 600/s for short bursts. Is that going to throttle us?
+
+Alice: The 100/s is a soft limit that auto-scales up when we see sustained traffic. Bursts to 600/s are OK; what triggers throttling is sustained 1000+/s for more than 30 seconds. If you expect that pattern, ping us in advance and we'll pre-provision.
+
+Erin: Got it. Last one — the migration window. We're on the v0 contract from when we onboarded last year. The 90-day migration window for legacy event vocabularies — does that start from when the customer signs the v1 amendment, or from a fixed date?
+
+Alice: Fixed date. Started on 2026-05-01. Hard cutoff is 2026-07-30. Per-customer extension up to 30 additional days is available if your SE rep flags it before day 21 of the window. So for Acme, you'd need to flag by 2026-05-21.
+
+Frank: That's tight given our Q2 release schedule. Erin, can you ping the SE rep this week?
+
+Erin: Yes, I'll do it tomorrow.
+
+Alice: One more thing — when you ship to v1, please use the idempotency_key on every event. Even though it's optional in v1, v2 will require it, and customers who adopt it now skip the v2 retry-handling complexity entirely.
+
+Frank: Noted. We'll bake it in from day one.
+
+Alice: Great. I'll send a follow-up email with the contact list and the SE rep handoff. Talk soon.
