@@ -10,6 +10,7 @@ If the time-budget claim breaks for you, that's an A7 falsifier — please open 
 - Python 3.10+ on PATH.
 - [`uv`](https://docs.astral.sh/uv/) — the tools use uv's inline-PEP-723 dependency declarations so you don't manage venvs explicitly. Install with `brew install uv` or follow upstream.
 - [`gh`](https://cli.github.com) — the GitHub CLI, for cloning and (optionally) interacting with PRs.
+- `claude` authenticated and on PATH — bootstrap checks this exists; if it's installed but not authenticated yet, run `claude` once interactively (it'll walk you through auth) before bootstrap so that the harvest pipeline's `claude -p` calls don't hit auth-expiry errors at runtime.
 - [Claude Code](https://docs.claude.com/en/docs/claude-code/setup) installed (`claude` on PATH). The skill runs inside Claude Code; the harvester also calls `claude -p` for compression.
 - A content-vault GitHub repo you control (or somewhere local — see step 2). Empty repo is fine.
 - The MCPs you want to harvest from — see [`docs/mcp-setup.md`](mcp-setup.md). At minimum, the Granola, Slack, or Gmail MCPs configured in your Claude Code account if you want to run the live-data harvest. For first setup you can skip MCPs and use the synthetic fixture path.
@@ -52,11 +53,14 @@ If it reports a problem, fix it as instructed and re-run. Bootstrap is idempoten
 
 ## Step 4 — copy KB templates into your vault
 
+Replace `<content_root>` below with the vault path you gave bootstrap (or use `python3 -c "import json; print(json.load(open('.assistant.local.json'))['paths']['content_root'])"` to read it back without `jq`):
+
 ```
-mkdir -p $(jq -r .paths.content_root .assistant.local.json)/kb
-cp kb-templates/people.md.example   $(jq -r .paths.content_root .assistant.local.json)/kb/people.md
-cp kb-templates/org.md.example      $(jq -r .paths.content_root .assistant.local.json)/kb/org.md
-cp kb-templates/decisions.md.example $(jq -r .paths.content_root .assistant.local.json)/kb/decisions.md
+VAULT=$(python3 -c "import json; print(json.load(open('.assistant.local.json'))['paths']['content_root'])")
+mkdir -p "$VAULT/kb"
+cp kb-templates/people.md.example   "$VAULT/kb/people.md"
+cp kb-templates/org.md.example      "$VAULT/kb/org.md"
+cp kb-templates/decisions.md.example "$VAULT/kb/decisions.md"
 ```
 
 Open the three files in your vault and replace placeholder content with real entries about you, your org, and your durable decisions. The templates carry the format documentation inline; just fill in.

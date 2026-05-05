@@ -18,7 +18,7 @@ If you want the deep version, jump to [`docs/setup.md`](docs/setup.md). The shor
 1. **Clone this repo** — `git clone git@github.com:acardote/personal-assistant-ultra.git`
 2. **Create a content vault repo** — a private repo somewhere you control. Empty is fine.
 3. **Clone the vault locally** — anywhere; commonly `~/Projects/<your>-pa-vault`.
-4. **Run the bootstrap walker** — `tools/bootstrap.py` interactively creates `.assistant.local.json` pointing at the vault, verifies your MCP setup, and exercises a smoke harvest.
+4. **Run the bootstrap walker** — `tools/bootstrap.py` interactively creates `.assistant.local.json` pointing at the vault, verifies the local environment (claude/uv/git on PATH, vault writable, KB assembly clean), and runs a harvest dry-run smoke to catch pipeline-import regressions. It does NOT verify MCP availability or run live harvests; that's step 6 of [`docs/setup.md`](docs/setup.md).
 5. **Invoke the skill** — open a Claude Code session in this method-repo checkout and run `/personal-assistant`.
 
 If `tools/bootstrap.py` says everything's healthy, you're ready. If not, it tells you what's missing with prescriptive next steps.

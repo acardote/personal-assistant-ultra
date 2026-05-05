@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -48,11 +49,11 @@ class CheckResult:
 
 
 def check_command_on_path(cmd: str) -> CheckResult:
-    found = subprocess.run(["which", cmd], capture_output=True, text=True).returncode == 0
+    found = shutil.which(cmd) is not None
     return CheckResult(
         name=f"`{cmd}` on PATH",
         passed=found,
-        detail=f"`which {cmd}` returned {'success' if found else 'failure'}",
+        detail=f"resolved via shutil.which({cmd!r}): {'found' if found else 'not found'}",
         remediation=(
             f"Install {cmd} or ensure it's on PATH. See docs/setup.md prerequisites."
             if not found
@@ -154,14 +155,53 @@ def check_harvest_state_writable(vault_path: Path) -> CheckResult:
         probe = state_dir / ".bootstrap-probe"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        return CheckResult(name=f"vault/.harvest/ writable", passed=True)
+        return CheckResult(name="vault/.harvest/ writable", passed=True)
     except OSError as e:
         return CheckResult(
-            name=f"vault/.harvest/ writable",
+            name="vault/.harvest/ writable",
             passed=False,
             detail=str(e),
             remediation=f"Fix permissions on {state_dir}.",
         )
+
+
+def check_harvest_dry_run() -> CheckResult:
+    """Smoke-test the harvest pipeline end-to-end short of an LLM call.
+    Per challenger F2 on PR #23: bootstrap had been claiming green status
+    on `which claude` alone, which doesn't catch claude-auth expiry or
+    a misconfigured harvest pipeline. The fixture dry-run exercises:
+      - tools/harvest.py imports and runs (config layer, dedup state, etc.)
+      - The fixture file at tests/fixtures/slack/ is reachable
+      - derive_raw_path / derive_memory_path resolve against content_root
+        without crashing (the previous reviewer-caught bug class)
+    Stops short of compress.py's claude -p invocation — that's verified by
+    the user running step 5 in setup.md (a real harvest, ~30s)."""
+    proc = subprocess.run(
+        [
+            str(METHOD_ROOT / "tools" / "harvest.py"),
+            "--source", "slack-fixture",
+            "--since", "2025-01-01",
+            "--dry-run",
+        ],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0 and "would write" in proc.stderr:
+        return CheckResult(
+            name="harvest pipeline dry-run smoke OK",
+            passed=True,
+            detail="harvest --source slack-fixture --dry-run completed without errors",
+        )
+    return CheckResult(
+        name="harvest pipeline dry-run smoke",
+        passed=False,
+        detail=(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit {proc.returncode}"),
+        remediation=(
+            "Harvest pipeline failed before any LLM call. Common causes: "
+            "missing tests/fixtures/slack/, content_root pointing at a non-vault "
+            "directory, broken _config.py import path. Re-run with the failing "
+            "command directly to see the full stack trace."
+        ),
+    )
 
 
 def render_summary(results: list[CheckResult]) -> str:
@@ -222,6 +262,7 @@ def main(argv: list[str]) -> int:
         check_command_on_path("git"),
         check_harvest_state_writable(vault_path),
         check_kb_assembly(),
+        check_harvest_dry_run(),
     ]
 
     print(render_summary(results))

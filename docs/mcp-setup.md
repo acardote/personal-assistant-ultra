@@ -59,4 +59,4 @@ This source is purely file-based and has no MCP dependency.
 
 ## Verifying MCP availability
 
-The bootstrap walker (`tools/bootstrap.py`) asks Claude Code to enumerate the available MCPs and reports which of the four expected (Slack, Gmail, Granola, Meet-via-Drive) are reachable. If your setup is partial that's OK — the skill works with whatever subset you have configured; missing MCPs just mean the corresponding live-harvest path isn't available.
+The bootstrap walker (`tools/bootstrap.py`) does NOT verify MCP availability — verifying remote MCP reachability would require a Claude Code session, and bootstrap is a CLI script. To test that an MCP is reachable for harvest, open a Claude Code session in the method-repo checkout and ask the skill to list available MCPs or attempt a small harvest. Missing MCPs aren't fatal — the skill works with whatever subset you have configured; missing MCPs just mean the corresponding live-harvest path isn't available, and you fall back to the file-based source for that channel (where one exists).
