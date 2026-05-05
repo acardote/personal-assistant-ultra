@@ -5,17 +5,29 @@
 # ///
 """Check whether the scheduled harvest is firing on cadence.
 
-This is the F1 silent-failure detector for the routine path (#27).
+This is the F1 silent-failure detector for the routine path (#27). Note that
+this is not a true SLA on detection time — it's a check that surfaces a
+warning when the user invokes `/personal-assistant`. The window is bounded
+by user-invocation cadence, not by the 26h threshold below. Out-of-band
+alerting (Slack self-DM, daily-digest entry) is tracked separately as
+follow-up work.
 
-Reads `<content_root>/.harvest/runs/*.json`, finds the newest entry by
-mtime, and decides:
-  - PASS:  newest run is `ok: true` AND younger than the staleness threshold
-  - STALE: newest run is older than the threshold (no successful run lately)
-  - FAILED: newest run is `ok: false` (most recent fire errored out)
+Reads `<content_root>/.harvest/runs/*.json`, finds the newest entry, and
+decides:
+  - PASS:    newest run is `ok: true` AND younger than the staleness threshold
+  - STALE:   newest run is older than the threshold (no successful run lately)
+  - FAILED:  newest run is `ok: false` (most recent fire errored out)
+  - STUCK:   N consecutive `ok: false` runs with the same error (issue is
+             chronic, not transient — surfaces a different message)
   - MISSING: no runs/ directory or no .json files in it
+  - CORRUPT: newest .json file is unparseable (truncated write or manual
+             corruption — likely indicates the last run crashed mid-write)
 
-The staleness threshold defaults to 26 hours (covers a daily-cadence routine
-plus 2h slack for clock skew or one slow run). Override with --max-age-hours.
+Age clock: prefers the `started_at` field from the run-status JSON payload,
+falling back to filesystem mtime if the payload is absent or unparseable.
+This matters because `git clone`, `cp -r`, and the backup/restore tooling
+all reset mtime — using mtime alone would silently report PASS for a
+months-old vault snapshot.
 
 By design this works against runs/ files written by EITHER scheduler:
   - launchd path (`tools/scheduled-harvest.py`) writes `"scheduler": "launchd"`
@@ -24,7 +36,7 @@ The check is scheduler-agnostic — it cares about freshness, not provenance.
 
 Exit codes:
   0 — PASS
-  1 — STALE / FAILED / MISSING (any reason the user should investigate)
+  1 — STALE / FAILED / STUCK / MISSING / CORRUPT (any reason to investigate)
   2 — config error (couldn't load .assistant.local.json)
 
 Output formats:
@@ -51,16 +63,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
 
 DEFAULT_MAX_AGE_HOURS = 26
+STUCK_CONSECUTIVE_THRESHOLD = 3  # N consecutive same-error failures → STUCK
 
 
 @dataclass(frozen=True)
 class FreshnessResult:
-    state: str  # "PASS" | "STALE" | "FAILED" | "MISSING"
+    state: str  # "PASS" | "STALE" | "FAILED" | "STUCK" | "MISSING" | "CORRUPT"
     newest_path: Path | None
     age_hours: float | None
+    age_source: str | None  # "started_at" | "mtime" | None
     scheduler: str | None  # "routine" | "launchd" | None
     payload_ok: bool | None
     error: str | None
+    consecutive_failures: int | None
     summary: str
 
     def to_dict(self) -> dict:
@@ -68,9 +83,11 @@ class FreshnessResult:
             "state": self.state,
             "newest_path": str(self.newest_path) if self.newest_path else None,
             "age_hours": round(self.age_hours, 2) if self.age_hours is not None else None,
+            "age_source": self.age_source,
             "scheduler": self.scheduler,
             "payload_ok": self.payload_ok,
             "error": self.error,
+            "consecutive_failures": self.consecutive_failures,
             "summary": self.summary,
         }
 
@@ -79,94 +96,177 @@ def _utcnow() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+def _parse_iso(ts: str) -> _dt.datetime | None:
+    """Parse an ISO-8601 UTC timestamp. Tolerates both `Z` suffix and explicit `+00:00`."""
+    if not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt
+
+
+def _read_payload(path: Path) -> tuple[dict | None, bool]:
+    """Returns (payload_dict_or_None, parse_ok). parse_ok=False indicates the file
+    exists but is unparseable — distinct from "successfully parsed but not a dict",
+    which still returns parse_ok=True with payload=None."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, False
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, False
+    if not isinstance(payload, dict):
+        return None, True
+    return payload, True
+
+
+def _count_consecutive_failures(files: list[Path]) -> tuple[int, str | None]:
+    """Walk newest-to-oldest, count how many consecutive runs reported ok=false
+    with the same `error` text. Returns (count, error_text) — count is 0 if the
+    newest run was ok=true or unparseable; count is 1 for an isolated failure."""
+    error_text: str | None = None
+    count = 0
+    for path in files:
+        payload, parse_ok = _read_payload(path)
+        if not parse_ok or not payload:
+            break
+        if payload.get("ok") is False:
+            this_error = payload.get("error") or ""
+            if count == 0:
+                error_text = this_error
+                count = 1
+            elif this_error == error_text:
+                count += 1
+            else:
+                break
+        else:
+            break
+    return count, error_text
+
+
 def assess_freshness(runs_dir: Path, max_age_hours: float) -> FreshnessResult:
     if not runs_dir.is_dir():
         return FreshnessResult(
-            state="MISSING",
-            newest_path=None,
-            age_hours=None,
-            scheduler=None,
-            payload_ok=None,
-            error=None,
+            state="MISSING", newest_path=None, age_hours=None, age_source=None,
+            scheduler=None, payload_ok=None, error=None, consecutive_failures=None,
             summary=(
-                f"runs/ directory not found at {runs_dir}. The scheduled harvest "
-                f"has never written a run-status file at this content root."
+                f"No harvest run-status files yet at {runs_dir}. If you've configured "
+                f"the scheduled routine and are waiting for the first fire, this is "
+                f"expected. Otherwise, configure the routine per "
+                f"`templates/routines/harvest-routine.md`."
             ),
         )
     files = sorted(runs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         return FreshnessResult(
-            state="MISSING",
-            newest_path=None,
-            age_hours=None,
-            scheduler=None,
-            payload_ok=None,
-            error=None,
+            state="MISSING", newest_path=None, age_hours=None, age_source=None,
+            scheduler=None, payload_ok=None, error=None, consecutive_failures=None,
             summary=(
                 f"runs/ directory exists at {runs_dir} but contains no .json status "
-                f"files. Has the scheduled harvest ever fired?"
+                f"files. Configure the routine per `templates/routines/harvest-routine.md` "
+                f"if you haven't already, or wait for its first fire."
             ),
         )
 
     newest = files[0]
-    mtime = _dt.datetime.fromtimestamp(newest.stat().st_mtime, tz=_dt.timezone.utc)
-    age_hours = (_utcnow() - mtime).total_seconds() / 3600.0
+    payload, parse_ok = _read_payload(newest)
 
-    payload: dict | None
-    try:
-        payload = json.loads(newest.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            payload = None
-    except (json.JSONDecodeError, OSError):
-        payload = None
+    if not parse_ok:
+        # Truncated write / manual corruption — distinct signal that the last run
+        # crashed mid-write or someone edited the file. Don't silently PASS.
+        return FreshnessResult(
+            state="CORRUPT", newest_path=newest, age_hours=None, age_source=None,
+            scheduler=None, payload_ok=None, error=None, consecutive_failures=None,
+            summary=(
+                f"Newest harvest run-status file at {newest} is unparseable. "
+                f"Either the most recent run crashed mid-write, or the file was "
+                f"manually edited. Investigate the file directly."
+            ),
+        )
+
+    # Determine age — prefer started_at from payload (resists mtime reset by
+    # git clone / cp / backup-restore); fallback to mtime.
+    age_hours: float
+    age_source: str
+    started_at = payload.get("started_at") if payload else None
+    parsed_started = _parse_iso(started_at) if started_at else None
+    if parsed_started is not None:
+        age_hours = (_utcnow() - parsed_started).total_seconds() / 3600.0
+        age_source = "started_at"
+    else:
+        mtime = _dt.datetime.fromtimestamp(newest.stat().st_mtime, tz=_dt.timezone.utc)
+        age_hours = (_utcnow() - mtime).total_seconds() / 3600.0
+        age_source = "mtime"
 
     scheduler = payload.get("scheduler") if payload else None
     payload_ok = payload.get("ok") if payload else None
     payload_error = payload.get("error") if payload else None
 
-    if age_hours > max_age_hours:
+    # STUCK takes precedence over FAILED if N consecutive same-error failures.
+    consecutive_failures, stuck_error = _count_consecutive_failures(files)
+    if consecutive_failures >= STUCK_CONSECUTIVE_THRESHOLD:
         return FreshnessResult(
-            state="STALE",
-            newest_path=newest,
-            age_hours=age_hours,
-            scheduler=scheduler,
-            payload_ok=payload_ok,
-            error=payload_error,
+            state="STUCK", newest_path=newest, age_hours=age_hours, age_source=age_source,
+            scheduler=scheduler, payload_ok=payload_ok, error=stuck_error,
+            consecutive_failures=consecutive_failures,
+            summary=(
+                f"Last {consecutive_failures} consecutive harvest runs all reported "
+                f"the same error: '{stuck_error or '<no error message>'}'. This is "
+                f"chronic, not transient — fix the underlying issue (often a "
+                f"connector that needs re-authentication) before the next fire."
+            ),
+        )
+
+    if age_hours > max_age_hours:
+        # Include payload error in summary if last run was also a failure (reviewer
+        # round-2 suggestion #1).
+        suffix = ""
+        if payload_ok is False and payload_error:
+            suffix = f" Last run also reported error: '{payload_error}'."
+        return FreshnessResult(
+            state="STALE", newest_path=newest, age_hours=age_hours, age_source=age_source,
+            scheduler=scheduler, payload_ok=payload_ok, error=payload_error,
+            consecutive_failures=consecutive_failures or None,
             summary=(
                 f"Most recent harvest run is {age_hours:.1f}h old (threshold "
-                f"{max_age_hours}h). The scheduled harvest may have stopped "
-                f"firing — check the routine status at "
-                f"https://claude.ai/code/routines, or the launchd plist if "
-                f"you're on the alternative scheduler."
+                f"{max_age_hours}h, age_source={age_source}). The scheduled harvest "
+                f"may have stopped firing — check routine status at "
+                f"https://claude.ai/code/routines, or the launchd plist if you're "
+                f"on the alternative scheduler.{suffix}"
             ),
         )
 
     if payload_ok is False:
         return FreshnessResult(
-            state="FAILED",
-            newest_path=newest,
-            age_hours=age_hours,
-            scheduler=scheduler,
-            payload_ok=False,
-            error=payload_error,
+            state="FAILED", newest_path=newest, age_hours=age_hours, age_source=age_source,
+            scheduler=scheduler, payload_ok=False, error=payload_error,
+            consecutive_failures=consecutive_failures or None,
             summary=(
                 f"Most recent harvest run ({age_hours:.1f}h ago, scheduler="
                 f"{scheduler or 'unknown'}) reported ok=false: "
-                f"{payload_error or '<no error message>'}. Investigate before "
-                f"the next fire."
+                f"'{payload_error or '<no error message>'}'. Investigate before "
+                f"the next fire. (If this error persists across "
+                f"{STUCK_CONSECUTIVE_THRESHOLD} consecutive runs the state will "
+                f"escalate to STUCK.)"
             ),
         )
 
     return FreshnessResult(
-        state="PASS",
-        newest_path=newest,
-        age_hours=age_hours,
-        scheduler=scheduler,
-        payload_ok=payload_ok,
-        error=None,
+        state="PASS", newest_path=newest, age_hours=age_hours, age_source=age_source,
+        scheduler=scheduler, payload_ok=payload_ok, error=None,
+        consecutive_failures=None,
         summary=(
             f"Most recent harvest run is {age_hours:.1f}h old (scheduler="
-            f"{scheduler or 'unknown'}, ok={payload_ok}). Healthy."
+            f"{scheduler or 'unknown'}, ok={payload_ok}, age_source={age_source}). Healthy."
         ),
     )
 
@@ -175,7 +275,13 @@ def _format_human_banner(result: FreshnessResult) -> str:
     if result.state == "PASS":
         return f"[harvest-freshness] OK — {result.summary}"
     bar = "=" * 78
-    icon = {"STALE": "⚠️", "FAILED": "❌", "MISSING": "❓"}[result.state]
+    icon = {
+        "STALE": "⚠️",
+        "FAILED": "❌",
+        "STUCK": "🔁",
+        "MISSING": "❓",
+        "CORRUPT": "⚠️",
+    }.get(result.state, "⚠️")
     lines = [
         bar,
         f"{icon}  HARVEST FRESHNESS: {result.state}",
