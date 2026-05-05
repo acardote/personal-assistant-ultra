@@ -116,7 +116,14 @@ def assemble_long_context(question: str, target_tokens: int) -> tuple[str, int]:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        block = f"<!-- raw: {path.relative_to(PROJECT_ROOT)} -->\n{text}\n"
+        try:
+            disp = str(path.relative_to(METHOD_ROOT))
+        except ValueError:
+            try:
+                disp = str(path.relative_to(_CFG.content_root))
+            except ValueError:
+                disp = str(path)
+        block = f"<!-- raw: {disp} -->\n{text}\n"
         block_tokens = count_tokens(block)
         if used + block_tokens > target_tokens:
             # Truncate this block to fit if it's the first; else stop.

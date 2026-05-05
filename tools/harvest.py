@@ -504,6 +504,16 @@ class GmailSource(Source):
 # Harvest loop
 # ───────────────────────────────────────────────────────────────────────
 
+def _disp(p: Path) -> str:
+    """Display a path relative to method root when possible; otherwise absolute.
+    Avoids ValueError when the path is outside the method root (e.g. under
+    content_root in vault mode)."""
+    try:
+        return str(p.relative_to(METHOD_ROOT))
+    except ValueError:
+        return str(p)
+
+
 def derive_raw_path(source: Source, ref: ItemRef, ext: str) -> Path:
     """Stable path under raw/<source-kind>/<title>-<id-hash>.<ext>."""
     safe_id = ref.id.replace(":", "_").replace("/", "_")
@@ -548,15 +558,15 @@ def harvest(source: Source, since: datetime, dry_run: bool = False) -> dict:
         raw_path = derive_raw_path(source, ref, raw.extension)
         memory_path = derive_memory_path(source, ref)
         if dry_run:
-            print(f"[dry-run] would write {raw_path.relative_to(PROJECT_ROOT)} and {memory_path.relative_to(PROJECT_ROOT)}", file=sys.stderr)
+            print(f"[dry-run] would write {_disp(raw_path)} and {_disp(memory_path)}", file=sys.stderr)
             continue
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(raw.content, encoding="utf-8")
         memory_path.parent.mkdir(parents=True, exist_ok=True)
         run_compress(raw_path, kind=raw.suggested_kind, source_kind=source.source_kind, out=memory_path)
-        state.seen[key] = str(memory_path.relative_to(PROJECT_ROOT))
-        summary["new_raw"].append(str(raw_path.relative_to(PROJECT_ROOT)))
-        summary["new_memory"].append(str(memory_path.relative_to(PROJECT_ROOT)))
+        state.seen[key] = _disp(memory_path)
+        summary["new_raw"].append(_disp(raw_path))
+        summary["new_memory"].append(_disp(memory_path))
     if not dry_run:
         state.save()
     return summary

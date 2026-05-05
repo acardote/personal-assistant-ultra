@@ -190,10 +190,21 @@ def report() -> dict:
                 ea = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
                 if ea.tzinfo is None:
                     ea = ea.replace(tzinfo=timezone.utc)
-                if 0 <= (ea - now).days <= 14:
-                    expiring_soon.append(str(path.relative_to(PROJECT_ROOT)))
             except ValueError:
-                pass
+                continue
+            if 0 <= (ea - now).days <= 14:
+                # Display path relative to method root when possible (fallback mode);
+                # otherwise relative to content root; otherwise absolute. Avoids the
+                # silent-drop pattern flagged in PR #17 review where ValueError on
+                # relative_to was swallowed by the same try block as the datetime parse.
+                try:
+                    disp = str(path.relative_to(METHOD_ROOT))
+                except ValueError:
+                    try:
+                        disp = str(path.relative_to(_CFG.content_root))
+                    except ValueError:
+                        disp = str(path)
+                expiring_soon.append(disp)
         total_tokens += body_token_count(body)
     return {
         "files": len(files),
