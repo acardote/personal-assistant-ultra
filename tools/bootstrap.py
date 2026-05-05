@@ -167,15 +167,17 @@ def check_harvest_state_writable(vault_path: Path) -> CheckResult:
 
 def check_harvest_dry_run() -> CheckResult:
     """Smoke-test the harvest pipeline end-to-end short of an LLM call.
-    Per challenger F2 on PR #23: bootstrap had been claiming green status
-    on `which claude` alone, which doesn't catch claude-auth expiry or
-    a misconfigured harvest pipeline. The fixture dry-run exercises:
-      - tools/harvest.py imports and runs (config layer, dedup state, etc.)
-      - The fixture file at tests/fixtures/slack/ is reachable
-      - derive_raw_path / derive_memory_path resolve against content_root
-        without crashing (the previous reviewer-caught bug class)
-    Stops short of compress.py's claude -p invocation — that's verified by
-    the user running step 5 in setup.md (a real harvest, ~30s)."""
+    Per challenger F2 on PR #23: this check catches PIPELINE-IMPORT regressions
+    (config layer, dedup state, derive_*_path resolution, fixture presence).
+    It does NOT verify `claude -p` authentication — that's exercised by step 5
+    of setup.md (real harvest). Bootstrap output makes this scope explicit.
+
+    The check passes if: harvest dry-run exits 0 AND its JSON summary parses
+    AND it didn't error. This intentionally tolerates the idempotent re-run
+    case (challenger nit on PR #23): if the user has already run a real
+    harvest, the slack-fixture entry is in dedup state and dry-run reports
+    skipped_already_seen=1 with no would-write line. That's a healthy state,
+    not a failure."""
     proc = subprocess.run(
         [
             str(METHOD_ROOT / "tools" / "harvest.py"),
@@ -185,21 +187,46 @@ def check_harvest_dry_run() -> CheckResult:
         ],
         capture_output=True, text=True,
     )
-    if proc.returncode == 0 and "would write" in proc.stderr:
+    if proc.returncode != 0:
         return CheckResult(
-            name="harvest pipeline dry-run smoke OK",
-            passed=True,
-            detail="harvest --source slack-fixture --dry-run completed without errors",
+            name="harvest pipeline dry-run smoke",
+            passed=False,
+            detail=(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit {proc.returncode}"),
+            remediation=(
+                "Harvest pipeline failed before any LLM call. Common causes: "
+                "missing tests/fixtures/slack/, content_root pointing at a non-vault "
+                "directory, broken _config.py import path. Re-run with the failing "
+                "command directly to see the full stack trace."
+            ),
+        )
+    # Parse the JSON summary on stdout — it's the harvester's source of truth.
+    try:
+        summary = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return CheckResult(
+            name="harvest pipeline dry-run smoke",
+            passed=False,
+            detail=f"harvest exit was 0 but stdout was not valid JSON: {exc}",
+            remediation=(
+                "Likely a regression in tools/harvest.py's main() output contract. "
+                "Re-run the harvest command directly and inspect."
+            ),
+        )
+    if "source" not in summary or "skipped_already_seen" not in summary:
+        return CheckResult(
+            name="harvest pipeline dry-run smoke",
+            passed=False,
+            detail=f"harvest summary missing expected keys; got: {sorted(summary.keys())}",
+            remediation="harvest output schema regressed. Re-run directly + inspect.",
         )
     return CheckResult(
-        name="harvest pipeline dry-run smoke",
-        passed=False,
-        detail=(proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit {proc.returncode}"),
-        remediation=(
-            "Harvest pipeline failed before any LLM call. Common causes: "
-            "missing tests/fixtures/slack/, content_root pointing at a non-vault "
-            "directory, broken _config.py import path. Re-run with the failing "
-            "command directly to see the full stack trace."
+        name="harvest pipeline dry-run smoke OK",
+        passed=True,
+        detail=(
+            f"harvest dry-run produced summary "
+            f"(skipped={summary.get('skipped_already_seen', 0)}, "
+            f"new_raw={len(summary.get('new_raw', []))}, "
+            f"new_memory={len(summary.get('new_memory', []))})"
         ),
     )
 
@@ -223,7 +250,9 @@ def render_summary(results: list[CheckResult]) -> str:
     out.append("=" * width)
     out.append(f"{n_pass}/{len(results)} checks passed; {n_fail} failed.")
     if n_fail == 0:
-        out.append("Setup looks healthy. Next: docs/setup.md step 5 (first synthetic harvest).")
+        out.append("Setup looks healthy. Bootstrap does NOT verify `claude -p` auth or MCP")
+        out.append("availability — those are exercised by step 5 (synthetic harvest) and")
+        out.append("step 6 (live MCP harvest) of docs/setup.md respectively.")
     else:
         out.append("Fix the failed checks (instructions above) and re-run tools/bootstrap.py.")
     out.append("=" * width)
