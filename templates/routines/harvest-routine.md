@@ -4,15 +4,17 @@ This is the artifact-of-record for the production scheduled harvest, per [#25](h
 
 ## Why routines (not launchd)
 
-Claude Code routines run on Anthropic's web infrastructure (verified by probe `trig_01TgF2k8aNeWsYtrjQ4JZ6RE` on 2026-05-05). They:
+Claude Code routines run on Anthropic's web infrastructure (verified end-to-end by probes 1–6 on 2026-05-05; canonical reference: probe `trig_012bbTLE2G6RYFsncQH89Ysy` for MCP discovery + `trig_01E63nUVn7TsfKVdCTnZbjHJ` for Granola body extraction). They:
 
 - Fire on schedule even when your laptop is closed or off.
 - Have authenticated git push to linked repos (no per-machine `gh auth` setup needed).
-- Auto-attach your account-level MCP connectors (Slack and Gmail confirmed).
+- Auto-attach your account-level MCP connectors (Slack, Gmail, Granola, GitHub all confirmed reachable from the routine sandbox).
 - Draw down the same Claude subscription as interactive sessions (no separate billing).
 - Are subject to per-tier daily limits (Pro: 5/day, Max: 15/day, Team/Enterprise: 25/day).
 
-The launchd-based path (`templates/launchd/`) remains as an **alternative scheduler** for users without routine eligibility (lower tiers, certain enterprise restrictions) or who prefer strictly local execution. Routines are the recommended primary.
+**Choose ONE scheduler** — do not run routines and launchd against the same vault simultaneously. They will race on `git push` to the vault and the dedup state files (`.harvest/<source>.json`) are last-writer-wins JSON. The launchd-based path (`templates/launchd/`) remains as an **alternative** for users without routine eligibility (lower tiers, certain enterprise restrictions) or who prefer strictly local execution. If you switch, disable the previous scheduler before enabling the new one.
+
+**Sources NOT covered by the routine path**: Google Meet folder watch and generic transcript drop. These are file-system-based sources that need either local Meet-export sync or a folder you drop transcripts into — neither exists in the routine sandbox. If you depend on those sources, either keep launchd active alongside routines for those sources only (with the same vault — but bear in mind the lock-and-race caveat above), or run them ad-hoc via `tools/harvest.py --source gmeet|transcripts --folder <path>` from a Mac session.
 
 ## Configuration
 
@@ -27,8 +29,8 @@ When you create the routine via `/schedule`, configure it as below.
 
 Two `git_repository` sources, in this order:
 
-1. `https://github.com/acardote/personal-assistant-ultra` (method repo — contains `.claude/skills/personal-assistant/SKILL.md`, `tools/compress.py`, schemas, prompts).
-2. `https://github.com/getnexar/acardote-pa-vault` (content vault — destination for memory objects, KB, harvest state).
+1. `https://github.com/acardote/personal-assistant-ultra` (method repo — contains `.claude/skills/personal-assistant/SKILL.md`, `tools/compress.py`, schemas, prompts). Same for every user.
+2. `https://github.com/<your-org>/<your-vault>` (content vault — destination for memory objects, KB, harvest state). **This is your private vault — replace with your own.** The author's example for reference: `https://github.com/getnexar/acardote-pa-vault`.
 
 The routine workspace clones both. The vault is the git-write target.
 
@@ -38,7 +40,7 @@ Auto-attached at routine create time (no manual config in the create body needed
 
 - Slack (account-level connector at https://mcp.slack.com/mcp).
 - Gmail (account-level connector at https://gmailmcp.googleapis.com/mcp/v1).
-- Granola (account-level connector at https://mcp.granola.ai/mcp). Exposes `query_granola_meetings`. Connector must be **authenticated** in claude.ai (not just enabled) — probes 3 and 4 showed Granola absent from the auto-attach list when only enabled but unauthenticated, and present once authenticated.
+- Granola (account-level connector at https://mcp.granola.ai/mcp). Exposes `query_granola_meetings` (required `query` string; optional `document_ids` UUID array). Connector must be **authenticated** in claude.ai (not just enabled) — probes 3 and 4 showed Granola absent from the auto-attach list when only enabled but unauthenticated, and present once authenticated. Probe 6 confirmed the tool returns full meeting bodies (sections, discussion, action items), not just metadata. Recommended invocations: `{"query": "Show me the full notes from my most recent meeting"}` for cold-start cycling through recent meetings; `{"query": "Show me all notes and action items from <title>"}` for title-targeted; `{"document_ids": ["<uuid>"]}` once IDs are known. Beware a ~60s timeout on long natural-language queries — back off and retry once at most.
 
 If you have additional connectors, the API attaches them automatically based on your account's connected (and authenticated) list. Verify the create response's `mcp_connections` array matches expectations before declaring the routine ready.
 
@@ -61,23 +63,50 @@ Two repos are linked to this routine:
 - METHOD: acardote/personal-assistant-ultra (cloned to your workspace)
 - VAULT:  getnexar/acardote-pa-vault (cloned to your workspace)
 
-Identify their paths via `find / -name personal-assistant-ultra -type d 2>/dev/null` and `find / -name acardote-pa-vault -type d 2>/dev/null`, picking the one inside the workspace (typically under /root/ or /workspace/). Treat those as $METHOD and $VAULT for the rest of this prompt.
+Identify the workspace paths. Use `find` constrained to known workspace roots, NOT the whole filesystem:
+
+  METHOD=""
+  VAULT=""
+  for root in /root /workspace /home/user; do
+    [ -d "$root" ] || continue
+    [ -z "$METHOD" ] && METHOD=$(find "$root" -maxdepth 4 -name personal-assistant-ultra -type d 2>/dev/null | head -1)
+    [ -z "$VAULT" ]  && VAULT=$(find "$root" -maxdepth 4 -name '*-pa-vault' -type d 2>/dev/null | head -1)
+  done
+  if [ -z "$METHOD" ] || [ -z "$VAULT" ]; then
+    echo "FATAL: could not resolve METHOD ($METHOD) or VAULT ($VAULT) — aborting" >&2
+    exit 1
+  fi
+  if [ "$METHOD" = "$VAULT" ] || [[ "$VAULT" == "$METHOD"/* ]]; then
+    echo "FATAL: VAULT must be distinct from METHOD (got METHOD=$METHOD VAULT=$VAULT)" >&2
+    exit 1
+  fi
+  export METHOD VAULT
+
+If either resolution fails, exit immediately — do NOT continue with empty paths. The fail-fast is essential: a silent fallback to cwd would write a runaway `.assistant.local.json` and produce a successful-looking run with zero real output.
 
 Write a per-checkout config so the method-repo tools resolve content paths against the vault:
 
-  cat > $METHOD/.assistant.local.json <<EOF
+  cat > "$METHOD/.assistant.local.json" <<EOF
   {"paths": {"content_root": "$VAULT"}}
   EOF
 
+Preflight your MCP connectors. The harvest expects all enabled connectors to be authenticated — not merely connected — at the account level. Check each:
+
+- Slack: confirm `mcp__<uuid>__slack_search_users` (or any `slack_*` tool) is in the deferred tool list.
+- Gmail: confirm `mcp__<uuid>__search_threads` (or any other Gmail tool) is in the deferred tool list.
+- Granola: confirm `mcp__<uuid>__query_granola_meetings` is in the deferred tool list. **If absent and the user has the Granola connector enabled at the account level, the connector is enabled but unauthenticated — fail loudly into the run-status JSON's `errors` key with the explicit message "granola connector enabled but unauthenticated" so the user can re-auth.**
+
+If a critical connector is unreachable (Slack OR Granola, the two highest-volume sources), set `ok: false` on the run-status JSON. A "skip with note" for a single low-volume source is acceptable; a missing high-volume source is not.
+
 Determine harvest cutoff:
-- If $VAULT/.harvest/runs/ contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
+- If `$VAULT/.harvest/runs/` contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
 - Otherwise: this IS a cold start: use "since 30 days ago".
 
-Open $METHOD/.claude/skills/personal-assistant/SKILL.md (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source, in this order:
-- Slack (via Slack MCP — check `mcp__claude_ai_Slack__slack_search_*` tool family)
-- Gmail (via Gmail MCP — check the auto-attached connector for the tool name)
-- Granola (via Granola MCP — verified auto-attached when the account-level connector is authenticated; the namespace is `mcp__<connector-uuid>__` with `query_granola_meetings` as the entry point. If the namespace is absent, the connector is enabled but unauthenticated — log to errors and skip)
-- Google Meet transcripts (via Drive folder — skip in routine context, this is a folder-watch path that needs local Meet-export sync)
+Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source, in this order:
+- Slack (via Slack MCP — UUID-namespaced `slack_search_*`/`slack_read_*` tools)
+- Gmail (via Gmail MCP — UUID-namespaced `search_threads`/`get_thread`/etc.)
+- Granola (via Granola MCP — `mcp__<uuid>__query_granola_meetings` as the entry point; for body extraction, see the argument shape recommended by probe 6 captured in `templates/routines/harvest-routine.md`'s "Granola argument shape" addendum)
+- Google Meet transcripts (skip in routine context — folder-watch path, needs local Meet-export sync)
 - Generic transcript drop (skip in routine context — same reason)
 
 For each source's discovered items: write raw artifact to $VAULT/raw/<source-kind>/<id>.md, then invoke the compression pipeline:

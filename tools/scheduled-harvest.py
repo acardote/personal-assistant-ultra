@@ -5,13 +5,18 @@
 # ///
 """On-demand / local-fallback harvest wrapper.
 
-Status: this is NOT the production scheduled-harvest path anymore (see #25).
-The production primary path is a Claude Code routine — see
-`templates/routines/harvest-routine.md`. This wrapper exists for:
-  - On-demand "harvest since lunch" runs from a terminal that don't burn
-    routine quota.
-  - The launchd alternative path (`templates/launchd/`) for users on plan
-    tiers without routine access or who explicitly want local-only execution.
+Status: this script is no longer the production *primary* scheduled-harvest
+path (see #25). The primary path is now a Claude Code routine, documented at
+`templates/routines/harvest-routine.md`. This script is still the entry
+point for two non-primary uses:
+
+  - **On-demand harvests from a terminal** (e.g. "harvest since lunch")
+    that the user wants to run interactively without consuming a routine
+    slot. Invoked directly from the shell by the user.
+  - **The launchd alternative scheduler** (`templates/launchd/`). The
+    plist invokes this script — it is the body of that path, not a
+    fallback for it. Available for users on plan tiers without routine
+    access or who prefer strictly local execution.
 
 Why a wrapper instead of `claude -p` directly:
   - `claude -p` exits 0 when the session ran, regardless of what the skill

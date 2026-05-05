@@ -133,5 +133,5 @@ Aim for ≤30 minutes from `gh repo clone` to first synthetic harvest output. St
 | 3 | `tools/bootstrap.py` exits 0 with all checks green | reports specific failure | follow its instructions |
 | 4 | `tools/assemble-kb.py --check` says clean, ~2-4K tokens | partial-truncation error | KB files missing in vault, copy templates |
 | 5 | `tools/harvest.py --source slack-fixture --since 2025-01-01` writes raw + memory; subsequent runs are idempotent (skipped=1, new_memory=[]) | crash | `claude` not on PATH, `uv` not on PATH, or content-root misconfigured |
-| 6 | Live MCP harvest produces real memory objects | gated on #11 | feature not yet shipped |
+| 6 | Routine fires on schedule and produces real memory objects in vault | routine doesn't fire / silent failure | connector not authenticated, routine misconfigured (see `templates/routines/harvest-routine.md`), or quota exhausted |
 | 7 | `tools/route.py "..."` returns advisor + critic perspectives | crash | KB assembly broken (step 4 regression) |

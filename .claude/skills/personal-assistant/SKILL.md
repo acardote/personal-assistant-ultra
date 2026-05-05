@@ -67,7 +67,7 @@ tools/compress.py <content_root>/raw/<source-kind>/<artifact>.md --kind <strateg
 
 The script reads `content_root` from `.assistant.local.json` and lands the output at `<content_root>/memory/<source-kind>/...`. With config missing it falls back to method's `memory/` with a loud warning — same fixture/test caveat as above.
 
-Idempotent harvesters for Slack/Gmail/Granola/Meet/file-drop are tracked in [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) / [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) (orchestrated through this skill via MCPs once those reopen close); scheduled harvest in [#11](https://github.com/acardote/personal-assistant-ultra/issues/11).
+Idempotent harvesters for Slack/Gmail/Granola/Meet/file-drop are orchestrated through this skill via MCPs (per [#5](https://github.com/acardote/personal-assistant-ultra/issues/5)/[#6](https://github.com/acardote/personal-assistant-ultra/issues/6) reopens). The scheduled trigger is a Claude Code routine (per [#25](https://github.com/acardote/personal-assistant-ultra/issues/25), superseding the earlier launchd-only design from #11).
 
 ## Harvest orchestration (per [#11](https://github.com/acardote/personal-assistant-ultra/issues/11) + [#25](https://github.com/acardote/personal-assistant-ultra/issues/25))
 
@@ -152,7 +152,7 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 
 - Multi-fidelity event matching + ranked retrieval: [#10](https://github.com/acardote/personal-assistant-ultra/issues/10).
 - Slack/Gmail/Granola/Meet via MCPs (skill orchestration): [#5](https://github.com/acardote/personal-assistant-ultra/issues/5) + [#6](https://github.com/acardote/personal-assistant-ultra/issues/6) reopens.
-- Scheduled harvest routine + daily digest: [#11](https://github.com/acardote/personal-assistant-ultra/issues/11).
+- Scheduled harvest via Claude Code routine: [#25](https://github.com/acardote/personal-assistant-ultra/issues/25) (in flight; supersedes the launchd path from #11).
 - Per-document-type expiry rules: [#8](https://github.com/acardote/personal-assistant-ultra/issues/8) (closed; integrated).
 - Backup/migrate tooling: [#13](https://github.com/acardote/personal-assistant-ultra/issues/13).
 - Setup docs + bootstrap: [#14](https://github.com/acardote/personal-assistant-ultra/issues/14).
