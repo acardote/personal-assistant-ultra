@@ -190,21 +190,24 @@ def report() -> dict:
                 ea = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
                 if ea.tzinfo is None:
                     ea = ea.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            if 0 <= (ea - now).days <= 14:
-                # Display path relative to method root when possible (fallback mode);
-                # otherwise relative to content root; otherwise absolute. Avoids the
-                # silent-drop pattern flagged in PR #17 review where ValueError on
-                # relative_to was swallowed by the same try block as the datetime parse.
-                try:
-                    disp = str(path.relative_to(METHOD_ROOT))
-                except ValueError:
+                if 0 <= (ea - now).days <= 14:
+                    # Display path relative to method root when possible (fallback mode);
+                    # otherwise relative to content root; otherwise absolute. The two
+                    # try blocks below are SEPARATE from the datetime parse so a path
+                    # outside both roots doesn't silently drop the expiring entry —
+                    # which was the pattern flagged in PR #17 review.
                     try:
-                        disp = str(path.relative_to(_CFG.content_root))
+                        disp = str(path.relative_to(METHOD_ROOT))
                     except ValueError:
-                        disp = str(path)
-                expiring_soon.append(disp)
+                        try:
+                            disp = str(path.relative_to(_CFG.content_root))
+                        except ValueError:
+                            disp = str(path)
+                    expiring_soon.append(disp)
+            except ValueError:
+                # Malformed expires_at — skip its expiry tracking but keep this
+                # entry in the corpus accounting (token total below).
+                pass
         total_tokens += body_token_count(body)
     return {
         "files": len(files),
