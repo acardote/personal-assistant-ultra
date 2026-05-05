@@ -1,5 +1,5 @@
 {
-  "_README": "These are the 10 frozen real recurring questions for the evaluation harness (#9). Per acceptance criterion 1, this set was agreed in chat and locked here on the date below; do NOT edit ad-hoc — changes invalidate the harness's prior-run comparability. Per F1 from challenger, each question carries `_recurring_evidence` pointing at ≥2 prior occurrences in the user's actual working corpus that predate the lock date. The evidence paths reference the user's existing personal_assistant project corpus (which will become a content-vault input).",
+  "_README": "These are the 10 frozen real recurring questions for the evaluation harness (#9). Per acceptance criterion 1, this set was agreed in chat and locked here on the date below; do NOT edit ad-hoc — changes invalidate the harness's prior-run comparability. Per F1 from challenger, each question carries `_recurring_evidence` pointing at ≥2 prior occurrences in the user's actual working corpus that predate the lock date. The evidence paths reference the user's existing personal_assistant project corpus (which will become a content-vault input). KNOWN LIMITATIONS DOCUMENTED PER QUESTION: some questions (q03, q08) carry `_known_corpus_limitation` notes flagging cases where corpus support is thin or one-sided — the eval may legitimately surface these as 'no good answer in any config,' which is information not failure. Some questions (q01, q02, q05, q06) are answerable from the most recent 3-4 weekly updates alone, which means vanilla long-context (config 2) may match full architecture (config 3) on them — the eval's job is partly to identify which questions actually exercise the architecture's discriminative value vs. which don't.",
   "_status": "FROZEN",
   "_frozen_date": "2026-05-05",
   "_locked_in_issue": "https://github.com/acardote/personal-assistant-ultra/issues/9",
@@ -38,13 +38,14 @@
       "_recurring_evidence": [
         {
           "path": "/Users/acardote/Projects/personal_assistant/.claude/commands/weekly-update.md",
-          "note": "Granola query area: DMS (driver monitoring, eyes off road, phone detection)"
+          "note": "Granola query area: DMS (driver monitoring, eyes off road, phone detection) — run every week"
         },
         {
-          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_15_2026.md",
-          "note": "DMS-themed content recurs across weekly updates as part of the weekly digest pattern"
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_14_2026.md",
+          "note": "Substantive DMS section: 'DMS video collection campaign launched in production to gather validation data by distraction event type.' Also recurs in week_03, 04, 07, 09, 12, 13."
         }
-      ]
+      ],
+      "_known_corpus_limitation": "DMS dropped out of weekly_updates from week_15 onward. The query area still exists in the recurring slash-command, but recent updates have been quiet. The eval may show 'no recent activity' for this question — that is itself a useful signal."
     },
     {
       "id": "q04",
@@ -98,11 +99,11 @@
       "_recurring_evidence": [
         {
           "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
-          "note": "### Problems: section is a structural part of every weekly update"
+          "note": "Substantive ### Problems: section covering Acko, Beam, BADAS-edge, Atlas/Waymo scaling"
         },
         {
-          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_03_2026.md",
-          "note": "Same Problems-section structure 14 weeks earlier — proves recurrence across the year"
+          "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_07_2026.md",
+          "note": "Substantive Problems section 10 weeks earlier (DMS phone detection, scenario reconstruction at night, Atlas quality gates) — proves recurrence with content, not just the section header"
         }
       ]
     },
@@ -112,13 +113,14 @@
       "_recurring_evidence": [
         {
           "path": "/Users/acardote/Projects/personal_assistant/2026-02-05_1-1_Leonor_Andre.md",
-          "note": "Recorded 1-1 with Leonor (manager); recurring 1-1 cadence — this is the artifact pattern"
+          "note": "Dated 1-1 artifact between Leonor (manager) and André; demonstrates the recurring 1-1 cadence as a documented working pattern. NOTE: this specific file's notes section is empty — see _known_corpus_limitation below."
         },
         {
           "path": "/Users/acardote/Projects/personal_assistant/weekly_updates/week_17_2026.md",
-          "note": "Manager-relationship work shows up implicitly in weekly updates as decisions / commitments that surfaced during 1-1s"
+          "note": "Recurring weekly digest captures commitments and decisions that flow out of 1-1s — the assistant should be able to triangulate ongoing themes from the weekly stream even when an individual 1-1 has no explicit notes"
         }
-      ]
+      ],
+      "_known_corpus_limitation": "The cited 1-1 file has empty notes ('No notes recorded for this meeting.') and there are no other Leonor-tagged files in the current corpus. This question is intentionally retained because it tests an important behavior: when the assistant has no specific evidence, does it say so honestly (correct), or hallucinate plausible-sounding commitments (failure mode F2 from #3 challenger)? An 'I don't have notes for that meeting' answer scoring high on quality is a successful outcome, not a degenerate one. The eval should disambiguate this clearly when the user judges it."
     },
     {
       "id": "q09",
