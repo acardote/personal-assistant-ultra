@@ -1,23 +1,21 @@
-#!/usr/bin/env -S uv run --quiet --with jsonschema --with pyyaml --with tiktoken --with slack-sdk --script
+#!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = [
-#   "jsonschema>=4",
-#   "pyyaml>=6",
-#   "tiktoken>=0.7",
-#   "slack-sdk>=3.27",
-#   "google-api-python-client>=2.140",
-#   "google-auth-oauthlib>=1.2",
-#   "google-auth-httplib2>=0.2",
-# ]
+# dependencies = ["jsonschema>=4", "pyyaml>=6", "tiktoken>=0.7"]
 # ///
 """Harvest items from a Source into layer 1 (raw archive) and layer 2 (memory objects).
 
 Usage:
-    tools/harvest.py --source slack --since 2026-04-01
-    tools/harvest.py --source slack --since 2026-04-01 --channels C0123,C0456
     tools/harvest.py --source slack-fixture --fixture-dir tests/fixtures/slack
+    tools/harvest.py --source granola --folder ~/.granola/exports --since 2026-04-01
+    tools/harvest.py --source gmeet --folder ~/Drive/Meet-transcripts
+    tools/harvest.py --source transcripts --folder ~/transcript-drop
     tools/harvest.py --source <name> --dry-run    # list what would be harvested, don't write
+
+Slack and Gmail were retired from the CLI in #5/#6 reopen — their MCP-based
+harvest now runs at the SKILL layer (see SKILL.md). The CLI keeps file-based
+sources (granola folder, gmeet folder, generic transcript drop) and the
+slack-fixture path used for tests.
 
 The Source interface (informal protocol — `Source` ABC):
     - `name: str` — short identifier ("slack", "gmail", ...)
@@ -38,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -124,7 +121,7 @@ class Source(ABC):
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Slack source — Web API
+# Source utilities (shared by file-based + fixture sources)
 # ───────────────────────────────────────────────────────────────────────
 
 def _slugify(text: str, max_len: int = 60) -> str:
@@ -133,91 +130,52 @@ def _slugify(text: str, max_len: int = 60) -> str:
     return s[:max_len] or "untitled"
 
 
-class SlackSource(Source):
-    """Harvests Slack threads via Web API (`conversations.history` + `conversations.replies`).
+# ───────────────────────────────────────────────────────────────────────
+# Slack-via-Web-API source: REMOVED (per #5 reopen)
+# ───────────────────────────────────────────────────────────────────────
+#
+# The user has Slack MCP configured (mcp__claude_ai_Slack__*) and prefers
+# MCP-orchestrated harvest over a Python Web-API client. Slack ingestion now
+# happens at the SKILL layer: when the personal-assistant skill runs harvest,
+# Claude calls the Slack MCP tools directly to discover + fetch threads, then
+# invokes tools/compress.py via Bash to produce memory objects. The CLI
+# `harvest --source slack` path is retired; `slack-fixture` remains for tests.
+#
+# See SKILL.md for the orchestration contract; #11 will land the scheduled
+# routine that drives the MCP-orchestrated harvest unattended.
 
-    Auth: `SLACK_USER_TOKEN` env var. Channels: comma-separated list of channel IDs via
-    `--channels` (this source treats no `--channels` as an explicit error rather than
-    pulling everything — F2 calls out that scope creep here is the noise-inversion failure).
-    """
 
+def _slack_dedupe_key(channel: str, thread_ts: str) -> str:
+    """Kept for SlackFixtureSource compatibility (it used SlackSource's
+    classmethod; inlining preserves dedupe-key shape across reads of old
+    state files)."""
+    return f"slack:{channel}:{thread_ts}"
+
+
+class _RemovedSlackSourceMarker(Source):
+    """Tombstone for the removed SlackSource. Defined only so the existing
+    reference in build_source() can be re-routed to a clean error message
+    (and so the type system doesn't shift). Never instantiable."""
     name = "slack"
     source_kind = "slack_thread"
 
-    def __init__(self, channels: list[str]):
-        if not channels:
-            raise ValueError(
-                "slack source requires --channels <C0123,C0456,...>; harvesting all "
-                "channels by default would invite F2 (signal/noise inversion)."
-            )
-        self.channels = channels
-        token = os.environ.get("SLACK_USER_TOKEN")
-        if not token:
-            raise RuntimeError(
-                "SLACK_USER_TOKEN is not set. Set it (a user OAuth token with conversations:history scope) "
-                "or use --source slack-fixture for offline testing."
-            )
-        from slack_sdk import WebClient  # imported lazily so fixture path doesn't need it
-        self.client = WebClient(token=token)
-
-    def list_new(self, since: datetime, state: HarvestState) -> Iterator[ItemRef]:
-        oldest = str(since.timestamp())
-        for channel in self.channels:
-            cursor = None
-            while True:
-                resp = self.client.conversations_history(
-                    channel=channel,
-                    oldest=oldest,
-                    cursor=cursor,
-                    limit=200,
-                )
-                for msg in resp.get("messages", []):
-                    if msg.get("subtype") in {"channel_join", "channel_leave", "bot_message"}:
-                        # F2 mitigation: skip low-signal subtypes by default.
-                        continue
-                    thread_ts = msg.get("thread_ts") or msg.get("ts")
-                    item_id = f"{channel}:{thread_ts}"
-                    key = self._dedupe_key_for(channel, thread_ts)
-                    if key in state.seen:
-                        continue
-                    text = (msg.get("text") or "").splitlines()[0][:80] or "untitled-message"
-                    yield ItemRef(
-                        id=item_id,
-                        title=_slugify(text),
-                        created_at=datetime.fromtimestamp(float(thread_ts), tz=timezone.utc),
-                        suggested_kind="thread",
-                        meta={"channel": channel, "thread_ts": thread_ts},
-                    )
-                cursor = resp.get("response_metadata", {}).get("next_cursor")
-                if not cursor:
-                    break
-
-    def fetch(self, ref: ItemRef) -> RawArtifact:
-        resp = self.client.conversations_replies(
-            channel=ref.meta["channel"],
-            ts=ref.meta["thread_ts"],
-            limit=1000,
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "harvest --source slack via Web API has been retired (#5 reopen). "
+            "Slack harvest now runs via MCP through the personal-assistant skill: "
+            "in a Claude Code session, invoke the skill and ask it to harvest. "
+            "For offline tests use --source slack-fixture; the architecture "
+            "details are documented in SKILL.md and parent #1's sequence."
         )
-        # Render thread as a structured Markdown document — preserves speaker
-        # attribution per F3, and is human-readable in the layer-1 archive.
-        lines = [f"# Slack thread {ref.id}", ""]
-        for msg in resp.get("messages", []):
-            user = msg.get("user", "?")
-            ts = msg.get("ts", "?")
-            iso = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat() if ts != "?" else "?"
-            text = msg.get("text", "")
-            lines.append(f"## {iso} — user:{user} (ts:{ts})")
-            lines.append("")
-            lines.append(text)
-            lines.append("")
-        return RawArtifact(content="\n".join(lines), extension=".md", suggested_kind="thread")
 
-    def dedupe_key(self, ref: ItemRef) -> str:
-        return self._dedupe_key_for(ref.meta["channel"], ref.meta["thread_ts"])
+    def list_new(self, since, state):  # pragma: no cover
+        raise RuntimeError("removed")
 
-    @staticmethod
-    def _dedupe_key_for(channel: str, thread_ts: str) -> str:
-        return f"slack:{channel}:{thread_ts}"
+    def fetch(self, ref):  # pragma: no cover
+        raise RuntimeError("removed")
+
+    def dedupe_key(self, ref):  # pragma: no cover
+        return ""
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -273,7 +231,7 @@ class SlackFixtureSource(Source):
         return RawArtifact(content="\n".join(lines), extension=".md", suggested_kind="thread")
 
     def dedupe_key(self, ref: ItemRef) -> str:
-        return SlackSource._dedupe_key_for(ref.meta["channel"], ref.meta["thread_ts"])
+        return _slack_dedupe_key(ref.meta["channel"], ref.meta["thread_ts"])
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -390,114 +348,40 @@ class GenericTranscriptDropSource(_FolderSource):
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Gmail source (API-based; requires OAuth setup by the user)
+# Gmail-via-OAuth source: REMOVED (per #6 reopen)
 # ───────────────────────────────────────────────────────────────────────
+#
+# The user has Gmail MCP available and prefers MCP-orchestrated harvest over
+# a Python-side OAuth client. Gmail ingestion happens at the SKILL layer:
+# Claude calls Gmail MCP tools to query threads + extract bodies, then
+# invokes tools/compress.py via Bash. The CLI `harvest --source gmail` path
+# is retired. (Granola similarly moves to the MCP path; only file-based
+# fallbacks — folder watchers — remain in this CLI.)
+#
+# Implementation history is preserved in git: git log -- tools/harvest.py.
 
-class GmailSource(Source):
-    """Harvests Gmail threads via the Gmail API. Requires the user to set up OAuth
-    credentials (`credentials.json`) and complete an OAuth flow once to persist
-    `token.json`. After that, the source is non-interactive.
 
-    Auth state lives at `.harvest/gmail-credentials.json` and `.harvest/gmail-token.json`
-    (both git-ignored). The user provides `--query` (Gmail search syntax) to scope
-    harvest, mirroring the Slack `--channels` discipline as an F2 mitigation against
-    signal/noise inversion ('inbox' is too broad to be a default).
-    """
-
+class _RemovedGmailSourceMarker(Source):
+    """Tombstone for the removed GmailSource. See _RemovedSlackSourceMarker."""
     name = "gmail"
     source_kind = "gmail_thread"
 
-    def __init__(self, query: str):
-        if not query:
-            raise ValueError(
-                "gmail source requires --query <gmail-search-syntax>; harvesting "
-                "all of inbox by default would invite F2 (signal/noise inversion)."
-            )
-        self.query = query
-        self.credentials_path = STATE_DIR / "gmail-credentials.json"
-        self.token_path = STATE_DIR / "gmail-token.json"
-        if not self.credentials_path.exists():
-            raise RuntimeError(
-                f"Gmail credentials not found at {self.credentials_path}.\n"
-                "To enable Gmail harvesting:\n"
-                "  1. Create a Google Cloud project + enable the Gmail API.\n"
-                "  2. Create OAuth client credentials (Desktop App).\n"
-                f"  3. Save the downloaded JSON as {self.credentials_path}.\n"
-                "  4. Re-run this command — a browser window will open for the OAuth flow.\n"
-                f"     The resulting token will be cached at {self.token_path}.\n"
-                "Required scope: `https://www.googleapis.com/auth/gmail.readonly`."
-            )
-        self._service = self._build_service()
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "harvest --source gmail via OAuth has been retired (#6 reopen). "
+            "Gmail harvest now runs via MCP through the personal-assistant skill: "
+            "in a Claude Code session, invoke the skill and ask it to harvest. "
+            "See SKILL.md."
+        )
 
-    def _build_service(self):
-        # Lazy import — only reached when the user has set up creds.
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from googleapiclient.discovery import build
+    def list_new(self, since, state):  # pragma: no cover
+        raise RuntimeError("removed")
 
-        scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
-        creds = None
-        if self.token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(self.token_path), scopes)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(str(self.credentials_path), scopes)
-                creds = flow.run_local_server(port=0)
-            self.token_path.write_text(creds.to_json(), encoding="utf-8")
-        return build("gmail", "v1", credentials=creds)
+    def fetch(self, ref):  # pragma: no cover
+        raise RuntimeError("removed")
 
-    def list_new(self, since: datetime, state: HarvestState) -> Iterator[ItemRef]:
-        epoch = int(since.timestamp())
-        full_query = f"{self.query} after:{epoch}"
-        next_page = None
-        while True:
-            resp = self._service.users().threads().list(userId="me", q=full_query, pageToken=next_page).execute()
-            for t in resp.get("threads", []):
-                yield ItemRef(
-                    id=t["id"],
-                    title=_slugify(t.get("snippet", t["id"])[:80]),
-                    created_at=since,  # refined when fetched
-                    suggested_kind="thread",
-                    meta={"thread_id": t["id"]},
-                )
-            next_page = resp.get("nextPageToken")
-            if not next_page:
-                break
-
-    def fetch(self, ref: ItemRef) -> RawArtifact:
-        thread = self._service.users().threads().get(userId="me", id=ref.meta["thread_id"]).execute()
-        lines = [f"# Gmail thread {ref.meta['thread_id']}", ""]
-        for msg in thread.get("messages", []):
-            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-            from_ = headers.get("From", "?")
-            date = headers.get("Date", "?")
-            subject = headers.get("Subject", "(no subject)")
-            body = self._extract_text(msg.get("payload", {}))
-            lines.append(f"## {date} — From: {from_}")
-            lines.append(f"Subject: {subject}")
-            lines.append("")
-            lines.append(body)
-            lines.append("")
-        return RawArtifact(content="\n".join(lines), extension=".md", suggested_kind="thread")
-
-    @staticmethod
-    def _extract_text(payload: dict) -> str:
-        import base64
-        if payload.get("mimeType") == "text/plain":
-            data = payload.get("body", {}).get("data", "")
-            if data:
-                return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-        for part in payload.get("parts", []) or []:
-            text = GmailSource._extract_text(part)
-            if text:
-                return text
+    def dedupe_key(self, ref):  # pragma: no cover
         return ""
-
-    def dedupe_key(self, ref: ItemRef) -> str:
-        return f"gmail:{ref.meta['thread_id']}"
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -578,8 +462,8 @@ def harvest(source: Source, since: datetime, dry_run: bool = False) -> dict:
 
 def build_source(args: argparse.Namespace) -> Source:
     if args.source == "slack":
-        channels = [c.strip() for c in (args.channels or "").split(",") if c.strip()]
-        return SlackSource(channels=channels)
+        # Retired — instantiating raises with guidance to the skill path.
+        return _RemovedSlackSourceMarker()
     if args.source == "slack-fixture":
         fixture_dir = Path(args.fixture_dir or (PROJECT_ROOT / "tests" / "fixtures" / "slack"))
         return SlackFixtureSource(fixture_dir=fixture_dir.resolve())
@@ -596,20 +480,18 @@ def build_source(args: argparse.Namespace) -> Source:
             raise SystemExit("--folder <path> is required for transcripts source")
         return GenericTranscriptDropSource(folder=Path(args.folder).resolve())
     if args.source == "gmail":
-        if not args.query:
-            raise SystemExit("--query <gmail-search-syntax> is required for gmail source")
-        return GmailSource(query=args.query)
+        # Retired — instantiating raises with guidance to the skill path.
+        return _RemovedGmailSourceMarker()
     raise SystemExit(f"unknown source: {args.source}")
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Harvest items from a source into layers 1+2.")
-    parser.add_argument("--source", required=True, help="Source name: slack | slack-fixture")
+    parser.add_argument("--source", required=True, help="Source name: slack-fixture | granola | gmeet | transcripts (slack/gmail are MCP-orchestrated via the skill, not this CLI — see SKILL.md)")
     parser.add_argument("--since", help="ISO date or datetime (default: 30 days ago).")
-    parser.add_argument("--channels", help="Comma-separated channel IDs (slack only).")
     parser.add_argument("--fixture-dir", help="Fixture directory (slack-fixture only).")
     parser.add_argument("--folder", help="Folder path (granola / gmeet / transcripts sources).")
-    parser.add_argument("--query", help="Gmail search query (gmail source only).")
+    # --channels and --query were tied to retired sources (slack/gmail) — removed.
     parser.add_argument("--dry-run", action="store_true", help="List what would be harvested.")
     args = parser.parse_args(argv[1:])
 
