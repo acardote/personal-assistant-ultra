@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _metrics import emit, time_event, inherit_or_start  # noqa: E402
 
 _CFG = load_config()
 METHOD_ROOT = _CFG.method_root
@@ -55,6 +56,40 @@ PROJECT_ROOT = METHOD_ROOT  # legacy alias for path-display
 SPECIALIST_TRIGGERS: dict[str, tuple[str, ...]] = {
     "incident-response": ("incident", "outage", "postmortem", "post-mortem", "remediation", "root cause"),
 }
+
+# Stopwords for topic-keyword extraction (privacy-preserving signal extraction).
+_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "what", "where", "when",
+    "how", "why", "on", "in", "of", "to", "for", "with", "and", "or", "but",
+    "we", "i", "me", "my", "this", "that", "these", "those", "it", "its",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "should", "could", "can", "may", "might", "must",
+    "from", "by", "at", "as", "if", "then", "than", "so", "not", "no",
+    "yes", "any", "all", "some", "you", "your", "they", "them", "their",
+    "he", "she", "him", "her", "his", "hers", "us", "our", "ours",
+    "latest", "current", "now", "today", "yesterday", "tomorrow", "week",
+    "tell", "show", "give", "summarize", "explain", "describe",
+})
+
+
+def extract_topic_keywords(query: str, *, limit: int = 5) -> list[str]:
+    """Privacy-preserving topic-keyword extraction from a query string.
+
+    Returns up to `limit` distinctive lowercase tokens (≥4 chars, not stopwords).
+    Used to tag metrics events with what topic the query was about, without
+    logging the raw query text.
+    """
+    tokens = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]+\b", query.lower())
+    seen = set()
+    out: list[str] = []
+    for t in tokens:
+        if t in _STOPWORDS or len(t) < 4 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= limit:
+            break
+    return out
 
 
 @dataclass
@@ -227,30 +262,58 @@ def run_specialist(name: str, query: str, context: str) -> str:
 
 
 def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -> RouteResult:
-    kb_text, kb_tokens = assemble_kb_text()
-    memory_text, memory_tokens, memory_files = load_memory_objects(query)
-    specialist = None if no_specialist else detect_specialist(query)
-    context = build_context_block(kb_text, memory_text, query)
+    # Per-query session: inherit if parent set PA_SESSION_ID, else fresh.
+    inherit_or_start()
+    topic_kws = extract_topic_keywords(query)
 
-    result = RouteResult(
-        query=query,
-        kb_tokens=kb_tokens,
-        memory_tokens=memory_tokens,
-        memory_files=memory_files,
-        specialist=specialist,
-    )
+    with time_event("query", topic_keywords=topic_kws,
+                    no_critic=no_critic, no_specialist=no_specialist) as q_tracker:
 
-    print(f"[route] kb={kb_tokens}t memory={memory_tokens}t files={len(memory_files)} specialist={specialist or 'none'}", file=sys.stderr)
-    print(f"[route] invoking advisor...", file=sys.stderr)
-    result.advisor_response = run_advisor(query, context)
+        with time_event("kb_load") as kb_tracker:
+            kb_text, kb_tokens = assemble_kb_text()
+            kb_tracker["kb_tokens"] = kb_tokens
+            kb_tracker["kb_chars"] = len(kb_text)
 
-    if not no_critic:
-        print(f"[route] invoking adversarial critic...", file=sys.stderr)
-        result.critic_response = run_critic(query, context, result.advisor_response)
+        with time_event("memory_retrieve", topic_keywords=topic_kws) as mem_tracker:
+            memory_text, memory_tokens, memory_files = load_memory_objects(query)
+            mem_tracker["memory_hits"] = len(memory_files)
+            mem_tracker["memory_tokens"] = memory_tokens
 
-    if specialist:
-        print(f"[route] invoking specialist: {specialist}...", file=sys.stderr)
-        result.specialist_response = run_specialist(specialist, query, context)
+        specialist = None if no_specialist else detect_specialist(query)
+        context = build_context_block(kb_text, memory_text, query)
+
+        result = RouteResult(
+            query=query,
+            kb_tokens=kb_tokens,
+            memory_tokens=memory_tokens,
+            memory_files=memory_files,
+            specialist=specialist,
+        )
+
+        print(f"[route] kb={kb_tokens}t memory={memory_tokens}t files={len(memory_files)} specialist={specialist or 'none'}", file=sys.stderr)
+        print(f"[route] invoking advisor...", file=sys.stderr)
+        with time_event("advisor_call", topic_keywords=topic_kws) as adv_tracker:
+            result.advisor_response = run_advisor(query, context)
+            adv_tracker["response_chars"] = len(result.advisor_response)
+
+        if not no_critic:
+            print(f"[route] invoking adversarial critic...", file=sys.stderr)
+            with time_event("critic_call", topic_keywords=topic_kws) as crit_tracker:
+                result.critic_response = run_critic(query, context, result.advisor_response)
+                crit_tracker["response_chars"] = len(result.critic_response)
+
+        if specialist:
+            print(f"[route] invoking specialist: {specialist}...", file=sys.stderr)
+            with time_event("specialist_call", specialist=specialist, topic_keywords=topic_kws) as sp_tracker:
+                result.specialist_response = run_specialist(specialist, query, context)
+                sp_tracker["response_chars"] = len(result.specialist_response)
+
+        # Top-level query tracker mutations (land on query_end)
+        q_tracker["kb_tokens"] = kb_tokens
+        q_tracker["memory_tokens"] = memory_tokens
+        q_tracker["memory_hits"] = len(memory_files)
+        q_tracker["specialist"] = specialist
+        q_tracker["empty_handed"] = (memory_tokens == 0 and kb_tokens > 0)
 
     return result
 

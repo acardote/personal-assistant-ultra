@@ -26,9 +26,27 @@ The layer-3 knowledge base is the assistant's ground truth on the user, the user
 | **Layer 2 — memory objects** | `<content_root>/memory/` | vault-tracked (real harvest); method's `memory/examples/` holds fixture-derived test outputs only | Editorially compressed memory objects. Loaded selectively per query (retrieval in `tools/route.py`; ranked retrieval in [#10](https://github.com/acardote/personal-assistant-ultra/issues/10)). |
 | **Layer 3 — split** | `<method_root>/kb/glossary.md` (canonical project terms) + `<content_root>/kb/{people,org,decisions}.md` (your content) | both tracked | Always loaded. Combined assembly via `tools/assemble-kb.py`. Token budget ≤4K total. |
 
-## Activation contract — load layer 3 first
+## Activation contract — bootstrap session, then load layer 3
 
-When this skill is invoked, your **first action** is to load layer-3 by running:
+When this skill is invoked, your **first two actions** are:
+
+1. **Bootstrap a metrics session** so the per-query instrumentation events from
+   subsequent tools all share one `session_id`. This is what lets the dashboard
+   group `query_start` → `kb_load_end` → `memory_retrieve_end` → `query_end`
+   into a single user-facing turn (per [#41](https://github.com/acardote/personal-assistant-ultra/issues/41)). Run:
+
+   ```bash
+   export PA_SESSION_ID=$(python3 -c "import secrets; print(secrets.token_hex(4))")
+   tools/log-event.py skill_start --inherit-session --data trigger=user
+   ```
+
+   Do this exactly once at turn start. Subsequent tool invocations within the
+   same turn (route.py, assemble-kb.py, compress.py, check-harvest-freshness.py)
+   will inherit the session via `PA_SESSION_ID` and emit events that aggregate
+   correctly. If you skip this, each tool will mint its own session and the
+   dashboard will fragment per-turn metrics.
+
+2. **Load layer-3** by running:
 
 ```
 tools/assemble-kb.py

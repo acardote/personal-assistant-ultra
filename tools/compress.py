@@ -35,6 +35,7 @@ from jsonschema import Draft202012Validator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _metrics import emit, time_event, inherit_or_start  # noqa: E402
 
 _CFG = load_config()
 METHOD_ROOT = _CFG.method_root
@@ -178,7 +179,14 @@ def main(argv: list[str]) -> int:
         except ValueError:
             return str(p)
     print(f"compressing {_disp(raw_path)} -> {_disp(out_path)} ...", file=sys.stderr)
-    output = call_claude(prompt, raw_text)
+
+    # Inherit parent's session id (e.g., from harvest routine) so all compress
+    # calls in one harvest run group together.
+    inherit_or_start()
+
+    with time_event("compress", source_kind=args.source_kind, raw_chars=len(raw_text)) as ct:
+        output = call_claude(prompt, raw_text)
+        ct["output_chars"] = len(output)
     front, body = parse_memo_output(output)
 
     # Script-authored fields override whatever the model emitted.
@@ -300,11 +308,23 @@ def main(argv: list[str]) -> int:
     # Soft-warn on token budget (rough char-based estimate, see tools/_tokens.py).
     body_tokens = count_tokens(body)
     print(f"body tokens: {body_tokens} (budget {args.token_budget})", file=sys.stderr)
-    if body_tokens > args.token_budget:
+    over_budget = body_tokens > args.token_budget
+    if over_budget:
         print(
             f"WARNING: body {body_tokens} tokens exceeds budget {args.token_budget}",
             file=sys.stderr,
         )
+
+    # Emit a compress_result event with the per-item outcome so the dashboard
+    # can chart token-budget violations + per-source compression yield over time.
+    emit(
+        "compress_result",
+        source_kind=args.source_kind,
+        kind=kind,
+        body_tokens=body_tokens,
+        over_budget=over_budget,
+        cluster_role=cluster.role,
+    )
 
     print(str(out_path))
     return 0

@@ -64,6 +64,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _metrics import emit, inherit_or_start  # noqa: E402
 
 DEFAULT_MAX_AGE_HOURS = 26
 STUCK_CONSECUTIVE_THRESHOLD = 3  # N consecutive same-error failures → STUCK
@@ -360,9 +361,21 @@ def main(argv: list[str]) -> int:
         print(f"[harvest-freshness] config error: {exc}", file=sys.stderr)
         return 2
 
+    inherit_or_start()  # join parent session if PA_SESSION_ID is set
     runs_dir = cfg.harvest_state_root / "runs"
     result = assess_freshness(
         runs_dir, max_age_hours=args.max_age_hours, stuck_threshold=args.stuck_threshold
+    )
+
+    # Emit a freshness_check event so the dashboard can chart freshness state
+    # over time (e.g., "how often does the assistant boot to a STALE state?").
+    emit(
+        "freshness_check",
+        state=result.state,
+        age_hours=result.age_hours,
+        age_source=result.age_source,
+        scheduler=result.scheduler,
+        consecutive_failures=result.consecutive_failures,
     )
 
     if args.json:
