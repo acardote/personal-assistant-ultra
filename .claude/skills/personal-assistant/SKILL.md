@@ -217,7 +217,21 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 - **zero_hit** — `load_memory_objects` returned 0 matches for the query keywords.
 - **topic_pinned** — the query mentions a topic listed in `<content_root>/.harvest/live-pinned.txt`. One topic per line; blank lines and lines starting with `#` are ignored. Matching is **case-insensitive, word-boundary** against the raw query (so pinned `sync` matches `"the sync"` but not `"asynchronous"`). Use this for fast-evolving topics (e.g. weekly syncs) where harvest cadence lags reality. Pin entries surface in metrics events as a bounded `matched_topic` (≤64 chars), so keep them short and non-sensitive.
 
-#39-A only emits the signal — actual live-MCP augmentation lands in #39-B. Until then, `gap_detected` events let the dashboard show how often live would have fired and why.
+#39-A emits the signal; #39-B implements the live-call adapters. The skill is the live-call orchestrator (per the architecture decision on #51): when `route.py --json` returns `gap_detected: true`, the skill makes the live MCP call, captures the result via `tools/live-result-write.py`, and folds the findings into the answer. Live calls are sequential (not parallel) and per-source.
+
+### Live-call procedure (Granola — #39-B.1)
+
+When you'd otherwise answer a question and the gap signal points at meetings / weekly-sync content:
+
+1. **Probe the gap.** Run `tools/route.py "<query>" --json --no-critic --no-specialist` and parse the JSON. If `gap_detected` is `true` AND the query reads as meeting-relevant (mentions a meeting cadence, attendee names, or a topic from `live-pinned.txt`), proceed with a live Granola call. If `gap_detected` is `false`, answer normally from memory + KB — **don't fire live calls speculatively.**
+2. **Targeted Granola query.** Emit `live_call_start` first via `tools/log-event.py live_call_start --inherit-session --data source=granola_note` so latency measurement (F3 on #52) can compute end-to-end p95. Then call `mcp__claude_ai_Granola__query_granola_meetings` with `{"query": "<the user's question, lightly rephrased to Granola's natural-language style>"}`. Unlike harvest's two-step enumerate-then-fetch (#34), live mode is single-shot — Granola's natural-language path is fine for a focused query, and the latency budget (<30s p95 from #39) doesn't allow the two-step pattern.
+3. **Capture the result.** Pipe the raw response body to `tools/live-result-write.py --source granola_note --query "<original user query>"`. The helper writes `<content_root>/raw/granola_note/live-<ts>-<hash>.md` with a leading provenance HTML comment, and emits a `live_call_end` metric event so the dashboard's `live_calls_per_query` stays accurate.
+4. **Fold findings into the answer.** Treat the live response as if it were just-loaded memory: cite specifics, prefer it over staler memory hits, and quote where the user's intent is "what's the latest." Do not duplicate the live findings in your response when they merely confirm memory — fold them inline.
+5. **Don't compress yet.** Write-back (compress live → memory) is #39-D; for now the raw artifact stays in `<content_root>/raw/granola_note/` for the next harvest run to dedup against.
+
+If the Granola MCP call itself fails (timeout, auth, no results), do NOT call `live-result-write.py` — emit a `live_call_error` event via `tools/log-event.py` instead and proceed with memory-only answer, surfacing the gap to the user (e.g., *"I don't have current notes on this — Granola was unavailable just now"*).
+
+Slack and Gmail live adapters land in #39-B.2 / #39-B.3.
 
 ## Open extensions
 
