@@ -273,6 +273,17 @@ Same shape as Slack (two-step search → read); differences below.
 - **Label-scope leak**: if the live query slips to broad inbox search (no `label:important`), F2 from #5/#6 fires — noise pollutes the answer and any future write-back. The procedure's "default scope to label:important" rule is honor-system; F2 below catches drift in production.
 - **Long threads**: legal / vendor email threads can be 40+ messages. The body cap from #39-B.2 (MAX_BODY_CHARS) protects against context blow-up; check `body_truncated=true` rate on the dashboard.
 
+### Cross-source synthesis (#39-C)
+
+When `gap_detected` fires with `reason=zero_hit`, the procedure says "fire all sources." Multiple `live_call_end` events can land in one query. The skill's job at that point is to merge memory + KB + multiple live findings into one coherent answer, not stitch them as labeled sections. Rules in priority order:
+
+1. **Freshness wins for "what's the latest" / "current state" intent.** When the user's question is anchored to *now*, prefer live findings over memory hits even when memory's sample is broader. Example from the 2026-05-06 eval Q08 ("last 1-1 with Leonor"): full-skill scored 5 because the granola live call surfaced the current 1-1 ahead of an older memory hit.
+2. **Memory wins for established / load-bearing context.** When the question asks about durable state ("what did we decide about pricing?"), prefer memory. Live calls are recency-biased and can surface ephemera that contradicts a settled decision. Cite KB / memory `## <heading>` and treat live as supporting detail.
+3. **Surface conflicts as conflicts.** If memory says X and live says ¬X, do NOT silently pick one. State the conflict and the timestamps: *"Memory (compressed 2026-05-04) says X; live Slack today says Y. Treating live as authoritative because [reason]."* Conflicts that aren't surfaced poison every downstream answer that grounds on the wrong fact.
+4. **Deduplicate by event, not by source.** When the same meeting / thread appears in multiple sources (e.g. a Granola note AND a Slack channel-recap), cite once with the strongest source — don't repeat the same fact wearing different labels. (#10 dedup logic does this for memory; live findings need to do it inline.)
+5. **Don't expose source-by-source structure.** Bad: *"## From Granola: ... ## From Slack: ..."*. Good: a unified answer that cites sources inline by `## <heading>`. The 2026-05-05 eval consistently rated source-stacked answers low ("contains an adversarial critic that I don't care to be exposed to") — the same anti-pattern applies here.
+6. **When live returned `status=empty`, say so.** Don't pretend the live call confirmed memory. If granola fired and returned empty, that's a real signal — surface it: *"Memory has X; granola live returned no current notes on this topic, so X may be stale."* Hiding empty live results conflates "no signal" with "no contradiction."
+
 ## Open extensions
 
 - Multi-fidelity event matching + ranked retrieval: [#10](https://github.com/acardote/personal-assistant-ultra/issues/10).
