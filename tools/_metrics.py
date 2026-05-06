@@ -84,11 +84,33 @@ MAX_KEYWORD_LEN = 32
 MAX_LINE_BYTES = 4000  # PIPE_BUF on most POSIX = 4096; stay under for atomic appends.
 
 # Field names that almost certainly carry PII; dropped from **data unconditionally.
+# Best-effort, not exhaustive — the privacy contract docstring puts the bar on
+# callers, but this catches the common slip-ups.
 PII_DENYLIST = frozenset({
+    # Raw text fields
     "raw_query", "query_text", "query", "raw_text", "body", "content",
-    "email", "email_address", "password", "api_key", "apikey",
-    "token", "access_token", "refresh_token", "secret", "credential",
+    "message", "prompt",
+    # Identifiers
+    "email", "email_address", "phone", "phone_number", "ssn", "name",
+    "full_name", "username", "user_id", "user", "address", "ip",
+    "ip_address", "dob", "birthdate",
+    # Secrets
+    "password", "api_key", "apikey", "token", "access_token",
+    "refresh_token", "secret", "credential", "authorization", "auth",
+    "cookie", "session_token",
 })
+
+
+def _safe_default(obj: Any) -> str:
+    """json.dumps default= hook. Refuses to stringify exception objects (which
+    can leak PII via stack traces / message content). Other unserializable
+    types fall back to str(obj) bounded to a sane length.
+    """
+    if isinstance(obj, BaseException):
+        # Surface only the type, never the message / args / __cause__.
+        return f"<{type(obj).__name__}>"
+    s = str(obj)
+    return s[:512]  # bound any default-stringified value
 
 # Cache the resolved metrics dir at first use; if None, the resolver is run.
 _METRICS_DIR: Path | None = None
@@ -296,10 +318,12 @@ def emit(event: str, *, duration_ms: int | None = None, **data: Any) -> bool:
         if sanitized:
             payload["data"] = sanitized
 
-        # Serialize. default=str converts non-JSON-native types (Path, datetime,
-        # set) to strings rather than crashing. Bounded to MAX_LINE_BYTES.
+        # Serialize. default=_safe_default converts non-JSON-native types
+        # (Path, datetime, set) to bounded strings rather than crashing.
+        # Exceptions surface as "<TypeName>" only — never their .args/.__str__
+        # which can leak PII via tracebacks. Bounded to MAX_LINE_BYTES.
         try:
-            line = json.dumps(payload, ensure_ascii=False, default=str)
+            line = json.dumps(payload, ensure_ascii=False, default=_safe_default)
         except (TypeError, ValueError):
             return False  # truly unserializable
 

@@ -372,6 +372,79 @@ def test_time_event_end_on_exception():
     print("  T19 PASS — time_event emits _end with error_type when body raises.")
 
 
+def test_pii_denylist_extended():
+    """T21: extended PII denylist catches phone, ssn, name, username, ip, etc. (round-2)."""
+    with tempfile.TemporaryDirectory() as td:
+        m = fresh_metrics_module(Path(td))
+        m.emit("kb_load",
+               phone="+1-555-1234",      # denylisted
+               ssn="123-45-6789",        # denylisted
+               name="Jane Doe",          # denylisted
+               username="jdoe",          # denylisted
+               user_id="u_12345",        # denylisted
+               ip_address="1.2.3.4",     # denylisted
+               authorization="Bearer x", # denylisted
+               kb_chars=12345)            # allowed
+        e = json.loads(next(Path(td).glob("events-*.jsonl")).read_text().splitlines()[0])
+        data = e["data"]
+        for forbidden in ("phone", "ssn", "name", "username", "user_id", "ip_address", "authorization"):
+            assert forbidden not in data, f"{forbidden} should be denylisted"
+        assert data["kb_chars"] == 12345
+    print("  T21 PASS — extended PII denylist (phone/ssn/name/username/ip/auth) enforced.")
+
+
+def test_exception_objects_redacted():
+    """T22: Exception objects in **data are surfaced as <TypeName> only — no PII leak from str(exc) (round-2)."""
+    with tempfile.TemporaryDirectory() as td:
+        m = fresh_metrics_module(Path(td))
+        try:
+            raise ValueError("user@example.com had a bad password: hunter2")
+        except ValueError as exc:
+            m.emit("test", error=exc)
+        e = json.loads(next(Path(td).glob("events-*.jsonl")).read_text().splitlines()[0])
+        err_str = e["data"]["error"]
+        # Should be "<ValueError>" not the leaky message.
+        assert err_str == "<ValueError>", f"exception leaked PII: {err_str!r}"
+        assert "@example.com" not in err_str
+        assert "hunter2" not in err_str
+    print("  T22 PASS — exception objects in **data are redacted to <TypeName>.")
+
+
+def test_data_json_data_precedence():
+    """T23: --json-data overrides --data when same key is given (round-2)."""
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "PA_METRICS_DIR": str(td)}
+        env.pop("PA_SESSION_ID", None)
+        result = subprocess.run(
+            [str(PROJ / "tools" / "log-event.py"), "test_event",
+             "--data", "foo=string_value",
+             "--json-data", "foo=42"],  # should win
+            env=env, capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"log-event failed: {result.stderr}"
+        e = json.loads(next(Path(td).glob("events-*.jsonl")).read_text().splitlines()[0])
+        # --json-data parses last → wins
+        assert e["data"]["foo"] == 42, f"--json-data should win, got {e['data']['foo']!r}"
+    print("  T23 PASS — --json-data wins over --data on same key.")
+
+
+def test_default_str_bounded():
+    """T24: _safe_default bounds string-coerced values to 512 chars (round-2)."""
+    with tempfile.TemporaryDirectory() as td:
+        m = fresh_metrics_module(Path(td))
+        # Use a custom non-JSON-native object whose str() is huge
+        class HugeRepr:
+            def __str__(self): return "x" * 10000
+        m.emit("test", giant=HugeRepr())
+        e = json.loads(next(Path(td).glob("events-*.jsonl")).read_text().splitlines()[0])
+        # Either dropped entirely (too big), or bounded
+        if "data" in e and "giant" in e["data"]:
+            assert len(e["data"]["giant"]) <= 512, (
+                f"_safe_default should bound to 512 chars; got {len(e['data']['giant'])}"
+            )
+    print("  T24 PASS — _safe_default bounds string-coerced values to 512 chars.")
+
+
 def test_log_event_json_data_typing():
     """T20: --json-data parses typed values; --data keeps strings."""
     with tempfile.TemporaryDirectory() as td:
@@ -416,5 +489,9 @@ if __name__ == "__main__":
     test_oversized_event_dropped()
     test_start_session_always_fresh()
     test_time_event_end_on_exception()
+    test_pii_denylist_extended()
+    test_exception_objects_redacted()
+    test_data_json_data_precedence()
+    test_default_str_bounded()
     test_log_event_json_data_typing()
     print("All metrics tests passed.")
