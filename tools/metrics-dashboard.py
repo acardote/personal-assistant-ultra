@@ -277,10 +277,16 @@ def render_current_state(latest: dict) -> str:
             ("Memory hit rate", cov.get("memory_hit_rate") or "—"),
             ("Empty-handed rate", cov.get("empty_handed_rate") or "—"),
             ("Gap-discovery rate", cov.get("gap_discovery_rate") or "—"),
+            ("Gap-detected rate (#39-A)", cov.get("gap_detected_rate") or "—"),
             ("Live calls per query", cov.get("live_calls_per_query") or 0),
             ("Total queries", cov.get("total_queries", 0)),
         ]
         sections.append("<h3>Coverage</h3>" + render_table(rows, ["metric", "value"]))
+        # Gap reason breakdown
+        by_reason = cov.get("gap_by_reason") or {}
+        if by_reason:
+            reason_rows = sorted(by_reason.items(), key=lambda kv: -kv[1])
+            sections.append("<h4>Gap reasons</h4>" + render_table(reason_rows, ["reason", "count"]))
 
     # Source economy
     se = latest.get("source_economy") or {}

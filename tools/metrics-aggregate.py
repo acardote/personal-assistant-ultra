@@ -268,6 +268,8 @@ def aggregate_coverage(events: list[dict]) -> dict:
             "memory_hit_rate": None,
             "empty_handed_rate": None,
             "gap_discovery_rate": None,
+            "gap_detected_rate": None,
+            "gap_by_reason": {},
             "live_calls_per_query": 0.0,
             "total_queries": 0,
         }
@@ -279,11 +281,22 @@ def aggregate_coverage(events: list[dict]) -> dict:
         and (e.get("data") or {}).get("topic_keywords")
     )
     live = sum(1 for e in events if e.get("event") == "live_call_end")
+    # gap_detected events from #39-A. Distinct from gap_discovery_rate
+    # (which only counts zero_hit + topic_keywords>0). gap_detected_rate
+    # is the operational signal: how often did the router decide live
+    # would help, regardless of reason. Reasons split out in by_reason.
+    gap_events = [e for e in events if e.get("event") == "gap_detected"]
+    by_reason: dict[str, int] = {}
+    for e in gap_events:
+        r = (e.get("data") or {}).get("reason") or "unknown"
+        by_reason[r] = by_reason.get(r, 0) + 1
     total = len(query_ends)
     return {
         "memory_hit_rate": round(with_memory / total, 4),
         "empty_handed_rate": round(empty / total, 4),
         "gap_discovery_rate": round(gap / total, 4),
+        "gap_detected_rate": round(len(gap_events) / total, 4) if total else 0.0,
+        "gap_by_reason": by_reason,
         "live_calls_per_query": round(live / total, 4) if total else 0.0,
         "total_queries": total,
     }
