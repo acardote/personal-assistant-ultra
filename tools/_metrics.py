@@ -6,23 +6,30 @@ this module to emit query/harvest/retrieval events; aggregation
 (`tools/metrics-aggregate.py`) and dashboard (`tools/metrics-dashboard.py`)
 read the same files.
 
-Design constraints (from #41):
+## Caller responsibility (privacy)
 
-- **<5% query-latency overhead**. Best effort: stdlib only, no network, no
-  dependency on `_config.py` for hot-path emit (which would parse JSON and
-  do filesystem checks). The library uses an env-var-resolved metrics dir
-  with a fallback search to be cheap on the common path.
-- **<50ms per event**. The append-and-fsync pattern is sub-millisecond
-  on local disk; we don't fsync.
-- **Privacy: no raw query text** stored. Topic keywords are bounded
-  (max 5 per event, max 32 chars each, lowercased). All other fields are
-  numeric / categorical / structured metadata.
-- **Crash-safe**. Every event flushes its line; partial writes are bounded
-  to the current event (the next emit appends a new complete line).
-- **Append-only**. The aggregator reads files in append-only fashion;
-  no event is ever rewritten.
+`emit(event, **data)` accepts arbitrary kwargs. The library bounds and
+sanitizes `topic_keywords` and applies a per-line size cap, but **every
+other field is the caller's responsibility**. The privacy contract:
 
-Schema (one event per line):
+- **Do not log raw query text.** Extract topic keywords (max 5, max 32
+  chars each, lowercased) via simple keyword extraction; pass via
+  `topic_keywords=`.
+- **Do not log full file paths.** Use relative paths or basenames.
+- **Do not log error messages or exception reprs.** Use error type
+  names + structured failure codes.
+- **Do not log user-identifying strings.** Email addresses, names, etc.
+
+The library enforces:
+- Bounded `topic_keywords` (max 5, max 32 chars each, lowercased).
+- Hard line cap (`MAX_LINE_BYTES=4000`, drops events that exceed).
+- Best-effort denylist on common PII field names (`raw_query`,
+  `query_text`, `email`, `password`, `api_key`, `token`, `secret`).
+  These keys are dropped from `**data` before serialization.
+- Crash-safety: any unexpected exception in emit() is swallowed and
+  returns False. Instrumentation MUST NEVER crash the host tool.
+
+## Schema (one event per line)
     {
         "ts": "2026-05-06T14:23:00Z",
         "session_id": "<8-char-hex>",
@@ -33,40 +40,55 @@ Schema (one event per line):
         "data": { ... event-specific structured fields ... }
     }
 
-Sessions: `start_session()` returns an 8-char-hex session id. Subsequent
-`emit()` calls with `session_id=None` use the current session. The session
-id can also be propagated across processes via the `PA_SESSION_ID` env var
-(set by the calling shell / parent tool).
+## Sessions
 
-Locating the metrics dir:
-    1. `$PA_METRICS_DIR` env var (explicit override)
-    2. `$PA_CONTENT_ROOT/.metrics/` env var
-    3. `_config.load_config().harvest_state_root.parent / ".metrics"` (slow path)
-    4. Fallback: `~/.personal-assistant/metrics/` (so the tools never crash)
+- `start_session()` always mints a fresh 8-hex-char id and overwrites
+  `PA_SESSION_ID` env var. Top-level entry points (skill startup, harvest
+  routine kickoff) should call this.
+- `inherit_or_start()` honors an inherited `PA_SESSION_ID` if set; otherwise
+  starts fresh. Child tool subprocesses use this to participate in the
+  parent's session.
+- `get_session_id()` is lazy: if no session has been started, it calls
+  `start_session()` (i.e., fresh, NOT env-inherited). This avoids the
+  env-bleed bug where two top-level invocations from the same shell
+  silently share session ids.
 
-The slow path is only taken when neither env var is set; the calling tools
-should set `PA_METRICS_DIR` once at module-import time to avoid repeated
-filesystem walks.
+## Locating the metrics dir
+1. `$PA_METRICS_DIR` env var (explicit override)
+2. `$PA_CONTENT_ROOT/.metrics/` env var
+3. `_config.load_config().harvest_state_root.parent / ".metrics"` (slow path)
+4. Fallback: `~/.personal-assistant/metrics/` (so the tools never crash)
+
+The slow path uses `importlib.util.spec_from_file_location` for `_config`
+loading instead of `sys.path.insert` to avoid global state mutation.
 
 If the metrics dir cannot be created or written to, `emit()` silently
-discards events. Instrumentation must NEVER crash the calling tool.
+discards events and returns False.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
+import importlib.util
 import json
 import os
 import secrets
-import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-# Bounded keyword count + length, per #41 privacy contract.
+# Privacy / safety bounds.
 MAX_KEYWORDS = 5
 MAX_KEYWORD_LEN = 32
+MAX_LINE_BYTES = 4000  # PIPE_BUF on most POSIX = 4096; stay under for atomic appends.
+
+# Field names that almost certainly carry PII; dropped from **data unconditionally.
+PII_DENYLIST = frozenset({
+    "raw_query", "query_text", "query", "raw_text", "body", "content",
+    "email", "email_address", "password", "api_key", "apikey",
+    "token", "access_token", "refresh_token", "secret", "credential",
+})
 
 # Cache the resolved metrics dir at first use; if None, the resolver is run.
 _METRICS_DIR: Path | None = None
@@ -75,6 +97,29 @@ _SESSION_ID: str | None = None
 
 def _utcnow_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_valid_session_id(s: str) -> bool:
+    """Reject session ids with whitespace, NUL, or non-ASCII (env-write safety)."""
+    if not isinstance(s, str) or not s:
+        return False
+    return s.isascii() and s.isalnum() and len(s) <= 64
+
+
+def _load_config_via_spec():
+    """Import _config without sys.path mutation (per challenger-finding #5)."""
+    config_path = Path(__file__).resolve().parent / "_config.py"
+    if not config_path.exists():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_pa_metrics_config", str(config_path))
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
 
 
 def _resolve_metrics_dir() -> Path | None:
@@ -100,25 +145,27 @@ def _resolve_metrics_dir() -> Path | None:
         except OSError:
             return None
 
-    # 3. Slow path: ask _config (lazy import to avoid circular deps + cost)
+    # 3. Slow path: ask _config (no sys.path mutation)
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from _config import load_config  # type: ignore
-        cfg = load_config(require_explicit_content_root=False)
-        p = cfg.harvest_state_root.parent / ".metrics"
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except OSError:
-            return None
+        cfg_module = _load_config_via_spec()
+        if cfg_module is not None:
+            cfg = cfg_module.load_config(require_explicit_content_root=False)
+            p = cfg.harvest_state_root.parent / ".metrics"
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+            except OSError:
+                return None
     except Exception:
-        # Final fallback; never let instrumentation crash the host tool.
-        p = Path.home() / ".personal-assistant" / "metrics"
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except OSError:
-            return None
+        pass
+
+    # 4. Final fallback; never let instrumentation crash the host tool.
+    p = Path.home() / ".personal-assistant" / "metrics"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except OSError:
+        return None
 
 
 def _get_metrics_dir() -> Path | None:
@@ -136,31 +183,56 @@ def _today_path() -> Path | None:
     return md / f"events-{today}.jsonl"
 
 
-def start_session(session_id: str | None = None) -> str:
-    """Begin a new session. Returns the session id (8 hex chars). If a
-    session id is provided (e.g. from a parent process via env), reuses it."""
+def _set_env_session(sid: str) -> None:
+    """Best-effort env write; tolerate failure silently (e.g., NUL bytes)."""
+    try:
+        os.environ["PA_SESSION_ID"] = sid
+    except (ValueError, OSError):
+        pass
+
+
+def start_session(*, session_id: str | None = None) -> str:
+    """Begin a new session, always fresh. Overwrites PA_SESSION_ID env var.
+
+    Top-level entry points (skill startup, harvest routine kickoff) should
+    call this to avoid the env-bleed bug where two top-level invocations
+    from the same shell silently share session ids.
+
+    If `session_id` is provided, validates it; falls back to fresh on invalid.
+    """
     global _SESSION_ID
-    if session_id:
+    if session_id is not None and _is_valid_session_id(session_id):
         _SESSION_ID = session_id
-    elif os.environ.get("PA_SESSION_ID"):
-        _SESSION_ID = os.environ["PA_SESSION_ID"]
     else:
         _SESSION_ID = secrets.token_hex(4)
-    # Propagate to child processes
-    os.environ["PA_SESSION_ID"] = _SESSION_ID
+    _set_env_session(_SESSION_ID)
     return _SESSION_ID
 
 
+def inherit_or_start() -> str:
+    """For child processes: inherit PA_SESSION_ID if valid, else start fresh.
+
+    This is the right call for tools spawned as subprocesses of the skill
+    or harvest routine. It honors the parent's session id when set.
+    """
+    global _SESSION_ID
+    env_sid = os.environ.get("PA_SESSION_ID", "")
+    if _is_valid_session_id(env_sid):
+        _SESSION_ID = env_sid
+        return _SESSION_ID
+    return start_session()
+
+
 def get_session_id() -> str:
-    """Return current session id; lazily start one if unset."""
+    """Return current session id; lazily starts a fresh one if unset.
+
+    Does NOT inherit from env in the lazy path — that's the bleed source.
+    Use `inherit_or_start()` explicitly for env inheritance.
+    """
     global _SESSION_ID
     if _SESSION_ID is None:
-        # Honor inherited env first
-        if os.environ.get("PA_SESSION_ID"):
-            _SESSION_ID = os.environ["PA_SESSION_ID"]
-        else:
-            start_session()
-    return _SESSION_ID  # type: ignore[return-value]
+        return start_session()
+    return _SESSION_ID
 
 
 def _sanitize_keywords(kws: Any) -> list[str]:
@@ -179,40 +251,72 @@ def _sanitize_keywords(kws: Any) -> list[str]:
     return out
 
 
+def _sanitize_data(data: dict) -> dict:
+    """Drop PII-denylist keys; sanitize topic_keywords."""
+    out: dict = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or k.lower() in PII_DENYLIST:
+            continue
+        if k == "topic_keywords":
+            out[k] = _sanitize_keywords(v)
+        else:
+            out[k] = v
+    return out
+
+
 def emit(event: str, *, duration_ms: int | None = None, **data: Any) -> bool:
     """Append one event to today's events file. Returns True on success.
 
     Instrumentation must never crash the host tool — any error is swallowed
     and the function returns False. Use the return value only for testing.
 
-    `event`: short event-type identifier (see schema in module docstring).
-    `duration_ms`: optional integer, only meaningful on `*_end` events.
-    `**data`: structured event-specific fields. `topic_keywords` is sanitized
-    if present (bounded + lowercased).
+    Bounds enforced (silently):
+    - Sanitized `topic_keywords` (count + length + lowercase)
+    - PII denylist on `**data` keys
+    - Hard line cap (MAX_LINE_BYTES); over-budget events are dropped
+    - Crash-safety: any exception in serialization or write returns False
     """
-    path = _today_path()
-    if path is None:
-        return False
-
-    if "topic_keywords" in data:
-        data["topic_keywords"] = _sanitize_keywords(data["topic_keywords"])
-
-    payload: dict[str, Any] = {
-        "ts": _utcnow_iso(),
-        "session_id": get_session_id(),
-        "event": event,
-    }
-    if duration_ms is not None:
-        payload["duration_ms"] = int(duration_ms)
-    if data:
-        payload["data"] = data
-
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        return True
-    except OSError:
-        # Disk full, perm error, dir gone — silently drop.
+        path = _today_path()
+        if path is None:
+            return False
+
+        sanitized = _sanitize_data(data)
+
+        payload: dict[str, Any] = {
+            "ts": _utcnow_iso(),
+            "session_id": get_session_id(),
+            "event": str(event)[:64],  # bound event name length too
+        }
+        if duration_ms is not None:
+            try:
+                payload["duration_ms"] = int(duration_ms)
+            except (TypeError, ValueError):
+                pass  # silently drop bad duration
+        if sanitized:
+            payload["data"] = sanitized
+
+        # Serialize. default=str converts non-JSON-native types (Path, datetime,
+        # set) to strings rather than crashing. Bounded to MAX_LINE_BYTES.
+        try:
+            line = json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return False  # truly unserializable
+
+        line_bytes = len(line.encode("utf-8"))
+        if line_bytes > MAX_LINE_BYTES:
+            # Too big — likely concurrency-corrupting. Drop.
+            return False
+
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            return True
+        except OSError:
+            return False
+
+    except Exception:
+        # Catch-all: instrumentation must never crash the host tool.
         return False
 
 
@@ -223,20 +327,22 @@ def time_event(event: str, **data: Any):
 
     Inside the context, the caller can set/extend keys on the yielded dict
     (`tracker`); those keys land on the `_end` event's data. The `_start`
-    event is emitted first with whatever data was passed in.
+    event is emitted with whatever data was passed in (excluding tracker
+    mutations).
 
-    Example:
-        with time_event("memory_retrieve", topic_keywords=["acko"]) as t:
-            results = retrieve(...)
-            t["memory_hits"] = len(results)
-        # emits memory_retrieve_start (with topic_keywords)
-        # emits memory_retrieve_end (with topic_keywords, memory_hits, duration_ms)
+    Crash-safety: if the body raises, the `_end` event is still emitted
+    (with `error_type` capturing the exception class name) before the
+    exception propagates. The library never swallows the user's exception.
     """
     start = time.monotonic()
     emit(f"{event}_start", **data)
     tracker: dict[str, Any] = dict(data)
     try:
         yield tracker
+    except Exception as exc:
+        # Capture failure metadata onto the _end event without leaking exception details.
+        tracker["error_type"] = type(exc).__name__
+        raise
     finally:
         duration_ms = int((time.monotonic() - start) * 1000)
         emit(f"{event}_end", duration_ms=duration_ms, **tracker)
