@@ -204,7 +204,7 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 ### Known limitations of harvest orchestration (per PR #24 review)
 
 - **Slack `has::pencil:` operator may not be a real Slack search operator.** The skill should attempt the search; if no results come back when the user has actually placed pencil reactions, fall back to listing the user's recent threads via `from:@<user>` and inspecting reactions per-thread. The first real harvest will tell us which approach Slack search supports.
-- **`/personal-assistant harvest <args>` is interpreted as a prompt, not parsed as a slash command** (no `.claude/commands/personal-assistant.md` registers a parser). The skill receives the prompt as freeform text; argument resolution (especially time windows like "yesterday") is at the model's discretion. The wrapper at `tools/scheduled-harvest.py` constructs explicit `--since <N>d` strings to keep the time-window discrete.
+- ~~**`/personal-assistant harvest <args>` is interpreted as a prompt, not parsed as a slash command**~~ — closed by [#59](https://github.com/acardote/personal-assistant-ultra/issues/59); see "Routine ops surface" below. The wrapper at `tools/scheduled-harvest.py` still constructs explicit `--since <N>d` strings for the routine path (which doesn't go through the slash command).
 - **MCP capability is not pre-checked at run start.** If a tool the skill expects (e.g., `mcp__claude_ai_Slack__slack_search_public_and_private`) has been renamed or removed, the run fails when the call is attempted. The run-status file captures this; the lint-docs CI gate doesn't catch MCP-tool drift. A future child can add a smoke probe at run start.
 - **Bash tool permission inheritance in headless `claude -p` is not guaranteed.** The skill calls `tools/compress.py` via Bash; if the headless session doesn't have Bash permission, compression fails. The wrapper's run-status will show this failure mode if it fires.
 - **Semantic F1 gap (claude exit 0 ≠ harvest success).** The wrapper at `tools/scheduled-harvest.py` writes `ok: true` whenever `claude -p` exits 0. That signals "the process didn't crash," NOT "the harvest produced meaningful output." Today, an empty-vault cold-start that hit MCP-auth failures and bailed would still show `ok: true` because the model decided to log-and-move-on rather than abort. The full F1 closure requires the skill to write a structured per-source result back to the wrapper (e.g., a `<harvest_dir>/runs/<ts>.harvest-result.json`) which the wrapper inspects to determine `ok`. Tracked as future work; for now, supplement the wrapper's binary `ok` with a manual look at the daily digest counts.
@@ -302,6 +302,19 @@ When `gap_detected` fires with `reason=zero_hit`, the procedure says "fire all s
 4. **Deduplicate by event, not by source.** When the same meeting / thread appears in multiple sources (e.g. a Granola note AND a Slack channel-recap), cite once with the strongest source — don't repeat the same fact wearing different labels. (#10 dedup logic does this for memory; live findings need to do it inline.)
 5. **Don't expose source-by-source structure.** Bad: *"## From Granola: ... ## From Slack: ..."* — group-by-source headers in the answer. Good: a unified answer that cites sources inline by `## <heading>` per the per-source procedures (Slack `## <iso> — user:<id>`, Gmail From/Subject/Date, Granola meeting title). Inline citations are fine and load-bearing — *grouping the entire answer by source is the anti-pattern*. The 2026-05-05 eval rated source-stacked answers low ("contains an adversarial critic that I don't care to be exposed to") — same shape, same fix.
 6. **Surface empty live calls when memory's claim is load-bearing.** Don't pretend the live call confirmed memory. If granola fired and returned empty AND memory's claim is what the user will act on, surface it: *"Memory has X; granola live returned no current notes on this topic, so X may be stale."* If memory's claim is incidental color, mentioning the empty live adds noise — drop it.
+
+## Routine ops surface (`/personal-assistant`, per [#59](https://github.com/acardote/personal-assistant-ultra/issues/59))
+
+For operator tasks that don't need the full skill activation contract (no KB load, no freshness pre-flight), use the slash command at `.claude/commands/personal-assistant.md`:
+
+- `/personal-assistant metrics [--days N | --since … --until …]` — refresh the dashboard.
+- `/personal-assistant freshness-check [--quiet|--json|--stuck-threshold N]` — surface harvest health.
+- `/personal-assistant harvest [<scope>]` — on-demand harvest, e.g. `since yesterday`, `last 90 days`, `slack only`. Defaults to `since yesterday`.
+- `/personal-assistant live-writeback [--source <kind>|--dry-run]` — fold accumulated live findings into memory after a live-call-heavy session.
+
+The slash command is operator-task-shaped: it doesn't run the freshness pre-flight check before dispatch (re-running freshness-check on every dashboard refresh is noise). For free-form questions and exploratory work, address the skill directly via prose — that path runs the full activation contract.
+
+Empty / unknown subcommands list the valid set rather than silently falling through to skill activation, so typos surface as typos.
 
 ## Open extensions
 
