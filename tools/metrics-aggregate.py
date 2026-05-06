@@ -268,6 +268,8 @@ def aggregate_coverage(events: list[dict]) -> dict:
             "memory_hit_rate": None,
             "empty_handed_rate": None,
             "gap_discovery_rate": None,
+            "gap_detected_rate": None,
+            "gap_by_reason": {},
             "live_calls_per_query": 0.0,
             "total_queries": 0,
         }
