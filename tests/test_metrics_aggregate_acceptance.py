@@ -177,6 +177,46 @@ def test_gap_discovery_rate():
     print("  T5 PASS — gap_discovery_rate counts memory_hits=0 with topic_keywords.")
 
 
+def test_gap_detected_rate_and_by_reason():
+    """T5b (#39-A): gap_detected events surface as gap_detected_rate + gap_by_reason
+    breakdown, distinct from gap_discovery_rate (which is zero_hit-only)."""
+    import datetime as _dt
+    agg = setup_aggregate()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        events = [
+            # 4 queries; 3 fire gap_detected (2 zero_hit, 1 topic_pinned).
+            {"ts": "2026-05-06T10:00:00Z", "session_id": "s1", "event": "query_end",
+             "data": {"memory_hits": 0, "topic_keywords": ["acko"]}},
+            {"ts": "2026-05-06T10:00:00Z", "session_id": "s1", "event": "gap_detected",
+             "data": {"reason": "zero_hit", "memory_hits": 0}},
+
+            {"ts": "2026-05-06T10:01:00Z", "session_id": "s2", "event": "query_end",
+             "data": {"memory_hits": 5, "topic_keywords": ["badas"]}},
+            {"ts": "2026-05-06T10:01:00Z", "session_id": "s2", "event": "gap_detected",
+             "data": {"reason": "topic_pinned", "memory_hits": 5, "matched_topic": "BADAS Weekly"}},
+
+            {"ts": "2026-05-06T10:02:00Z", "session_id": "s3", "event": "query_end",
+             "data": {"memory_hits": 0, "topic_keywords": ["q3"]}},
+            {"ts": "2026-05-06T10:02:00Z", "session_id": "s3", "event": "gap_detected",
+             "data": {"reason": "zero_hit", "memory_hits": 0}},
+
+            {"ts": "2026-05-06T10:03:00Z", "session_id": "s4", "event": "query_end",
+             "data": {"memory_hits": 8, "topic_keywords": ["roadmap"]}},
+        ]
+        write_events_file(td_p / ".metrics", "2026-05-06", events)
+        snap = agg.build_snapshot(
+            metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
+            start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
+        )
+        cov = snap["coverage"]
+        assert abs(cov["gap_detected_rate"] - 0.75) < 0.01, f"expected 3/4=0.75, got {cov['gap_detected_rate']}"
+        assert cov["gap_by_reason"] == {"zero_hit": 2, "topic_pinned": 1}, cov["gap_by_reason"]
+        # gap_discovery_rate stays zero_hit-flavored (memory_hits=0 + topic_keywords): 2/4
+        assert abs(cov["gap_discovery_rate"] - 0.5) < 0.01
+    print("  T5b PASS — gap_detected_rate + gap_by_reason breakdown surfaced.")
+
+
 def test_query_abandonment_rate():
     """T6: sessions with query_start but no query_end → abandoned."""
     import datetime as _dt
@@ -486,6 +526,7 @@ if __name__ == "__main__":
     test_memory_hit_rate()
     test_empty_handed_rate()
     test_gap_discovery_rate()
+    test_gap_detected_rate_and_by_reason()
     test_query_abandonment_rate()
     test_compress_growth()
     test_harvest_runs_aggregated()
