@@ -274,6 +274,7 @@ def aggregate_coverage(events: list[dict]) -> dict:
             "live_by_status": {},
             "live_by_source": {},
             "live_body_truncated_count": 0,
+            "writeback_by_source": {},
             "total_queries": 0,
         }
     with_memory = sum(1 for e in query_ends if (e.get("data") or {}).get("memory_hits", 0) > 0)
@@ -308,6 +309,19 @@ def aggregate_coverage(events: list[dict]) -> dict:
         live_by_source[src] = live_by_source.get(src, 0) + 1
         if d.get("body_truncated") is True:
             truncated += 1
+
+    # Write-back items per source (#39-D). Same shape as live_call_end —
+    # status ∈ success | error. Lets the dashboard show whether the
+    # batch pipeline is keeping up with the live-call inflow.
+    writeback_events = [e for e in events if e.get("event") == "live_writeback_item"]
+    writeback_by_source: dict[str, dict[str, int]] = {}
+    for e in writeback_events:
+        d = e.get("data") or {}
+        src = d.get("source") or "unknown"
+        s = d.get("status") or "unknown"
+        bucket = writeback_by_source.setdefault(src, {"success": 0, "error": 0, "total": 0})
+        bucket[s] = bucket.get(s, 0) + 1
+        bucket["total"] = bucket.get("total", 0) + 1
     total = len(query_ends)
     return {
         "memory_hit_rate": round(with_memory / total, 4),
@@ -319,6 +333,7 @@ def aggregate_coverage(events: list[dict]) -> dict:
         "live_by_status": live_by_status,
         "live_by_source": live_by_source,
         "live_body_truncated_count": truncated,
+        "writeback_by_source": writeback_by_source,
         "total_queries": total,
     }
 

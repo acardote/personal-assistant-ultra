@@ -119,9 +119,18 @@ def render_memo(front: dict, body: str) -> str:
     return f"---\n{front_yaml}---\n\n{body.rstrip()}\n"
 
 
-def derive_memory_path(raw_path: Path, source_kind: str) -> Path:
-    """Mirror the layer-1 path under memory/, preserving subdirectory structure."""
+def derive_memory_path(raw_path: Path, source_kind: str, *, provenance: str | None = None) -> Path:
+    """Mirror the layer-1 path under memory/, preserving subdirectory structure.
+
+    When `provenance == "live"`, the raw path is `raw/live/<source>/<file>` and
+    we strip the `live/` segment so the memory object lands alongside
+    harvest-fetched memory at `memory/<source>/<file>` (per #39-D). This lets
+    the existing #10 event-id dedup catch the same meeting/thread across
+    harvest and live pipelines without separate dedup state.
+    """
     rel = raw_path.relative_to(RAW_ROOT)
+    if provenance == "live" and rel.parts and rel.parts[0] == "live":
+        rel = Path(*rel.parts[1:])
     return MEMORY_ROOT / rel
 
 
@@ -156,6 +165,15 @@ def main(argv: list[str]) -> int:
         default=800,
         help="Soft body token budget; warn (not fail) if exceeded.",
     )
+    parser.add_argument(
+        "--provenance",
+        default=None,
+        choices=[None, "harvest", "live"],
+        help="Provenance flag for the memory object's frontmatter (#39-D). "
+             "When 'live', also strips the `live/` segment from the raw path "
+             "when deriving the memory location, so #10 event-id dedup can "
+             "catch the same event across harvest and live pipelines.",
+    )
     args = parser.parse_args(argv[1:])
 
     raw_path = Path(args.raw_path).resolve()
@@ -167,8 +185,20 @@ def main(argv: list[str]) -> int:
     except ValueError:
         print(f"raw_path must live under {RAW_ROOT}", file=sys.stderr)
         return 2
+    # Path/provenance consistency check (per pr-challenger C1 on PR #64).
+    # Without this, `compress.py raw/granola_note/foo.md --provenance live`
+    # silently mislabels a harvest-shape memory object as live-fetched.
+    is_live_path = rel_to_raw.parts and rel_to_raw.parts[0] == "live"
+    if args.provenance == "live" and not is_live_path:
+        print(f"--provenance live requires raw_path under raw/live/ (got {rel_to_raw})", file=sys.stderr)
+        return 2
+    if args.provenance == "harvest" and is_live_path:
+        print(f"--provenance harvest is incompatible with raw/live/ path (got {rel_to_raw})", file=sys.stderr)
+        return 2
 
-    out_path = Path(args.out).resolve() if args.out else derive_memory_path(raw_path, args.source_kind)
+    out_path = Path(args.out).resolve() if args.out else derive_memory_path(
+        raw_path, args.source_kind, provenance=args.provenance,
+    )
 
     raw_text = raw_path.read_text(encoding="utf-8")
     prompt = PROMPT_PATH.read_text(encoding="utf-8")
@@ -199,6 +229,11 @@ def main(argv: list[str]) -> int:
     front["source_uri"] = f"file:./raw/{rel_to_raw.as_posix()}"
     front["source_kind"] = args.source_kind
     front["created_at"] = now_iso
+    # Provenance lets the dashboard / #10 dedup distinguish a memory object
+    # that came from the live-call path (#39-B) from one that came from the
+    # scheduled harvest. Absent when --provenance not passed (back-compat).
+    if args.provenance:
+        front["provenance"] = args.provenance
 
     if args.kind:
         front["kind"] = args.kind
