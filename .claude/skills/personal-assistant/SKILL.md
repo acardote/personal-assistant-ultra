@@ -254,7 +254,24 @@ Same shape as the Granola path; differences below.
 
 ### Live-call procedure (Gmail — #39-B.3)
 
-Slack and Gmail live adapters share the search-then-read shape. Gmail-specific procedure lands in #39-B.3.
+Same shape as Slack (two-step search → read); differences below.
+
+1. **Probe the gap.** As above. Gmail-relevant queries: status of an email thread, a vendor / partner conversation, a contract / renewal lookup. If `gap_detected` is `false` AND the question doesn't read as an email-thread question, answer from memory.
+2. **Capture the start ts and emit `live_call_start`** with `source=gmail_thread`.
+3. **Two-step Gmail call** (search returns thread metadata, body fetch is separate):
+   - **Label scope** — match the harvest procedure's: default to `label:important`, but if the user maintains a different curated label (the same per-user override the harvest section refers to at "if no per-user override"), use that. Live MUST use the same label as harvest — diverging would silently search a label the user doesn't curate, exactly the failure F2 on #5/#6 was meant to prevent.
+   - **Time filter** — default `newer_than:30d` to bound noise on un-anchored questions. **Drop the filter ONLY when the user's question contains an explicit date or period reference older than 30 days** (e.g. "what did the contract say in February", "last quarter's renewal") — substitute `after:YYYY-MM-DD before:YYYY-MM-DD`. Date-free historical asks ("did marketing renew", "what did legal say about the MSA") stay in the 30-day window — the live signal will likely show `status=empty`, which is the right cue to fall back to memory rather than expanding the search blindly (per F5 on #56).
+   - **Tool selection** — the Gmail MCP exposes auth tools (`mcp__claude_ai_Gmail__authenticate`, `mcp__claude_ai_Gmail__complete_authentication`) plus search/read tools that surface only after auth. Use the same MCP tools harvest uses; check the running session's tool list rather than hardcoding names that may evolve.
+   - **Hard cap: 2 thread reads per live call** (provisional — Gmail threads typically denser than Slack; revisit at Move 5 once `live_call_end.duration_ms` data exists). Body cap (`MAX_BODY_CHARS=65536`) inherited from the helper.
+4. **Capture the result.** Render to Markdown preserving headers (From, Subject, Date) and message boundaries — same format harvest writes for `gmail_thread`. Pipe to `tools/live-result-write.py --source gmail_thread --query "<original user query>" --start-iso "<start_iso>"`. Helper writes to `<content_root>/raw/live/gmail_thread/<ts-ms>-<hash>.md`.
+5. **Fold findings into the answer.** Quote sender + date when citing — for email, "who said what when" is load-bearing context. If multiple threads contribute, group by subject.
+6. **Don't compress yet** — same as the other adapters. #39-D handles write-back.
+
+**Failure paths**: same contract — emit `live_call_end` with `status=error` / `status=timeout` via `tools/log-event.py`, NOT a separate `live_call_error` event. Surface the gap to the user (e.g., *"I couldn't find a labeled-important thread on this — Gmail returned nothing relevant"*).
+
+**Gmail-specific risks**:
+- **Label-scope leak**: if the live query slips to broad inbox search (no `label:important`), F2 from #5/#6 fires — noise pollutes the answer and any future write-back. The procedure's "default scope to label:important" rule is honor-system; F2 below catches drift in production.
+- **Long threads**: legal / vendor email threads can be 40+ messages. The body cap from #39-B.2 (MAX_BODY_CHARS) protects against context blow-up; check `body_truncated=true` rate on the dashboard.
 
 ## Open extensions
 
