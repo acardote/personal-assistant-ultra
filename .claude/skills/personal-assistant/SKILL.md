@@ -210,6 +210,15 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 - **Semantic F1 gap (claude exit 0 ≠ harvest success).** The wrapper at `tools/scheduled-harvest.py` writes `ok: true` whenever `claude -p` exits 0. That signals "the process didn't crash," NOT "the harvest produced meaningful output." Today, an empty-vault cold-start that hit MCP-auth failures and bailed would still show `ok: true` because the model decided to log-and-move-on rather than abort. The full F1 closure requires the skill to write a structured per-source result back to the wrapper (e.g., a `<harvest_dir>/runs/<ts>.harvest-result.json`) which the wrapper inspects to determine `ok`. Tracked as future work; for now, supplement the wrapper's binary `ok` with a manual look at the daily digest counts.
 - **`git push` non-fast-forward on cross-machine contention.** When two machines (e.g. laptop + workstation) both try to push within seconds of each other, the second push fails with non-fast-forward. The wrapper currently exits 1 in that case (failure is loud, which is correct), but a future iteration could `git pull --rebase` and retry. For now: if you run on multiple machines, stagger the launchd `StartCalendarInterval` minutes so they don't collide.
 
+## Live-call gap detection (per [#39](https://github.com/acardote/personal-assistant-ultra/issues/39))
+
+`tools/route.py` checks whether memory looks insufficient for the current query and emits a `gap_detected` metric event when so. Two triggers:
+
+- **zero_hit** — `load_memory_objects` returned 0 matches for the query keywords.
+- **topic_pinned** — the query mentions a topic listed in `<content_root>/.harvest/live-pinned.txt`. One topic per line; blank lines and lines starting with `#` are ignored. Matching is case-insensitive substring on the raw query. Use this for fast-evolving topics (e.g. weekly syncs) where harvest cadence lags reality.
+
+#39-A only emits the signal — actual live-MCP augmentation lands in #39-B. Until then, `gap_detected` events let the dashboard show how often live would have fired and why.
+
 ## Open extensions
 
 - Multi-fidelity event matching + ranked retrieval: [#10](https://github.com/acardote/personal-assistant-ultra/issues/10).
