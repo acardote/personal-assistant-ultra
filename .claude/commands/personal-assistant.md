@@ -1,47 +1,45 @@
 ---
-description: Personal-assistant routine ops — dispatches to metrics / freshness-check / harvest / write-back / live-writeback subcommands. Falls through to skill activation for free-form questions.
-allowed-tools: Bash
+description: Personal-assistant routine ops — dispatches metrics / freshness-check / harvest / live-writeback subcommands.
 ---
 
-The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root. Parse the first token of `$ARGUMENTS` as the subcommand and forward the rest as flags. Dispatch table:
+The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root.
 
-## `metrics` — refresh the dashboard
+## Dispatch contract
 
-```bash
-tools/metrics-aggregate.py <remaining-args>
-tools/metrics-dashboard.py --serve
-```
+1. **Parse the FIRST whitespace-separated token of `$ARGUMENTS` as the subcommand.** Tokens with no whitespace (e.g. `metrics--days30`) are NOT subcommands — treat them as unknown.
+2. **Match the token EXACTLY against the table below.** No fuzzy matching, no inference of intent on near-misses (typos like `metrcs` are unknown, not `metrics`).
+3. **On match**: forward `$ARGUMENTS` minus the first token as flags to the underlying tool, follow the subcommand's instructions, surface the actual shell command(s) you ran in your final response.
+4. **On empty `$ARGUMENTS` OR unknown subcommand**: print the valid subcommand list with one-line descriptions and STOP. Do NOT activate the personal-assistant skill, do NOT ask a clarifying question, do NOT infer intent. Empty/unknown is a deterministic refusal — that's the contract.
 
-Default window in `metrics-aggregate.py` is 7 days; pass `--days 30` or `--since YYYY-MM-DD --until YYYY-MM-DD` through transparently. The dashboard step takes no args worth surfacing. Print the dashboard path in your final response so the user can re-open it later. If the aggregator reports zero events for the window, surface that explicitly (likely the routine hasn't fired or `PA_METRICS_DIR` is misconfigured).
+## Subcommand table
 
-## `freshness-check` — surface harvest health
+| Subcommand | Tool dispatch |
+|---|---|
+| `metrics` | `tools/metrics-aggregate.py <flags>` then `tools/metrics-dashboard.py --serve` |
+| `freshness-check` | `tools/check-harvest-freshness.py <flags>` |
+| `harvest` | follow harvest orchestration in SKILL.md (uses MCP tools, can't go through Bash alone) |
+| `live-writeback` | `tools/live-writeback.py <flags>` |
 
-```bash
-tools/check-harvest-freshness.py <remaining-args>
-```
+## Per-subcommand notes
 
-The check exits 0 when the most recent harvest is `ok: true` and younger than 26h. Non-zero exits emit a banner on stderr with one of: `STALE`, `FAILED`, `STUCK`, `STUCK_AND_STALE`, `MISSING`, `CORRUPT`. Surface the banner to the user verbatim (don't paraphrase the error field). Pass-through flags: `--quiet`, `--json`, `--stuck-threshold N`.
+### `metrics`
+Default window is 7 days; pass `--days N` or `--since YYYY-MM-DD --until YYYY-MM-DD` through transparently. Print the dashboard path. If aggregator reports zero events for the window, surface that explicitly (likely the routine hasn't fired or `PA_METRICS_DIR` is misconfigured).
 
-## `harvest` — run the harvest orchestration on demand
+### `freshness-check`
+The check exits 0 when the most recent harvest is `ok: true` AND younger than 26h. Non-zero exits emit a banner on stderr with one of: `STALE`, `FAILED`, `STUCK`, `STUCK_AND_STALE`, `MISSING`, `CORRUPT`. Surface the banner verbatim. Pass-through: `--quiet`, `--json`, `--stuck-threshold N`.
 
-The skill itself is the harvest orchestrator (per the "Harvest orchestration" section of `SKILL.md`). For `/personal-assistant harvest <args>`, treat `<args>` as the harvest scope (e.g. `since yesterday`, `last 90 days`, `slack only`) and follow the per-source procedures in SKILL.md. Do NOT invoke `tools/harvest.py` directly for live MCP work — those calls only succeed inside a Claude session.
+### `harvest`
+**Run `tools/check-harvest-freshness.py --quiet` FIRST** (per pr-challenger B2 on #66 — on-demand harvest without pre-flight produces false-positive successes when auth/MCP is broken). If freshness exits non-zero with `FAILED` / `STUCK` / `STUCK_AND_STALE` / `CORRUPT`, surface the banner and ASK the user before proceeding (the user may want to fix the upstream issue first; running harvest over a broken auth wastes time and pollutes the trail). For `MISSING` / `STALE`, proceed — those are the cases on-demand harvest exists to fix.
 
-If the user passes nothing (`/personal-assistant harvest`), default to `since yesterday`.
+Then follow the per-source procedures in SKILL.md ("Harvest orchestration"). Treat `<args>` as the harvest scope: `since yesterday` (default if no args), `last 90 days`, `slack only`, etc.
 
-## `live-writeback` — fold accumulated live findings into memory
+### `live-writeback`
+Walks `<content_root>/raw/live/<source>/`, runs `compress.py --provenance live` per file, moves processed files to `.processed/`. Pass-through: `--source <granola_note|slack_thread|gmail_thread>`, `--dry-run`. Useful after a session that fired multiple live calls.
 
-```bash
-tools/live-writeback.py <remaining-args>
-```
+## Empty / unknown response template
 
-Walks `<content_root>/raw/live/<source>/`, runs `compress.py --provenance live` per file, moves processed files to `.processed/`. Pass-through flags: `--source <granola_note|slack_thread|gmail_thread>`, `--dry-run`. Useful after a session that fired multiple live calls, before the user closes their laptop. (Per #39-D — also runs as part of the daily harvest routine.)
+When `$ARGUMENTS` is empty or unknown, respond with EXACTLY this shape (substituting the literal subcommand list):
 
-## (no subcommand or unknown subcommand)
+> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
 
-If `$ARGUMENTS` is empty or doesn't match any subcommand above:
-- Empty: list the subcommands with one-line descriptions and stop.
-- Unknown: tell the user the subcommand isn't recognized, list the valid ones, and stop. Do NOT silently fall through to skill activation — that would mask typos.
-
-## Surface contract
-
-Always print the actual shell command(s) you ran (so the user can re-run them by hand), and surface tool-side stderr (banners from freshness-check, summary lines from metrics). The skill's pre-flight harvest-freshness check from SKILL.md does NOT run for these routine ops — these are operator tasks, not user-question tasks, and re-running freshness-check on every dashboard refresh is noise.
+No skill activation, no clarifying question, no inference.
