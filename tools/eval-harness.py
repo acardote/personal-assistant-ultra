@@ -249,28 +249,29 @@ def _summarize_events(events_dir: Path) -> str:
     return ", ".join(parts)
 
 
-def run_full_skill(question: str) -> Run:
+def run_full_skill(question: str, *, events_dir: Path, qid: str) -> Run:
     """Drive a `claude -p` session and let the personal-assistant skill
     auto-activate. This is the user-facing entry that exercises the
     live-call path (#52/#54/#56) — `tools/route.py` does NOT fire live
     calls; the skill orchestrates them per the #51 architecture decision.
 
-    Each call gets its own isolated PA_METRICS_DIR so events don't pollute
-    the operator dashboard AND so we can summarize this run's events into
-    the rater notes (skill activation, gap, live calls, sources)."""
-    import tempfile
+    Each call writes to a per-question subdir of `events_dir` so events
+    don't pollute the operator dashboard, AND so the raw events are
+    preserved alongside the eval report for forensic re-derivation if
+    the summary turns out to be wrong (per pr-challenger #2 on PR #60).
+    The rater notes carry the summary; the raw events stay on disk."""
     import os as _os
-    with tempfile.TemporaryDirectory(prefix="eval-skill-") as td:
-        td_p = Path(td)
-        env = _os.environ.copy()
-        env["PA_METRICS_DIR"] = str(td_p)
-        # Fresh session per call so events don't bleed across questions.
-        env.pop("PA_SESSION_ID", None)
-        try:
-            resp = call_claude(question, env=env)
-        except subprocess.CalledProcessError as e:
-            resp = f"[full-skill call failed: exit {e.returncode}]\n{(e.stdout or '')[:500]}"
-        notes = _summarize_events(td_p)
+    qdir = events_dir / qid
+    qdir.mkdir(parents=True, exist_ok=True)
+    env = _os.environ.copy()
+    env["PA_METRICS_DIR"] = str(qdir)
+    # Fresh session per call so events don't bleed across questions.
+    env.pop("PA_SESSION_ID", None)
+    try:
+        resp = call_claude(question, env=env)
+    except subprocess.CalledProcessError as e:
+        resp = f"[full-skill call failed: exit {e.returncode}]\n{(e.stdout or '')[:500]}"
+    notes = _summarize_events(qdir)
     return Run(
         config="full-skill",
         response=resp,
@@ -283,7 +284,7 @@ def run_full_skill(question: str) -> Run:
 # Run + blinding + report
 # ───────────────────────────────────────────────────────────────────────
 
-def evaluate_question(qid: str, qtext: str, rng: random.Random) -> QuestionEval:
+def evaluate_question(qid: str, qtext: str, rng: random.Random, *, events_dir: Path) -> QuestionEval:
     qe = QuestionEval(id=qid, text=qtext)
 
     # Run full-architecture first to learn the retrieved-context size.
@@ -303,7 +304,7 @@ def evaluate_question(qid: str, qtext: str, rng: random.Random) -> QuestionEval:
     # Per #51 the skill orchestrates live calls; eval-harness needs to invoke
     # the skill (claude -p with auto-activation) to measure that path.
     print(f"  [{qid}] full-skill...", file=sys.stderr)
-    qe.runs["full-skill"] = run_full_skill(qtext)
+    qe.runs["full-skill"] = run_full_skill(qtext, events_dir=events_dir, qid=qid)
 
     # Blinding: shuffle config order under labels A, B, C, D (F2).
     configs = list(qe.runs.keys())
@@ -318,7 +319,7 @@ def render_report(evals: list[QuestionEval], blind_key_path: Path) -> tuple[dict
     judge; only `key_payload` reveals which label was which config."""
     blinded = {
         "questions": [],
-        "$instructions": "For each question, supply a 1-5 quality rating + free-text comment per label A/B/C. Do not look at the key file until your judgments are recorded.",
+        "$instructions": "For each question, supply a 1-5 quality rating + free-text comment per label A/B/C/D. Do not look at the key file until your judgments are recorded.",
     }
     key = {"questions": []}
     for qe in evals:
@@ -357,15 +358,21 @@ def main(argv: list[str]) -> int:
     if questions_payload.get("_status", "").startswith("PLACEHOLDER"):
         print("[eval-harness] WARNING: questions file is marked PLACEHOLDER — F1 from challenger says these must be real recurring questions traceable to ≥2 prior occurrences before treating output as evidence.", file=sys.stderr)
 
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # full-skill events live alongside the report for forensic re-derivation
+    # if a `Run.notes` summary turns out to be wrong (per pr-challenger #2 on
+    # PR #60). One subdir per question id under <out-stem>.events/.
+    events_dir = out_path.parent / f"{out_path.stem}.events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+
     rng = random.Random(args.seed)
     evals: list[QuestionEval] = []
     for q in questions:
         print(f"\n=== {q['id']}: {q['text']!r} ===", file=sys.stderr)
-        qe = evaluate_question(q["id"], q["text"], rng)
+        qe = evaluate_question(q["id"], q["text"], rng, events_dir=events_dir)
         evals.append(qe)
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     key_path = out_path.with_suffix(".key.json")
     blinded, key = render_report(evals, key_path)
     out_path.write_text(json.dumps(blinded, indent=2), encoding="utf-8")
@@ -373,6 +380,7 @@ def main(argv: list[str]) -> int:
 
     print(f"\n[eval-harness] blinded report: {out_path}", file=sys.stderr)
     print(f"[eval-harness] key (do not peek until judged): {key_path}", file=sys.stderr)
+    print(f"[eval-harness] full-skill events: {events_dir}", file=sys.stderr)
     print(f"[eval-harness] questions evaluated: {len(evals)}", file=sys.stderr)
     return 0
 
