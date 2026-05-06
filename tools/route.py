@@ -25,9 +25,15 @@ The router calls Claude Code (`claude -p`) for each persona. Critic's call
 includes the advisor's response in context — by construction the critic can
 see exactly what it must disagree with.
 
-Synthesis: the router does NOT collapse the perspectives. It outputs both,
-delineated, so downstream consumers (or the user) preserve both. F2 on issue
-#7 directly warns against synthesis-by-collapse — we don't do it.
+Synthesis: per [#40](https://github.com/acardote/personal-assistant-ultra/issues/40),
+when the critic ran, a `synthesizer` step (one additional LLM call) integrates
+draft + critique into a SINGLE unified response. The advisor's draft and the
+critic's full output remain on `RouteResult` (audit / debugging via --json),
+but the user-facing render shows only the synthesized response. This addresses
+the eval-baseline finding (#9) that the exposed advisor/critic dichotomy
+hurt UX ratings. The original "do not collapse perspectives" framing (F2 on
+#7) traded UX for transparency — #40 reverses that trade based on user
+feedback.
 """
 
 from __future__ import annotations
