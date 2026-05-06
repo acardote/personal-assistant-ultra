@@ -145,15 +145,17 @@ def test_multiple_snapshots_ordered():
 
 
 def test_html_has_plotly_and_charts():
-    """T4: HTML output contains Plotly script and chart divs."""
+    """T4: HTML output contains Plotly script and chart divs (with ≥2 snapshots)."""
     dash = setup_dashboard()
     with tempfile.TemporaryDirectory() as td:
         snap_dir = Path(td) / "snapshots"
         snap_dir.mkdir()
-        (snap_dir / "snap.json").write_text(json.dumps(make_snapshot("2026-05-07T12:00:00Z")))
+        # Two snapshots so n=1 gate doesn't suppress charts
+        (snap_dir / "snap1.json").write_text(json.dumps(make_snapshot("2026-05-06T12:00:00Z")))
+        (snap_dir / "snap2.json").write_text(json.dumps(make_snapshot("2026-05-07T12:00:00Z")))
         snapshots = dash.load_snapshots(snap_dir)
         html = dash.render_html(snapshots)
-        # Plotly CDN + at least one chart div
+        # Plotly CDN + chart divs
         assert "plot.ly" in html
         assert "Plotly.newPlot" in html
         assert "chart-0" in html
@@ -221,21 +223,107 @@ def test_by_source_kind_table():
 
 
 def test_mtime_dominates_warning():
-    """T9: mtime-dominates warning when mtime > created_at in age distribution."""
+    """T9: mtime-dominates warning fires only when mtime > 2x created_at (round-1 fix)."""
     dash = setup_dashboard()
-    snap = make_snapshot(
+    # Strong dominance (45 mtime vs 5 created_at, 9x ratio) → warning
+    snap_strong = make_snapshot(
         "2026-05-07T12:00:00Z",
         memory_quality={
             "memory_objects_total": 50, "memory_growth_count_in_window": 0,
             "topic_coverage_breadth": 0,
             "by_source_count": {"slack_thread": 50},
             "memory_age_days_p50": 0, "memory_age_days_p95": 0,
-            "memory_age_source_distribution": {"created_at": 5, "mtime": 45},  # mtime dominates
+            "memory_age_source_distribution": {"created_at": 5, "mtime": 45},
         },
     )
-    html = dash.render_current_state(snap)
-    assert "mtime dominates" in html, "warning should appear when mtime > created_at"
-    print("  T9 PASS — mtime-dominates warning appears in HTML.")
+    html_strong = dash.render_current_state(snap_strong)
+    assert "mtime dominates" in html_strong, "strong dominance should fire warning"
+
+    # Weak dominance (28 mtime vs 22 created_at, 1.27x ratio) → NO warning
+    snap_weak = make_snapshot(
+        "2026-05-07T12:00:00Z",
+        memory_quality={
+            "memory_objects_total": 50, "memory_growth_count_in_window": 0,
+            "topic_coverage_breadth": 0,
+            "by_source_count": {"slack_thread": 50},
+            "memory_age_days_p50": 0, "memory_age_days_p95": 0,
+            "memory_age_source_distribution": {"created_at": 22, "mtime": 28},
+        },
+    )
+    html_weak = dash.render_current_state(snap_weak)
+    assert "mtime dominates" not in html_weak, "51/49 should NOT fire warning (was hair-trigger)"
+    print("  T9 PASS — mtime-dominates warning fires only when mtime > 2x created_at.")
+
+
+def test_html_escaping_xss():
+    """T11: snapshot values containing HTML are escaped (round-1 XSS fix)."""
+    dash = setup_dashboard()
+    # Snapshot with hostile values in multiple fields
+    snap = make_snapshot(
+        "2026-05-07T12:00:00Z",
+        source_economy={
+            "by_source_kind": {
+                "<script>alert(1)</script>": {  # malicious source name
+                    "compress_result_count": 5,
+                    "over_budget_count": 0,
+                    "over_budget_rate": 0.0,
+                    "canonical_count": 5,
+                },
+            },
+            "by_kind": {},
+        },
+        memory_quality={
+            "memory_objects_total": 1,
+            "memory_growth_count_in_window": 0,
+            "topic_coverage_breadth": 0,
+            "by_source_count": {"<img onerror=alert(1)>": 1},  # malicious key
+            "memory_age_days_p50": 0,
+            "memory_age_days_p95": 0,
+            "memory_age_source_distribution": {"created_at": 1, "mtime": 0},
+        },
+    )
+    html_out = dash.render_current_state(snap)
+    # The hostile strings should NOT appear unescaped
+    assert "<script>alert(1)</script>" not in html_out, "XSS: <script> survived render!"
+    assert "<img onerror=alert(1)>" not in html_out, "XSS: <img onerror> survived render!"
+    # They SHOULD appear escaped
+    assert "&lt;script&gt;" in html_out
+    assert "&lt;img" in html_out
+    print("  T11 PASS — hostile snapshot values are escaped, no XSS.")
+
+
+def test_charts_skip_single_snapshot():
+    """T12: build_charts requires ≥2 snapshots; single-point lines are misleading."""
+    dash = setup_dashboard()
+    snaps_one = [make_snapshot("2026-05-07T12:00:00Z")]
+    snaps_two = [make_snapshot("2026-05-06T12:00:00Z"), make_snapshot("2026-05-07T12:00:00Z")]
+    assert dash.build_charts(snaps_one) == [], "single snapshot should produce no charts"
+    assert len(dash.build_charts(snaps_two)) > 0, "two snapshots should produce charts"
+    # And the HTML should explain this when n=1
+    html_one = dash.render_html(snaps_one)
+    assert "Need at least 2 snapshots" in html_one or "≥2 snapshots" in html_one
+    print("  T12 PASS — charts skipped on single snapshot, message rendered.")
+
+
+def test_staleness_warning():
+    """T13: dashboard surfaces a staleness warning when latest snapshot is >36h old."""
+    dash = setup_dashboard()
+    # Snapshot from 48h ago — should warn
+    import datetime as _dt
+    old_ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snap_old = make_snapshot(old_ts)
+    html_old = dash.render_current_state(snap_old)
+    assert "Latest snapshot is" in html_old or "old" in html_old.lower(), (
+        "staleness warning should fire on >36h-old snapshot"
+    )
+
+    # Snapshot from 1h ago — no warning
+    new_ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snap_new = make_snapshot(new_ts)
+    html_new = dash.render_current_state(snap_new)
+    # The "X hours old" warning shouldn't appear for fresh snapshots
+    assert "Latest snapshot is" not in html_new
+    print("  T13 PASS — staleness warning fires only on snapshots >36h old.")
 
 
 def test_cli_writes_html():
@@ -278,5 +366,8 @@ if __name__ == "__main__":
     test_missing_snapshots_dir()
     test_by_source_kind_table()
     test_mtime_dominates_warning()
+    test_html_escaping_xss()
+    test_charts_skip_single_snapshot()
+    test_staleness_warning()
     test_cli_writes_html()
     print("All metrics-dashboard tests passed.")

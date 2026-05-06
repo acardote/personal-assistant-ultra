@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import html
 import importlib.util
 import json
 import sys
@@ -56,6 +57,18 @@ _spec.loader.exec_module(_config_module)
 load_config = _config_module.load_config
 
 
+# Plotly.js loaded via CDN. **Security trade-off acknowledged**: there is
+# no SubResource Integrity (SRI) hash here because computing one for each
+# Plotly version requires a build step we don't currently run, and shipping
+# an unverified hash would block all loads if wrong (worse than no SRI).
+# Mitigations available:
+#   - Vendor plotly.js under tools/vendor/ (~3.7MB minified).
+#   - Compute SRI with `cat plotly.min.js | openssl dgst -sha384 -binary | base64`
+#     and pin to the version, then auto-bump via Renovate.
+#   - Use --offline flag (future) to skip charts entirely.
+# For a personal-use local dashboard rendering against private vault data,
+# the CDN supply-chain risk is real but bounded (private machine, infrequent
+# render). Caveat documented.
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
 
@@ -102,11 +115,18 @@ def time_series_chart(
     return {"data": data, "layout": layout}
 
 
+def _esc(value: Any) -> str:
+    """HTML-escape a value, coercing to string. Defense-in-depth even though
+    snapshot data comes from trusted aggregator — future schema fields or
+    user-provided event data could leak HTML/script into the dashboard."""
+    return html.escape(str(value), quote=True)
+
+
 def render_table(rows: list[tuple], headers: list[str]) -> str:
-    """Tiny HTML table renderer."""
-    th = "".join(f"<th>{h}</th>" for h in headers)
+    """Tiny HTML table renderer. All values escaped."""
+    th = "".join(f"<th>{_esc(h)}</th>" for h in headers)
     body = "".join(
-        "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
+        "<tr>" + "".join(f"<td>{_esc(c)}</td>" for c in row) + "</tr>"
         for row in rows
     )
     return f"<table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
@@ -124,8 +144,13 @@ def safe_get(d: dict, *keys: str, default=None):
 
 
 def build_charts(snapshots: list[dict]) -> list[dict]:
-    """Build the list of Plotly figure specs from snapshot history."""
-    if not snapshots:
+    """Build the list of Plotly figure specs from snapshot history.
+
+    Requires at least 2 snapshots for trends to be meaningful — a one-point
+    line chart is misleading. Caller is expected to render an explicit
+    "need ≥2 snapshots" message when this returns empty due to the gate.
+    """
+    if len(snapshots) < 2:
         return []
     xs = [s.get("generated_at", "") for s in snapshots]
 
@@ -203,16 +228,34 @@ def render_current_state(latest: dict) -> str:
 
     sections: list[str] = []
 
-    # Header
-    gen_at = latest.get("generated_at", "?")
-    win = f"{latest.get('window_start', '?')} → {latest.get('window_end', '?')}"
-    events = latest.get("events_total", 0)
+    # Header — escape all snapshot-derived values
+    gen_at = _esc(latest.get("generated_at", "?"))
+    win = _esc(f"{latest.get('window_start', '?')} → {latest.get('window_end', '?')}")
+    events = _esc(latest.get("events_total", 0))
+    runs = _esc(latest.get("harvest_runs_total", 0))
     sections.append(
         f"<p>Latest snapshot: <strong>{gen_at}</strong> · "
         f"window <strong>{win}</strong> · "
         f"<strong>{events}</strong> events · "
-        f"<strong>{latest.get('harvest_runs_total', 0)}</strong> harvest runs</p>"
+        f"<strong>{runs}</strong> harvest runs</p>"
     )
+
+    # Staleness warning if latest snapshot is stale (>36h old).
+    parsed_gen = None
+    try:
+        gen_str = latest.get("generated_at", "")
+        if isinstance(gen_str, str):
+            parsed_gen = _dt.datetime.fromisoformat(gen_str.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    if parsed_gen is not None:
+        age_h = (_dt.datetime.now(_dt.timezone.utc) - parsed_gen).total_seconds() / 3600.0
+        if age_h > 36:
+            sections.append(
+                f'<p style="color:#c00;background:#fee;padding:6px 12px;border-left:4px solid #c00;">'
+                f'⚠️ Latest snapshot is {age_h:.1f}h old. Run '
+                f'<code>tools/metrics-aggregate.py</code> to refresh.</p>'
+            )
 
     # User-experience summary
     ux = latest.get("user_experience") or {}
@@ -262,15 +305,21 @@ def render_current_state(latest: dict) -> str:
     if by_src_count:
         rows = sorted(by_src_count.items())
         sections.append("<h3>Memory corpus by source</h3>" + render_table(rows, ["source", "memory objects"]))
-        # Age provenance — warn if mtime dominates
+        # Age provenance — warn if mtime DOMINATES (>2x created_at) per round-1
+        # challenger: 51/49 fired identically to 99/1 with the old binary check.
         agedist = mq.get("memory_age_source_distribution") or {}
         if agedist:
-            ca = agedist.get("created_at", 0)
-            mt = agedist.get("mtime", 0)
-            warn = " ⚠️ <em>mtime dominates — check for vault rehydration</em>" if mt > ca else ""
+            ca = agedist.get("created_at", 0) or 0
+            mt = agedist.get("mtime", 0) or 0
+            ratio_warn = mt > 2 * max(ca, 1)
+            warn = (
+                f' ⚠️ <em>mtime dominates ({mt}:{ca} = {mt / max(ca, 1):.1f}x) — '
+                f'likely vault rehydration; ages are not truthful.</em>'
+                if ratio_warn else ""
+            )
             sections.append(
-                f"<p>Memory age source: {ca} from <code>created_at</code> (frontmatter), "
-                f"{mt} from <code>mtime</code>.{warn}</p>"
+                f"<p>Memory age source: <strong>{_esc(ca)}</strong> from <code>created_at</code> (frontmatter), "
+                f"<strong>{_esc(mt)}</strong> from <code>mtime</code>.{warn}</p>"
             )
 
     # System health
@@ -342,7 +391,7 @@ def render_html(snapshots: list[dict]) -> str:
   {current_state}
 
   <h2>Trends across snapshots</h2>
-  {'<p><em>Need at least one snapshot to show trends. Run <code>tools/metrics-aggregate.py</code> daily/weekly to build history.</em></p>' if not charts else chart_divs}
+  {'<p><em>Need at least 2 snapshots to show trends — a one-point line is meaningless. Run <code>tools/metrics-aggregate.py</code> daily/weekly to build history.</em></p>' if not charts else chart_divs}
 
   <script>
 {chart_scripts}
