@@ -25,9 +25,15 @@ The router calls Claude Code (`claude -p`) for each persona. Critic's call
 includes the advisor's response in context — by construction the critic can
 see exactly what it must disagree with.
 
-Synthesis: the router does NOT collapse the perspectives. It outputs both,
-delineated, so downstream consumers (or the user) preserve both. F2 on issue
-#7 directly warns against synthesis-by-collapse — we don't do it.
+Synthesis: per [#40](https://github.com/acardote/personal-assistant-ultra/issues/40),
+when the critic ran, a `synthesizer` step (one additional LLM call) integrates
+draft + critique into a SINGLE unified response. The advisor's draft and the
+critic's full output remain on `RouteResult` (audit / debugging via --json),
+but the user-facing render shows only the synthesized response. This addresses
+the eval-baseline finding (#9) that the exposed advisor/critic dichotomy
+hurt UX ratings. The original "do not collapse perspectives" framing (F2 on
+#7) traded UX for transparency — #40 reverses that trade based on user
+feedback.
 """
 
 from __future__ import annotations
@@ -125,6 +131,7 @@ class RouteResult:
     advisor_response: str = ""
     critic_response: str = ""
     specialist_response: str = ""
+    synthesized_response: str = ""  # Per #40: single unified response, hides advisor/critic format
 
 
 def assemble_kb_text() -> tuple[str, int]:
@@ -284,6 +291,33 @@ def run_specialist(name: str, query: str, context: str) -> str:
     return call_claude(prompt)
 
 
+def run_synthesizer(
+    query: str,
+    context: str,
+    draft: str,
+    critique: str,
+    specialist_response: str = "",
+) -> str:
+    """Per #40: integrate advisor draft + critic into a single unified response.
+
+    Adds one LLM call to the route, but produces a response without the
+    advisor/critic dichotomy that the eval (#9 partial baseline) showed
+    consistently underperformed in user ratings. The critic role is
+    preserved (it still runs and emits its event); only the user-facing
+    format changes.
+    """
+    parts = [
+        (PROMPTS_DIR / "synthesize.md").read_text(encoding="utf-8"),
+        "\n---\n",
+        context,
+        f"\n<DRAFT>\n{draft}\n</DRAFT>\n",
+        f"<CRITIQUE>\n{critique}\n</CRITIQUE>\n",
+    ]
+    if specialist_response:
+        parts.append(f"<SPECIALIST>\n{specialist_response}\n</SPECIALIST>\n")
+    return call_claude("".join(parts))
+
+
 def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -> RouteResult:
     # Per-query session: inherit if parent set PA_SESSION_ID, else fresh.
     inherit_or_start()
@@ -331,27 +365,48 @@ def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -
                 result.specialist_response = run_specialist(specialist, query, context)
                 sp_tracker["response_chars"] = len(result.specialist_response)
 
+        # Per #40: integrate advisor + critic + specialist into a single
+        # synthesized response. Skipped if --no-critic (no critique to merge)
+        # or if both critic and specialist were skipped (no value to add).
+        if not no_critic and result.critic_response:
+            print(f"[route] invoking synthesizer...", file=sys.stderr)
+            with time_event("synthesize_call", topic_keywords=topic_kws) as syn_tracker:
+                result.synthesized_response = run_synthesizer(
+                    query, context, result.advisor_response,
+                    result.critic_response, result.specialist_response,
+                )
+                syn_tracker["response_chars"] = len(result.synthesized_response)
+
         # Top-level query tracker mutations (land on query_end)
         q_tracker["kb_tokens"] = kb_tokens
         q_tracker["memory_tokens"] = memory_tokens
         q_tracker["memory_hits"] = len(memory_files)
         q_tracker["specialist"] = specialist
         q_tracker["empty_handed"] = (memory_tokens == 0 and kb_tokens > 0)
+        q_tracker["synthesized"] = bool(result.synthesized_response)
 
     return result
 
 
 def render_human_output(r: RouteResult) -> str:
-    sections = [
-        f"# Query\n\n{r.query}\n",
-        f"# Context\n- KB tokens: {r.kb_tokens}\n- Memory tokens: {r.memory_tokens}\n- Memory files: {len(r.memory_files)}\n- Specialist invoked: {r.specialist or 'none'}\n",
-        f"# Advisor\n\n{r.advisor_response}\n",
-    ]
-    if r.critic_response:
-        sections.append(f"# Adversarial critic\n\n{r.critic_response}\n")
-    if r.specialist_response:
-        sections.append(f"# Specialist ({r.specialist})\n\n{r.specialist_response}\n")
-    return "\n".join(sections)
+    """Render the user-facing output.
+
+    Per #40: when synthesis ran, the user sees ONLY the synthesized
+    response — no advisor/critic/specialist labels. Falls back to the
+    advisor's draft when --no-critic skips synthesis. The advisor +
+    critic + specialist outputs remain in the structured RouteResult
+    (and reachable via --json) for audit / debugging.
+    """
+    response_body = r.synthesized_response or r.advisor_response
+    return (
+        f"# Query\n\n{r.query}\n\n"
+        f"# Context\n- KB tokens: {r.kb_tokens}\n"
+        f"- Memory tokens: {r.memory_tokens}\n"
+        f"- Memory files: {len(r.memory_files)}\n"
+        f"- Specialist invoked: {r.specialist or 'none'}\n"
+        f"- Synthesized: {'yes' if r.synthesized_response else 'no'}\n\n"
+        f"# Response\n\n{response_body}\n"
+    )
 
 
 def main(argv: list[str]) -> int:
