@@ -234,7 +234,27 @@ When you'd otherwise answer a question and the gap signal points at meetings / w
 
 **Privacy note**: the helper writes the user's query verbatim into the artifact's leading HTML comment (provenance trail). `<content_root>/raw/live/` files inherit the same privacy posture as harvest's `raw/` artifacts (they contain user content). The metrics events file remains PII-filtered per `_metrics.py`'s denylist.
 
-Slack and Gmail live adapters land in #39-B.2 / #39-B.3.
+### Live-call procedure (Slack — #39-B.2)
+
+Same shape as the Granola path; differences below.
+
+1. **Probe the gap.** As above. Slack-relevant queries: people-by-channel-mention, status-of-X-thread, recent-discussion-of-Y. If `gap_detected` is `false` AND the question doesn't read as a Slack-conversation question, answer from memory.
+2. **Capture the start ts and emit `live_call_start`** with `source=slack_thread`. Same shape as Granola.
+3. **Two-step Slack call** (single-shot doesn't fit Slack's MCP shape — search returns snippets, threads need a separate read):
+   - Call `mcp__claude_ai_Slack__slack_search_public_and_private` with `{"query": "<topic terms from the user's question>"}`. Inspect the top result(s) for relevance — Slack search ranks by recency by default, so a recent post about the topic beats stale ones.
+   - Call `mcp__claude_ai_Slack__slack_read_thread` on the top match's thread. If the top match is mid-thread, the read returns the full thread context.
+   - Repeat the read for at most 2 additional matches if the first thread didn't answer the question. Hard cap: **3 thread reads per live call**, to stay within the <30s budget.
+4. **Capture the result.** Render the thread(s) to Markdown with `## <iso> — user:<id>` per message (same format as harvest writes for `slack_thread`), concatenate, and pipe to `tools/live-result-write.py --source slack_thread --query "<original user query>" --start-iso "<start_iso>"`. Helper writes to `<content_root>/raw/live/slack_thread/<ts-ms>-<hash>.md`.
+5. **Fold findings into the answer.** Quote speaker attribution where it matters (per #5/#6 F3: "the speaker matters as much as the content"). If multiple threads contribute, group by channel.
+6. **Don't compress yet** — same as Granola. #39-D handles write-back.
+
+**Failure paths**: same contract as Granola — emit `live_call_end` with `status=error` / `status=timeout`, NOT a separate `live_call_error` event. Surface gaps to the user (e.g., *"I couldn't find a current thread on this — Slack search returned nothing relevant"*).
+
+**Slack-specific over-firing risk**: Slack search is more permissive than Granola's natural-language path; it will return *something* for almost any query. Don't trust the top result blindly — if the snippet doesn't clearly relate to the question, skip the read and emit `status=empty` rather than fetching irrelevant threads (#39-B.2's F1).
+
+### Live-call procedure (Gmail — #39-B.3)
+
+Slack and Gmail live adapters share the search-then-read shape. Gmail-specific procedure lands in #39-B.3.
 
 ## Open extensions
 

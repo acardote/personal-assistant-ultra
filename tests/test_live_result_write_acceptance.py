@@ -59,7 +59,7 @@ def test_write_creates_path_under_live_dir():
     h = load_helper()
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        target = h.write_live_artifact(
+        target, truncated = h.write_live_artifact(
             source="granola_note",
             query="what's up with Acko?",
             body="Some meeting notes.",
@@ -69,6 +69,7 @@ def test_write_creates_path_under_live_dir():
         assert target.parent == expected_dir, f"expected dir {expected_dir}, got {target.parent}"
         assert target.exists()
         assert target.suffix == ".md"
+        assert truncated is False
     print("  T1 PASS — write creates path under raw/live/<source>/.")
 
 
@@ -76,7 +77,7 @@ def test_provenance_comment_first():
     """T2: first line of file is the HTML provenance comment."""
     h = load_helper()
     with tempfile.TemporaryDirectory() as td:
-        target = h.write_live_artifact(
+        target, _ = h.write_live_artifact(
             source="slack_thread",
             query="status of BADAS",
             body="@user: progressing well",
@@ -94,7 +95,7 @@ def test_filename_format():
     """T3: filename is <ts>-<8hex>.md (no 'live-' prefix; the dir conveys that)."""
     h = load_helper()
     with tempfile.TemporaryDirectory() as td:
-        target = h.write_live_artifact(
+        target, _ = h.write_live_artifact(
             source="gmail_thread",
             query="renewal status",
             body="email body",
@@ -184,7 +185,7 @@ def test_writes_under_content_root():
     h = load_helper()
     with tempfile.TemporaryDirectory() as td:
         custom_root = Path(td) / "custom_vault"
-        target = h.write_live_artifact(
+        target, _ = h.write_live_artifact(
             source="granola_note",
             query="q",
             body="b",
@@ -338,7 +339,7 @@ def test_live_dir_separate_from_harvest_dir():
         root = Path(td)
         # Simulate harvest's per-source dir
         (root / "raw" / "granola_note").mkdir(parents=True)
-        target = h.write_live_artifact(
+        target, _ = h.write_live_artifact(
             source="granola_note",
             query="separation test",
             body="meeting notes",
@@ -352,6 +353,75 @@ def test_live_dir_separate_from_harvest_dir():
         # Harvest dir is empty (live didn't pollute it)
         assert list(harvest_dir.iterdir()) == []
     print("  T15 PASS — raw/live/<source>/ is distinct from raw/<source>/.")
+
+
+def test_oversized_body_truncated():
+    """T16 (#39-B.2 F4): bodies above MAX_BODY_CHARS are truncated with a marker
+    and the function returns body_truncated=True so callers can flag it on the
+    metric event. Slack threads with 50+ messages were the motivating case."""
+    h = load_helper()
+    cap = h.MAX_BODY_CHARS
+    # Use a sentinel char that doesn't appear in the marker or comment.
+    # 'Q' avoids 'X' (in MAX_BODY_CHARS marker) and any iso-ts characters.
+    huge = "Q" * (cap + 1000)
+    with tempfile.TemporaryDirectory() as td:
+        target, truncated = h.write_live_artifact(
+            source="slack_thread",
+            query="big thread",
+            body=huge,
+            content_root=Path(td),
+        )
+        content = target.read_text()
+        assert truncated is True
+        assert "[...truncated" in content
+        # The body region was truncated to exactly MAX_BODY_CHARS sentinel chars.
+        # Past-cap content must NOT be present.
+        assert content.count("Q") == cap, (
+            f"expected exactly {cap} sentinel chars (truncated); got {content.count('Q')}"
+        )
+    print(f"  T16 PASS — bodies > MAX_BODY_CHARS={cap} are truncated with marker.")
+
+
+def test_truncation_marker_built_from_constant():
+    """T17a (#55 B1): marker must be derived from MAX_BODY_CHARS so a future
+    cap change can't desync the documented number from the actual cap."""
+    h = load_helper()
+    assert str(h.MAX_BODY_CHARS) in h.TRUNCATION_MARKER, (
+        "TRUNCATION_MARKER must reference MAX_BODY_CHARS — was the marker hardcoded?"
+    )
+    print(f"  T17a PASS — TRUNCATION_MARKER references MAX_BODY_CHARS={h.MAX_BODY_CHARS}.")
+
+
+def test_cli_emits_body_truncated_flag():
+    """T17: when body exceeds the cap, the CLI emits live_call_end with
+    body_truncated=True so the dashboard can chart context-overflow risk."""
+    target_path: Path | None = None
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        metrics_dir = td_p / "metrics"
+        metrics_dir.mkdir()
+        env = dict(os.environ)
+        env["PA_METRICS_DIR"] = str(metrics_dir)
+
+        h = load_helper()
+        # Sentinel 'Q' chosen to avoid collision with iso-ts and marker chars.
+        big_body = "Q" * (h.MAX_BODY_CHARS + 500)
+        result = subprocess.run(
+            [str(TOOL), "--source", "slack_thread", "--query", "oversized thread test"],
+            input=big_body,
+            env=env, text=True, capture_output=True, check=True,
+        )
+        target_path = Path(result.stdout.strip())
+        try:
+            event_files = list(metrics_dir.glob("events-*.jsonl"))
+            events = [json.loads(line) for line in event_files[0].read_text().splitlines() if line.strip()]
+            end = [e for e in events if e["event"] == "live_call_end"][0]
+            assert end["data"]["body_truncated"] is True
+            assert end["data"]["status"] == "success"
+        finally:
+            if target_path is not None and target_path.exists():
+                target_path.unlink()
+    print("  T17 PASS — CLI propagates body_truncated to live_call_end.")
 
 
 if __name__ == "__main__":
@@ -371,4 +441,7 @@ if __name__ == "__main__":
     test_cli_start_iso_computes_duration_ms()
     test_utc_ts_has_millisecond_precision()
     test_live_dir_separate_from_harvest_dir()
+    test_oversized_body_truncated()
+    test_truncation_marker_built_from_constant()
+    test_cli_emits_body_truncated_flag()
     print("All live-result-write tests passed.")

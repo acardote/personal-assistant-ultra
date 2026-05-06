@@ -86,6 +86,20 @@ from _metrics import emit, inherit_or_start  # noqa: E402
 VALID_SOURCES = {"granola_note", "slack_thread", "gmail_thread"}
 QUERY_HASH_LEN = 8
 
+# Cap a single live-fetched body. Slack threads in particular can run 50+
+# messages (per pr-challenger F4 on #54); without a cap a single fetch can
+# blow the answer's context budget. 64 KB ≈ 16 K tokens, well above any
+# meaningful single-thread payload but below context limits. When triggered,
+# the helper truncates with a marker and surfaces `body_truncated=True` on
+# `live_call_end` so the dashboard can flag the failure mode.
+MAX_BODY_CHARS = 65_536
+# Build marker from the constant so a future cap change can't desync the
+# documented number from the actual cap (per pr-challenger B1 on PR #55).
+TRUNCATION_MARKER = (
+    f"\n\n[...truncated to fit MAX_BODY_CHARS={MAX_BODY_CHARS} "
+    "— see live_call_end body_truncated flag]\n"
+)
+
 
 def query_hash(query: str) -> str:
     return hashlib.sha256(query.encode("utf-8", errors="replace")).hexdigest()[:QUERY_HASH_LEN]
@@ -123,12 +137,16 @@ def write_live_artifact(
     content_root: Path,
     now_iso: str | None = None,
     now_filename: str | None = None,
-) -> Path:
-    """Pure write: no env touching, no metrics emit. Returns the path written.
+) -> tuple[Path, bool]:
+    """Pure write: no env touching, no metrics emit. Returns (path, body_truncated).
 
     Path scheme: `<content_root>/raw/live/<source>/<ts>-<hash>.md`. The
     `raw/live/` separation is intentional — keeps live artifacts away
     from harvest's per-source dirs.
+
+    body_truncated is True when the source body exceeded MAX_BODY_CHARS
+    and was clipped with TRUNCATION_MARKER. Caller should propagate this
+    on the metric event.
     """
     if source not in VALID_SOURCES:
         raise ValueError(f"unknown source {source!r}; valid: {sorted(VALID_SOURCES)}")
@@ -136,6 +154,14 @@ def write_live_artifact(
         raise ValueError("query must be non-empty")
     if not body.strip():
         raise ValueError("body must be non-empty (refusing to write zero-byte artifact)")
+
+    body_truncated = False
+    if len(body) > MAX_BODY_CHARS:
+        # Slicing a Python str cuts codepoints, not bytes — write_text
+        # handles the UTF-8 encoding after, so we can't end up with a
+        # half-codepoint at the truncation boundary.
+        body = body[:MAX_BODY_CHARS] + TRUNCATION_MARKER
+        body_truncated = True
 
     h = query_hash(query)
     ts_file = now_filename or utc_ts()
@@ -148,7 +174,7 @@ def write_live_artifact(
     # Leading HTML comment carries provenance for compress.py + auditors.
     comment = f"<!-- live-fetched on {iso} for query {query!r} (#39-B) -->"
     target.write_text(f"{comment}\n{body}\n", encoding="utf-8")
-    return target
+    return target, body_truncated
 
 
 def _emit_live_call_end(
@@ -159,12 +185,14 @@ def _emit_live_call_end(
     bytes_written: int = 0,
     path_relative: str | None = None,
     duration_ms: int | None = None,
+    body_truncated: bool = False,
 ) -> None:
     payload: dict = {
         "source": source,
         "query_hash": q_hash,
         "status": status,
         "bytes_written": bytes_written,
+        "body_truncated": body_truncated,
     }
     if path_relative is not None:
         payload["path_relative"] = path_relative
@@ -198,7 +226,7 @@ def main(argv: list[str]) -> int:
         return 3
 
     try:
-        target = write_live_artifact(
+        target, body_truncated = write_live_artifact(
             source=args.source,
             query=args.query,
             body=body,
@@ -221,6 +249,7 @@ def main(argv: list[str]) -> int:
         bytes_written=bytes_written,
         path_relative=str(target.relative_to(cfg.content_root)),
         duration_ms=duration_ms,
+        body_truncated=body_truncated,
     )
     print(str(target))
     return 0
