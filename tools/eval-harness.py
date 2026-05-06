@@ -12,15 +12,22 @@ Usage:
     tools/eval-harness.py --questions tests/eval-questions.json --first 2 \\
         --out /tmp/claude/eval-smoke.json   # smoke test on first 2 questions
 
-For each question, runs three configurations:
-  - `no-memory`        : `claude -p "<question>"` with no system prompt context
+For each question, runs four configurations:
+  - `no-memory`        : `claude -p "<question>"` bare, no skill, no context
   - `vanilla-long-context`: `claude -p "<KB+raw artifacts up to budget>\\n\\n<question>"`
                        — concatenated raw/* up to a token budget MATCHED to the
                          full-architecture's retrieved-context size (per F3)
-  - `full-architecture`: `tools/route.py "<question>"` (advisor + critic + optional specialist)
+  - `full-architecture`: `tools/route.py "<question>"` (advisor + critic + synthesizer
+                       per #40). Measures the synthesizer in isolation. Does NOT
+                       exercise the live-call path — that's skill-orchestrated.
+  - `full-skill`       : `claude -p "<question>"` with skill auto-activation. Exercises
+                       the user-facing entry that #39's live-call path runs through.
+                       Each call gets an isolated PA_METRICS_DIR so events don't
+                       pollute the operator dashboard, and the events are summarized
+                       into the rater notes (skill_activated, gap reason, live calls).
 
 Outputs a JSON report with:
-  - blinded labels (A, B, C per question; the run's blinding key stored separately
+  - blinded labels (A, B, C, D per question; the run's blinding key stored separately
     at <out>.key.json so the user can rate without seeing config identity, then
     map back) — F2 mitigation.
   - per-config token counts for each input
@@ -69,8 +76,15 @@ class QuestionEval:
     blinding: dict[str, str] = field(default_factory=dict)  # blinded_label -> config
 
 
-def call_claude(prompt: str) -> str:
-    result = subprocess.run(["claude", "-p", prompt], check=True, capture_output=True, text=True)
+def call_claude(prompt: str, *, env: dict | None = None) -> str:
+    # stdin=DEVNULL is load-bearing — claude -p will hang waiting for input
+    # otherwise (per probe on 2026-05-06).
+    result = subprocess.run(
+        ["claude", "-p", prompt],
+        check=True, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
     return result.stdout.strip()
 
 
@@ -195,10 +209,82 @@ def run_full_architecture(question: str) -> tuple[Run, int]:
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Config 4: full-skill (claude -p with skill auto-activation, exercises live path)
+# ───────────────────────────────────────────────────────────────────────
+
+def _summarize_events(events_dir: Path) -> str:
+    """Walk this run's isolated metrics dir and summarize what fired.
+    Surfaced in the rater notes so we can tell "skill activated AND live
+    fired" apart from "skill activated but no gap" apart from "skill
+    didn't activate." Per F2 of #19's eval: full-skill is only
+    differentiating if the live path actually fires when memory misses."""
+    events_seen: dict[str, int] = {}
+    live_calls: list[str] = []
+    gap_reason: str | None = None
+    for f in events_dir.glob("events-*.jsonl"):
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev = e.get("event") or "?"
+            events_seen[ev] = events_seen.get(ev, 0) + 1
+            if ev == "live_call_end":
+                d = e.get("data") or {}
+                live_calls.append(f"{d.get('source','?')}={d.get('status','?')}")
+            if ev == "gap_detected":
+                d = e.get("data") or {}
+                gap_reason = d.get("reason")
+    skill_activated = "skill_start" in events_seen
+    parts = [f"skill_activated={skill_activated}"]
+    if gap_reason:
+        parts.append(f"gap={gap_reason}")
+    if live_calls:
+        parts.append("live=[" + ",".join(live_calls) + "]")
+    else:
+        parts.append("live=none")
+    return ", ".join(parts)
+
+
+def run_full_skill(question: str, *, events_dir: Path, qid: str) -> Run:
+    """Drive a `claude -p` session and let the personal-assistant skill
+    auto-activate. This is the user-facing entry that exercises the
+    live-call path (#52/#54/#56) — `tools/route.py` does NOT fire live
+    calls; the skill orchestrates them per the #51 architecture decision.
+
+    Each call writes to a per-question subdir of `events_dir` so events
+    don't pollute the operator dashboard, AND so the raw events are
+    preserved alongside the eval report for forensic re-derivation if
+    the summary turns out to be wrong (per pr-challenger #2 on PR #60).
+    The rater notes carry the summary; the raw events stay on disk."""
+    import os as _os
+    qdir = events_dir / qid
+    qdir.mkdir(parents=True, exist_ok=True)
+    env = _os.environ.copy()
+    env["PA_METRICS_DIR"] = str(qdir)
+    # Fresh session per call so events don't bleed across questions.
+    env.pop("PA_SESSION_ID", None)
+    try:
+        resp = call_claude(question, env=env)
+    except subprocess.CalledProcessError as e:
+        resp = f"[full-skill call failed: exit {e.returncode}]\n{(e.stdout or '')[:500]}"
+    notes = _summarize_events(qdir)
+    return Run(
+        config="full-skill",
+        response=resp,
+        input_tokens=count_tokens(question),
+        notes=notes,
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run + blinding + report
 # ───────────────────────────────────────────────────────────────────────
 
-def evaluate_question(qid: str, qtext: str, rng: random.Random) -> QuestionEval:
+def evaluate_question(qid: str, qtext: str, rng: random.Random, *, events_dir: Path) -> QuestionEval:
     qe = QuestionEval(id=qid, text=qtext)
 
     # Run full-architecture first to learn the retrieved-context size.
@@ -214,10 +300,16 @@ def evaluate_question(qid: str, qtext: str, rng: random.Random) -> QuestionEval:
     print(f"  [{qid}] no-memory...", file=sys.stderr)
     qe.runs["no-memory"] = run_no_memory(qtext)
 
-    # Blinding: shuffle config order under labels A, B, C (F2).
+    # full-skill exercises the live-call path that route.py cannot reach.
+    # Per #51 the skill orchestrates live calls; eval-harness needs to invoke
+    # the skill (claude -p with auto-activation) to measure that path.
+    print(f"  [{qid}] full-skill...", file=sys.stderr)
+    qe.runs["full-skill"] = run_full_skill(qtext, events_dir=events_dir, qid=qid)
+
+    # Blinding: shuffle config order under labels A, B, C, D (F2).
     configs = list(qe.runs.keys())
     rng.shuffle(configs)
-    labels = ["A", "B", "C"]
+    labels = ["A", "B", "C", "D"]
     qe.blinding = dict(zip(labels, configs))
     return qe
 
@@ -227,7 +319,7 @@ def render_report(evals: list[QuestionEval], blind_key_path: Path) -> tuple[dict
     judge; only `key_payload` reveals which label was which config."""
     blinded = {
         "questions": [],
-        "$instructions": "For each question, supply a 1-5 quality rating + free-text comment per label A/B/C. Do not look at the key file until your judgments are recorded.",
+        "$instructions": "For each question, supply a 1-5 quality rating + free-text comment per label A/B/C/D. Do not look at the key file until your judgments are recorded.",
     }
     key = {"questions": []}
     for qe in evals:
@@ -266,15 +358,21 @@ def main(argv: list[str]) -> int:
     if questions_payload.get("_status", "").startswith("PLACEHOLDER"):
         print("[eval-harness] WARNING: questions file is marked PLACEHOLDER — F1 from challenger says these must be real recurring questions traceable to ≥2 prior occurrences before treating output as evidence.", file=sys.stderr)
 
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # full-skill events live alongside the report for forensic re-derivation
+    # if a `Run.notes` summary turns out to be wrong (per pr-challenger #2 on
+    # PR #60). One subdir per question id under <out-stem>.events/.
+    events_dir = out_path.parent / f"{out_path.stem}.events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+
     rng = random.Random(args.seed)
     evals: list[QuestionEval] = []
     for q in questions:
         print(f"\n=== {q['id']}: {q['text']!r} ===", file=sys.stderr)
-        qe = evaluate_question(q["id"], q["text"], rng)
+        qe = evaluate_question(q["id"], q["text"], rng, events_dir=events_dir)
         evals.append(qe)
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     key_path = out_path.with_suffix(".key.json")
     blinded, key = render_report(evals, key_path)
     out_path.write_text(json.dumps(blinded, indent=2), encoding="utf-8")
@@ -282,6 +380,7 @@ def main(argv: list[str]) -> int:
 
     print(f"\n[eval-harness] blinded report: {out_path}", file=sys.stderr)
     print(f"[eval-harness] key (do not peek until judged): {key_path}", file=sys.stderr)
+    print(f"[eval-harness] full-skill events: {events_dir}", file=sys.stderr)
     print(f"[eval-harness] questions evaluated: {len(evals)}", file=sys.stderr)
     return 0
 
