@@ -57,8 +57,10 @@ SPECIALIST_TRIGGERS: dict[str, tuple[str, ...]] = {
     "incident-response": ("incident", "outage", "postmortem", "post-mortem", "remediation", "root cause"),
 }
 
-# Stopwords for topic-keyword extraction (privacy-preserving signal extraction).
+# Stopwords for topic-keyword extraction. Includes generic English plus
+# Nexar/project-specific high-frequency low-signal terms (per round-1 review).
 _STOPWORDS = frozenset({
+    # Generic English
     "the", "a", "an", "is", "are", "was", "were", "what", "where", "when",
     "how", "why", "on", "in", "of", "to", "for", "with", "and", "or", "but",
     "we", "i", "me", "my", "this", "that", "these", "those", "it", "its",
@@ -69,21 +71,42 @@ _STOPWORDS = frozenset({
     "he", "she", "him", "her", "his", "hers", "us", "our", "ours",
     "latest", "current", "now", "today", "yesterday", "tomorrow", "week",
     "tell", "show", "give", "summarize", "explain", "describe",
+    # Project / domain noise
+    "nexar", "corp", "team", "project", "please", "help", "need", "know",
+    "want", "going", "work", "working", "thanks", "great", "good",
 })
 
 
 def extract_topic_keywords(query: str, *, limit: int = 5) -> list[str]:
-    """Privacy-preserving topic-keyword extraction from a query string.
+    """Topic-keyword extraction from a query string.
 
-    Returns up to `limit` distinctive lowercase tokens (≥4 chars, not stopwords).
-    Used to tag metrics events with what topic the query was about, without
-    logging the raw query text.
+    Privacy contract: emits up to `limit` distinctive lowercase tokens (≥4
+    chars, not stopwords, not adjacent to `@`). Used to tag metrics events
+    with what topic the query was about, without logging the raw query.
+
+    **Honest scope**: this strips obvious lexical PII (emails, phones,
+    secrets) but does NOT recognize proper-noun PII like first/last names.
+    A query mentioning "John Smith" will emit `["john", "smith"]` as topic
+    keywords. The privacy contract for `.metrics/` accepts this as topic
+    context (people the user asks about are part of the working corpus,
+    documented in `kb/people.md`). If you need stricter scrubbing, narrow
+    the contract here or post-process via a name allowlist drawn from KB.
     """
-    tokens = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]+\b", query.lower())
-    seen = set()
+    # Reject tokens that appear immediately before `@` (email local-part).
+    # Match the lowercased query against an `@` boundary.
+    q_lower = query.lower()
+    email_locals: set[str] = set()
+    for m in re.finditer(r"\b([a-z0-9_.-]+)@", q_lower):
+        # Local-part may be dotted (e.g., andre.cardote); split and add each piece.
+        for piece in re.split(r"[._-]", m.group(1)):
+            if piece:
+                email_locals.add(piece)
+
+    tokens = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]+\b", q_lower)
+    seen: set[str] = set()
     out: list[str] = []
     for t in tokens:
-        if t in _STOPWORDS or len(t) < 4 or t in seen:
+        if t in _STOPWORDS or len(t) < 4 or t in seen or t in email_locals:
             continue
         seen.add(t)
         out.append(t)

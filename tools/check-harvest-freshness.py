@@ -354,14 +354,17 @@ def main(argv: list[str]) -> int:
             f"a threshold of 0 or negative would fire STUCK on every healthy run."
         )
 
+    inherit_or_start()  # join parent session if PA_SESSION_ID set
+
     try:
         cfg = load_config(require_explicit_content_root=False)
     except RuntimeError as exc:
         # require_explicit_content_root=False shouldn't raise, but catch defensively.
+        # Emit an event so dashboards can see config-error frequency over time.
+        emit("freshness_check_error", error_type=type(exc).__name__)
         print(f"[harvest-freshness] config error: {exc}", file=sys.stderr)
         return 2
 
-    inherit_or_start()  # join parent session if PA_SESSION_ID is set
     runs_dir = cfg.harvest_state_root / "runs"
     result = assess_freshness(
         runs_dir, max_age_hours=args.max_age_hours, stuck_threshold=args.stuck_threshold

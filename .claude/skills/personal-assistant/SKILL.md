@@ -36,15 +36,23 @@ When this skill is invoked, your **first two actions** are:
    into a single user-facing turn (per [#41](https://github.com/acardote/personal-assistant-ultra/issues/41)). Run:
 
    ```bash
-   export PA_SESSION_ID=$(python3 -c "import secrets; print(secrets.token_hex(4))")
+   export PA_SESSION_ID=$(openssl rand -hex 4)
+   echo "PA session: $PA_SESSION_ID" >&2
    tools/log-event.py skill_start --inherit-session --data trigger=user
    ```
 
-   Do this exactly once at turn start. Subsequent tool invocations within the
-   same turn (route.py, assemble-kb.py, compress.py, check-harvest-freshness.py)
-   will inherit the session via `PA_SESSION_ID` and emit events that aggregate
-   correctly. If you skip this, each tool will mint its own session and the
-   dashboard will fragment per-turn metrics.
+   Do this exactly once at turn start. The `echo` to stderr surfaces the
+   session id so a missing/broken `openssl` produces a visible failure
+   (empty session id → first tool mints its own; the inheritance contract
+   relies on the env being set).
+
+   Subsequent tool invocations within the same turn (route.py, assemble-kb.py,
+   compress.py, check-harvest-freshness.py) will inherit the session via
+   `PA_SESSION_ID` and emit events that aggregate correctly. If you skip
+   this step entirely, the first tool to run will mint its own session and
+   the rest will inherit that — within-turn aggregation still works, but
+   the session start point is the first tool call rather than skill entry.
+   Cross-turn isolation is unaffected.
 
 2. **Load layer-3** by running:
 

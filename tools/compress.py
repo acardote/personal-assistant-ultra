@@ -184,6 +184,10 @@ def main(argv: list[str]) -> int:
     # calls in one harvest run group together.
     inherit_or_start()
 
+    # `compress` covers the LLM call (the slow part); the trailing
+    # `compress_result` event carries post-dedup, post-validation outcome
+    # data that isn't available until later in the function. Aggregator can
+    # join the two events on session_id + relative timestamp.
     with time_event("compress", source_kind=args.source_kind, raw_chars=len(raw_text)) as ct:
         output = call_claude(prompt, raw_text)
         ct["output_chars"] = len(output)
@@ -315,11 +319,12 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
 
-    # Emit a compress_result event with the per-item outcome so the dashboard
-    # can chart token-budget violations + per-source compression yield over time.
+    # Compress_result carries post-LLM, post-validation outcome only. Fields
+    # that overlap with `compress_end` (source_kind) are NOT repeated — the
+    # aggregator joins on session_id + recency. Only emits NEW signal:
+    # the resulting kind, body token count, budget violation, dedup role.
     emit(
         "compress_result",
-        source_kind=args.source_kind,
         kind=kind,
         body_tokens=body_tokens,
         over_budget=over_budget,
