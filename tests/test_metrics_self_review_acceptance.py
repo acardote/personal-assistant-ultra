@@ -261,6 +261,44 @@ def test_high_live_calls_per_query():
     print("  T15 PASS — high live_calls_per_query → medium finding.")
 
 
+def test_live_call_error_rate_high():
+    """T15a (#39-B follow-up): live_call error+timeout rate > threshold → high finding."""
+    rev = setup_review()
+    # 6 success + 2 error + 1 timeout = 9 total, error_rate = 3/9 = 33% > 10%
+    snap = make_snapshot(coverage={
+        "live_by_status": {"success": 6, "error": 2, "timeout": 1},
+    })
+    recs = rev.evaluate_rules(snap)
+    found = [r for r in recs if r["category"] == "live_calls" and "error+timeout" in r["finding"]]
+    assert found, f"expected live_call error finding, got: {[r['finding'] for r in recs]}"
+    assert found[0]["severity"] == "high"
+    print("  T15a PASS — high live_call error rate → high finding.")
+
+
+def test_live_call_empty_rate_high():
+    """T15b (#39-B follow-up): live_call empty rate > threshold → medium finding."""
+    rev = setup_review()
+    # 4 success + 6 empty = 10 total, empty_rate = 60% > 40%
+    snap = make_snapshot(coverage={
+        "live_by_status": {"success": 4, "empty": 6},
+    })
+    recs = rev.evaluate_rules(snap)
+    found = [r for r in recs if r["category"] == "live_calls" and "empty rate" in r["finding"]]
+    assert found, f"expected live_call empty finding, got: {[r['finding'] for r in recs]}"
+    assert found[0]["severity"] == "medium"
+    print("  T15b PASS — high live_call empty rate → medium finding.")
+
+
+def test_live_call_no_data_no_finding():
+    """T15c: when no live calls fired (live_by_status empty/missing), neither rule fires."""
+    rev = setup_review()
+    snap = make_snapshot(coverage={"live_by_status": {}})
+    recs = rev.evaluate_rules(snap)
+    live_findings = [r for r in recs if r["category"] == "live_calls"]
+    assert live_findings == [], f"expected no live_calls findings, got: {live_findings}"
+    print("  T15c PASS — no live calls → no live_call findings (avoids div-by-zero noise).")
+
+
 def test_mcp_errors_finding():
     """T16: mcp_errors_by_source has any errors → low system_health finding."""
     rev = setup_review()
@@ -340,6 +378,9 @@ if __name__ == "__main__":
     test_render_groups_by_severity()
     test_summary_counts()
     test_high_live_calls_per_query()
+    test_live_call_error_rate_high()
+    test_live_call_empty_rate_high()
+    test_live_call_no_data_no_finding()
     test_mcp_errors_finding()
     test_freshness_states_non_pass()
     test_just_below_threshold_no_finding()

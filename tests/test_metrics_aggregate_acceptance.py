@@ -217,6 +217,45 @@ def test_gap_detected_rate_and_by_reason():
     print("  T5b PASS — gap_detected_rate + gap_by_reason breakdown surfaced.")
 
 
+def test_live_call_status_breakdown():
+    """T5c (#39-B follow-up): live_call_end events surface as live_by_status,
+    live_by_source, and live_body_truncated_count for operator visibility."""
+    import datetime as _dt
+    agg = setup_aggregate()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        events = [
+            {"ts": "2026-05-06T10:00:00Z", "session_id": "s1", "event": "query_end",
+             "data": {"memory_hits": 0, "topic_keywords": ["acko"]}},
+            {"ts": "2026-05-06T10:00:01Z", "session_id": "s1", "event": "live_call_end",
+             "data": {"source": "granola_note", "status": "success", "body_truncated": False}},
+            {"ts": "2026-05-06T10:00:02Z", "session_id": "s1", "event": "live_call_end",
+             "data": {"source": "slack_thread", "status": "success", "body_truncated": True}},
+
+            {"ts": "2026-05-06T10:01:00Z", "session_id": "s2", "event": "query_end",
+             "data": {"memory_hits": 0, "topic_keywords": ["badas"]}},
+            {"ts": "2026-05-06T10:01:01Z", "session_id": "s2", "event": "live_call_end",
+             "data": {"source": "granola_note", "status": "error", "body_truncated": False}},
+
+            {"ts": "2026-05-06T10:02:00Z", "session_id": "s3", "event": "query_end",
+             "data": {"memory_hits": 5, "topic_keywords": ["q3"]}},
+            {"ts": "2026-05-06T10:02:01Z", "session_id": "s3", "event": "live_call_end",
+             "data": {"source": "gmail_thread", "status": "empty", "body_truncated": False}},
+        ]
+        write_events_file(td_p / ".metrics", "2026-05-06", events)
+        snap = agg.build_snapshot(
+            metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
+            start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
+        )
+        cov = snap["coverage"]
+        assert cov["live_by_status"] == {"success": 2, "error": 1, "empty": 1}
+        assert cov["live_by_source"] == {"granola_note": 2, "slack_thread": 1, "gmail_thread": 1}
+        assert cov["live_body_truncated_count"] == 1
+        # 4 live_call_end / 3 query_end = 1.33
+        assert abs(cov["live_calls_per_query"] - (4/3)) < 0.01
+    print("  T5c PASS — live_by_status / live_by_source / body_truncated_count surfaced.")
+
+
 def test_query_abandonment_rate():
     """T6: sessions with query_start but no query_end → abandoned."""
     import datetime as _dt
@@ -527,6 +566,7 @@ if __name__ == "__main__":
     test_empty_handed_rate()
     test_gap_discovery_rate()
     test_gap_detected_rate_and_by_reason()
+    test_live_call_status_breakdown()
     test_query_abandonment_rate()
     test_compress_growth()
     test_harvest_runs_aggregated()
