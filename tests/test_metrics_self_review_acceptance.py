@@ -252,6 +252,58 @@ def test_summary_counts():
     print("  T13 PASS — summary counts findings per severity correctly.")
 
 
+def test_high_live_calls_per_query():
+    """T15: live_calls_per_query > threshold → medium coverage finding (round-1 add)."""
+    rev = setup_review()
+    snap = make_snapshot(coverage={"live_calls_per_query": 0.7})
+    recs = rev.evaluate_rules(snap)
+    assert any(r["category"] == "coverage" and "live_calls_per_query" in r["finding"] for r in recs)
+    print("  T15 PASS — high live_calls_per_query → medium finding.")
+
+
+def test_mcp_errors_finding():
+    """T16: mcp_errors_by_source has any errors → low system_health finding."""
+    rev = setup_review()
+    snap = make_snapshot(system_health={"mcp_errors_by_source": {"slack": 3, "granola": 1}})
+    recs = rev.evaluate_rules(snap)
+    found = [r for r in recs if "MCP errors" in r["finding"]]
+    assert found, f"expected MCP errors finding, got: {[r['finding'] for r in recs]}"
+    assert "slack=3" in found[0]["finding"] and "granola=1" in found[0]["finding"]
+    print("  T16 PASS — MCP errors per source surfaced as low finding.")
+
+
+def test_freshness_states_non_pass():
+    """T17: non-PASS freshness_check_states surfaces medium finding."""
+    rev = setup_review()
+    snap = make_snapshot(system_health={"freshness_check_states": {"PASS": 5, "STALE": 2, "FAILED": 1}})
+    recs = rev.evaluate_rules(snap)
+    found = [r for r in recs if "non-PASS states" in r["finding"]]
+    assert found, "non-PASS freshness states should produce a finding"
+    assert "STALE=2" in found[0]["finding"] and "FAILED=1" in found[0]["finding"]
+    print("  T17 PASS — non-PASS freshness_check_states surfaced as finding.")
+
+
+def test_just_below_threshold_no_finding():
+    """T18: values JUST BELOW threshold do NOT trigger the finding (boundary).
+
+    The previous PR-D challenger raised the hair-trigger concern. Verify that
+    values exactly at threshold or just below don't fire — only values that
+    materially exceed do. This test pins the boundary semantics."""
+    rev = setup_review()
+    threshold = rev.THRESHOLDS["empty_handed_rate"]  # 0.30
+    # At threshold: comparison is `> 0.30`, so 0.30 should NOT fire.
+    snap = make_snapshot(coverage={"empty_handed_rate": threshold})
+    recs = rev.evaluate_rules(snap)
+    assert not any("empty_handed_rate" in r["finding"] for r in recs), (
+        f"value at threshold should not fire, got recs: {[r['finding'] for r in recs]}"
+    )
+    # Just above: 0.31 should fire.
+    snap_above = make_snapshot(coverage={"empty_handed_rate": threshold + 0.01})
+    recs_above = rev.evaluate_rules(snap_above)
+    assert any("empty_handed_rate" in r["finding"] for r in recs_above)
+    print("  T18 PASS — threshold boundary is strict: at threshold = no fire, just above = fire.")
+
+
 def test_cli_writes_review():
     """T14: CLI writes review file."""
     with tempfile.TemporaryDirectory() as td:
@@ -287,5 +339,9 @@ if __name__ == "__main__":
     test_latest_snapshot_picks_newest()
     test_render_groups_by_severity()
     test_summary_counts()
+    test_high_live_calls_per_query()
+    test_mcp_errors_finding()
+    test_freshness_states_non_pass()
+    test_just_below_threshold_no_finding()
     test_cli_writes_review()
     print("All metrics-self-review tests passed.")

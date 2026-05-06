@@ -65,6 +65,23 @@ load_config = _config_module.load_config
 METHOD_ROOT = Path(__file__).resolve().parent.parent
 AGGREGATE_TOOL = METHOD_ROOT / "tools" / "metrics-aggregate.py"
 
+# Thresholds. Hoisted to module level so calibration is one edit; tests
+# reference these constants instead of hardcoded literals. Expect to re-tune
+# after 2-4 weeks of real production data.
+THRESHOLDS = {
+    "empty_handed_rate": 0.30,           # high: many queries find no useful memory
+    "gap_discovery_rate": 0.40,          # high: many queries surface untracked topics
+    "memory_hit_rate": 0.50,             # medium: memory misses on >50% of queries (low side)
+    "query_abandonment_rate": 0.20,      # medium: 20%+ of queries have no end event
+    "p95_latency_ms": 60_000,            # low: slow tail >1 minute
+    "harvest_success_rate": 0.95,        # high: harvest failing more than rarely
+    "token_budget_violations": 10,       # medium: >10/window suggests bloat
+    "mtime_to_created_at_ratio": 2.0,    # medium: vault rehydration likely
+    "live_calls_per_query": 0.50,        # medium: half+ of queries need live (#39 not fully closed)
+    "min_mcp_errors_to_flag": 1,         # low: any MCP error worth surfacing
+    "min_memory_for_orphan_check": 5,    # low: source needs ≥5 memory objects to flag
+}
+
 
 def latest_snapshot(snapshots_dir: Path) -> dict | None:
     """Return the most recent snapshot by generated_at, or None if no snapshots."""
@@ -105,16 +122,16 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
 
     # Coverage gaps
     eh = safe_get(snapshot, "coverage", "empty_handed_rate")
-    if isinstance(eh, (int, float)) and eh > 0.30:
+    if isinstance(eh, (int, float)) and eh > THRESHOLDS["empty_handed_rate"]:
         recs.append({
             "severity": "high",
             "category": "coverage",
-            "finding": f"empty_handed_rate is {eh:.0%} — more than 30% of queries find no useful memory.",
+            "finding": f"empty_handed_rate is {eh:.0%} — more than {THRESHOLDS['empty_handed_rate']:.0%} of queries find no useful memory.",
             "suggested_action": "Broaden harvest scope (add Slack channels to allow-list, lower Gmail label filter, add Granola meeting series). Consider live-call augmentation per #39.",
         })
 
     gap = safe_get(snapshot, "coverage", "gap_discovery_rate")
-    if isinstance(gap, (int, float)) and gap > 0.40:
+    if isinstance(gap, (int, float)) and gap > THRESHOLDS["gap_discovery_rate"]:
         recs.append({
             "severity": "high",
             "category": "coverage",
@@ -123,7 +140,7 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
         })
 
     hit = safe_get(snapshot, "coverage", "memory_hit_rate")
-    if isinstance(hit, (int, float)) and hit < 0.50:
+    if isinstance(hit, (int, float)) and hit < THRESHOLDS["memory_hit_rate"]:
         recs.append({
             "severity": "medium",
             "category": "coverage",
@@ -131,9 +148,19 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
             "suggested_action": "Either coverage is too narrow (broaden harvest) or retrieval is broken (check tools/route.py:load_memory_objects keyword scoring).",
         })
 
+    # Live calls per query: tracked by #39; high rate signals harvest can't keep up.
+    lcq = safe_get(snapshot, "coverage", "live_calls_per_query")
+    if isinstance(lcq, (int, float)) and lcq > THRESHOLDS["live_calls_per_query"]:
+        recs.append({
+            "severity": "medium",
+            "category": "coverage",
+            "finding": f"live_calls_per_query is {lcq:.2f} — over half of queries needed live MCP calls.",
+            "suggested_action": "Live-call layer (#39) is a gap-filler, not a substitute for harvest. Inspect which topics consistently miss memory and add them to scheduled-harvest scope.",
+        })
+
     # User experience
     ab = safe_get(snapshot, "user_experience", "query_abandonment_rate")
-    if isinstance(ab, (int, float)) and ab > 0.20:
+    if isinstance(ab, (int, float)) and ab > THRESHOLDS["query_abandonment_rate"]:
         recs.append({
             "severity": "medium",
             "category": "user_experience",
@@ -142,7 +169,7 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
         })
 
     p95 = safe_get(snapshot, "user_experience", "time_to_response_ms_p95")
-    if isinstance(p95, (int, float)) and p95 > 60_000:
+    if isinstance(p95, (int, float)) and p95 > THRESHOLDS["p95_latency_ms"]:
         recs.append({
             "severity": "low",
             "category": "user_experience",
@@ -152,7 +179,7 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
 
     # System health
     hs = safe_get(snapshot, "system_health", "harvest_success_rate")
-    if isinstance(hs, (int, float)) and hs < 0.95:
+    if isinstance(hs, (int, float)) and hs < THRESHOLDS["harvest_success_rate"]:
         recs.append({
             "severity": "high",
             "category": "system_health",
@@ -161,7 +188,7 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
         })
 
     tv = safe_get(snapshot, "system_health", "token_budget_violations")
-    if isinstance(tv, (int, float)) and tv > 10:
+    if isinstance(tv, (int, float)) and tv > THRESHOLDS["token_budget_violations"]:
         recs.append({
             "severity": "medium",
             "category": "system_health",
@@ -169,11 +196,39 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
             "suggested_action": "Tighten the compress.py prompt or raise the soft budget; investigate which kinds are over-budget (see source_economy.by_kind.over_budget_rate).",
         })
 
+    # MCP errors per source — any non-zero is signal worth surfacing.
+    mcp = safe_get(snapshot, "system_health", "mcp_errors_by_source") or {}
+    if isinstance(mcp, dict) and mcp:
+        sources_with_errors = ", ".join(f"{src}={n}" for src, n in sorted(mcp.items()) if n >= THRESHOLDS["min_mcp_errors_to_flag"])
+        if sources_with_errors:
+            recs.append({
+                "severity": "low",
+                "category": "system_health",
+                "finding": f"MCP errors observed: {sources_with_errors}.",
+                "suggested_action": "Inspect harvest run-status JSONs for the failing source(s). If recurring, check connector authentication state in claude.ai.",
+            })
+
+    # Freshness check non-PASS states surface here too — a STALE/FAILED/STUCK
+    # check at skill startup is already user-visible (per #27 banner) and
+    # routine watchdog DM (per #32). Aggregating them here helps identify
+    # whether the issue is acute (one-off) or chronic (every fire).
+    fc_states = safe_get(snapshot, "system_health", "freshness_check_states") or {}
+    if isinstance(fc_states, dict):
+        non_pass = {k: v for k, v in fc_states.items() if k != "PASS" and v > 0}
+        if non_pass:
+            states_str = ", ".join(f"{k}={v}" for k, v in sorted(non_pass.items()))
+            recs.append({
+                "severity": "medium",
+                "category": "system_health",
+                "finding": f"Freshness check fired non-PASS states this window: {states_str}.",
+                "suggested_action": "Cross-reference the watchdog Slack DM history (#32). If STALE or STUCK appears repeatedly, the routine isn't firing reliably; investigate the routine config.",
+            })
+
     # Memory quality
     ad = safe_get(snapshot, "memory_quality", "memory_age_source_distribution") or {}
     ca = ad.get("created_at", 0) or 0
     mt = ad.get("mtime", 0) or 0
-    if mt > 2 * max(ca, 1):
+    if mt > THRESHOLDS["mtime_to_created_at_ratio"] * max(ca, 1):
         recs.append({
             "severity": "medium",
             "category": "memory_quality",
@@ -185,7 +240,7 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
     se = safe_get(snapshot, "source_economy", "by_source_kind") or {}
     by_count = safe_get(snapshot, "memory_quality", "by_source_count") or {}
     for src, count in by_count.items():
-        if count >= 5 and src not in se:
+        if count >= THRESHOLDS["min_memory_for_orphan_check"] and src not in se:
             recs.append({
                 "severity": "low",
                 "category": "source_economy",
