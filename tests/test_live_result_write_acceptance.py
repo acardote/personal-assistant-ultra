@@ -382,6 +382,16 @@ def test_oversized_body_truncated():
     print(f"  T16 PASS — bodies > MAX_BODY_CHARS={cap} are truncated with marker.")
 
 
+def test_truncation_marker_built_from_constant():
+    """T17a (#55 B1): marker must be derived from MAX_BODY_CHARS so a future
+    cap change can't desync the documented number from the actual cap."""
+    h = load_helper()
+    assert str(h.MAX_BODY_CHARS) in h.TRUNCATION_MARKER, (
+        "TRUNCATION_MARKER must reference MAX_BODY_CHARS — was the marker hardcoded?"
+    )
+    print(f"  T17a PASS — TRUNCATION_MARKER references MAX_BODY_CHARS={h.MAX_BODY_CHARS}.")
+
+
 def test_cli_emits_body_truncated_flag():
     """T17: when body exceeds the cap, the CLI emits live_call_end with
     body_truncated=True so the dashboard can chart context-overflow risk."""
@@ -432,5 +442,6 @@ if __name__ == "__main__":
     test_utc_ts_has_millisecond_precision()
     test_live_dir_separate_from_harvest_dir()
     test_oversized_body_truncated()
+    test_truncation_marker_built_from_constant()
     test_cli_emits_body_truncated_flag()
     print("All live-result-write tests passed.")

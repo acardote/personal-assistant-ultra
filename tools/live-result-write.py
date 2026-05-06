@@ -93,7 +93,12 @@ QUERY_HASH_LEN = 8
 # the helper truncates with a marker and surfaces `body_truncated=True` on
 # `live_call_end` so the dashboard can flag the failure mode.
 MAX_BODY_CHARS = 65_536
-TRUNCATION_MARKER = "\n\n[...truncated to fit MAX_BODY_CHARS=65536 — see live_call_end body_truncated flag]\n"
+# Build marker from the constant so a future cap change can't desync the
+# documented number from the actual cap (per pr-challenger B1 on PR #55).
+TRUNCATION_MARKER = (
+    f"\n\n[...truncated to fit MAX_BODY_CHARS={MAX_BODY_CHARS} "
+    "— see live_call_end body_truncated flag]\n"
+)
 
 
 def query_hash(query: str) -> str:
@@ -152,6 +157,9 @@ def write_live_artifact(
 
     body_truncated = False
     if len(body) > MAX_BODY_CHARS:
+        # Slicing a Python str cuts codepoints, not bytes — write_text
+        # handles the UTF-8 encoding after, so we can't end up with a
+        # half-codepoint at the truncation boundary.
         body = body[:MAX_BODY_CHARS] + TRUNCATION_MARKER
         body_truncated = True
 
