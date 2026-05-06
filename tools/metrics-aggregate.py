@@ -38,8 +38,6 @@ import argparse
 import datetime as _dt
 import importlib.util
 import json
-import re
-import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -85,7 +83,18 @@ def date_range(start: _dt.date, end: _dt.date) -> Iterable[_dt.date]:
 def read_events_for_window(
     metrics_dir: Path, start: _dt.date, end: _dt.date
 ) -> list[dict]:
-    """Read all events files in the date window. Skips malformed lines."""
+    """Read all events files in the date window. Skips malformed lines.
+
+    Filtering is by **filename only** (events-YYYY-MM-DD.jsonl). The library
+    invariant in `_metrics.py:_today_path` is that an event's file date
+    matches its UTC `ts` date — both are derived from the same `datetime.now`
+    call microseconds apart at emit. Replayed/imported events with synthetic
+    `ts` are NOT re-filtered against `ts`; they're trusted to be in the
+    correct day-file. PR-D should NOT double-filter on `ts`.
+
+    TODO (perf): for >1M events the read_text().splitlines() pattern doubles
+    peak memory. Switch to streaming line iteration if that becomes a problem.
+    """
     events: list[dict] = []
     for d in date_range(start, end):
         path = metrics_dir / f"events-{d.isoformat()}.jsonl"
@@ -100,6 +109,58 @@ def read_events_for_window(
             except json.JSONDecodeError:
                 continue  # tolerate corruption (PR-A's MAX_LINE_BYTES guard)
     return events
+
+
+def build_compress_source_index(events: list[dict]) -> dict[tuple, str]:
+    """Index `compress_end` events by (session_id, ts) so `compress_result`
+    events can be joined back to their source_kind.
+
+    Per PR-B's design: compress_end carries source_kind + raw_chars +
+    output_chars (timing-side data); compress_result carries kind +
+    body_tokens + over_budget + cluster_role (post-validation outcome).
+    Aggregator joins them by session_id + ts proximity (within ~5 seconds
+    in normal operation).
+
+    Returns {(session_id, approx_ts_minute): source_kind}. Approximate
+    minute-bucketing is good enough — compress is per-item and far apart.
+    """
+    index: dict[tuple, str] = {}
+    for e in events:
+        if e.get("event") != "compress_end":
+            continue
+        sid = e.get("session_id")
+        ts = e.get("ts")
+        sk = (e.get("data") or {}).get("source_kind")
+        if not (sid and ts and sk):
+            continue
+        # Bucket on first 16 chars (YYYY-MM-DDTHH:MM) so a same-session
+        # compress_result emitted seconds after end joins to same source_kind.
+        ts_bucket = ts[:16]
+        index[(sid, ts_bucket)] = sk
+    return index
+
+
+def lookup_source_kind(idx: dict[tuple, str], session_id: str, ts: str) -> str:
+    """Return source_kind for a compress_result by joining to compress_end.
+    Falls back to "unknown" if no matching compress_end was indexed."""
+    if not (session_id and ts):
+        return "unknown"
+    ts_bucket = ts[:16]
+    # Try exact bucket; if miss, try previous minute (compress_result might
+    # land 5-15s after compress_end at minute boundaries).
+    for offset_min in (0, -1):
+        b = ts_bucket
+        if offset_min < 0:
+            try:
+                t = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                t = t - _dt.timedelta(minutes=1)
+                b = t.strftime("%Y-%m-%dT%H:%M")
+            except ValueError:
+                continue
+        sk = idx.get((session_id, b))
+        if sk:
+            return sk
+    return "unknown"
 
 
 def read_harvest_runs(
@@ -148,7 +209,14 @@ def percentile(values: list[float], p: float) -> float:
 
 
 def aggregate_user_experience(events: list[dict]) -> dict:
-    """Time-to-response, abandonment proxy, query counts."""
+    """Time-to-response, abandonment proxy, query counts.
+
+    Naming: `queries_per_session_*` is intentionally NOT called
+    "iterations_to_resolution" because we don't have a satisfaction signal.
+    A 12-query session may mean 12 successful answers OR 12 attempts at one
+    question; metrics can't distinguish. PR-D dashboard should label these
+    "queries per session", not "iterations".
+    """
     query_ends = [e for e in events if e.get("event") == "query_end"]
     durations = [e["duration_ms"] for e in query_ends if isinstance(e.get("duration_ms"), (int, float))]
     sessions = {e.get("session_id") for e in events if e.get("session_id")}
@@ -157,9 +225,11 @@ def aggregate_user_experience(events: list[dict]) -> dict:
         sid = e.get("session_id")
         if sid:
             queries_per_session[sid] += 1
-    iterations = list(queries_per_session.values())
+    qcounts = list(queries_per_session.values())
 
     # Abandonment proxy: sessions with query_start but no query_end.
+    # Caveat: window-edge events (start in last day, end in next day) appear
+    # abandoned. For 7-day windows the bias is small.
     started = {e.get("session_id") for e in events if e.get("event") == "query_start"}
     ended = {e.get("session_id") for e in events if e.get("event") == "query_end"}
     abandoned = started - ended
@@ -170,25 +240,39 @@ def aggregate_user_experience(events: list[dict]) -> dict:
         "sessions_total": len(sessions),
         "time_to_response_ms_p50": int(percentile(durations, 50)) if durations else None,
         "time_to_response_ms_p95": int(percentile(durations, 95)) if durations else None,
-        "iterations_per_session_p50": percentile([float(x) for x in iterations], 50) if iterations else None,
-        "iterations_per_session_p95": percentile([float(x) for x in iterations], 95) if iterations else None,
+        "queries_per_session_p50": percentile([float(x) for x in qcounts], 50) if qcounts else None,
+        "queries_per_session_p95": percentile([float(x) for x in qcounts], 95) if qcounts else None,
         "query_abandonment_rate": round(abandonment_rate, 4),
     }
 
 
 def aggregate_coverage(events: list[dict]) -> dict:
-    """Memory hit rate, empty-handed rate, gap-discovery rate, live-call rate."""
+    """Memory hit rate, empty-handed rate, gap-discovery rate, live-call rate.
+
+    Definitions:
+    - memory_hit_rate: fraction of query_ends with memory_hits > 0.
+    - empty_handed_rate: fraction with empty_handed=True (KB had data but
+      memory was empty for this query).
+    - gap_discovery_rate: fraction with memory_hits=0 AND topic_keywords
+      non-empty. **Edge case**: a query whose extractor returns empty
+      topic_keywords (short, all-stopwords) is invisible here regardless
+      of memory_hits — neither in numerator nor denominator. Acceptable
+      because no topic = nothing meaningful to chart as a gap.
+    - live_calls_per_query: NOT a rate (can exceed 1.0 if a query triggers
+      multiple live calls; e.g., one Slack + one Granola for the same
+      question). Renamed from live_call_rate per round-1 review.
+    """
     query_ends = [e for e in events if e.get("event") == "query_end"]
     if not query_ends:
         return {
             "memory_hit_rate": None,
             "empty_handed_rate": None,
             "gap_discovery_rate": None,
-            "live_call_rate": 0.0,
+            "live_calls_per_query": 0.0,
+            "total_queries": 0,
         }
     with_memory = sum(1 for e in query_ends if (e.get("data") or {}).get("memory_hits", 0) > 0)
     empty = sum(1 for e in query_ends if (e.get("data") or {}).get("empty_handed") is True)
-    # Gap discovery: query_end with memory_hits == 0 AND topic_keywords present.
     gap = sum(
         1 for e in query_ends
         if (e.get("data") or {}).get("memory_hits", 0) == 0
@@ -200,21 +284,59 @@ def aggregate_coverage(events: list[dict]) -> dict:
         "memory_hit_rate": round(with_memory / total, 4),
         "empty_handed_rate": round(empty / total, 4),
         "gap_discovery_rate": round(gap / total, 4),
-        "live_call_rate": round(live / total, 4) if total else 0.0,
+        "live_calls_per_query": round(live / total, 4) if total else 0.0,
         "total_queries": total,
     }
+
+
+def _read_memory_created_at(path: Path) -> _dt.datetime | None:
+    """Extract `created_at` from a memory file's YAML frontmatter, if present.
+
+    Hand-parses the frontmatter rather than importing PyYAML — keeps the
+    aggregator stdlib-only. Returns None if no frontmatter or no
+    `created_at:` line.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            first = f.readline().strip()
+            if first != "---":
+                return None
+            for _ in range(50):  # cap frontmatter scan
+                line = f.readline()
+                if not line or line.strip() == "---":
+                    break
+                if line.startswith("created_at:"):
+                    val = line.split(":", 1)[1].strip().strip("'\"")
+                    return parse_iso(val)
+    except OSError:
+        return None
+    return None
 
 
 def aggregate_memory_quality(events: list[dict], memory_root: Path) -> dict:
     """Walk memory/ for current corpus state + use compress events for growth.
 
     Growth and topic_breadth come from events alone, so they're computed even
-    when memory_root doesn't exist (e.g., a fresh test fixture). Corpus-state
-    fields (memory_objects_total, by_source_count, age distribution) require
-    memory_root to be present and walkable.
+    when memory_root doesn't exist. Corpus-state fields (memory_objects_total,
+    by_source_count, age distribution) require memory_root to be walkable.
+
+    **Growth fix (per round-1 challenger)**: counts only `compress_result`
+    events with `cluster_role=canonical`. Alternates and existing-canonical
+    updates do NOT add net-new memory objects; counting them inflated
+    growth by 30-50% on real workloads.
+
+    **Memory age**: prefers `created_at` from frontmatter (truthful across
+    cross-machine clones, restores, etc); falls back to file mtime when
+    frontmatter is unparseable. Snapshot's `memory_age_source_distribution`
+    field exposes the mix so dashboard can warn when mtime dominates
+    (likely indicates a recent vault rehydration).
     """
     # Event-derived fields (independent of memory_root):
-    growth = sum(1 for e in events if e.get("event") == "compress_result")
+    growth = sum(
+        1 for e in events
+        if e.get("event") == "compress_result"
+        and (e.get("data") or {}).get("cluster_role") == "canonical"
+    )
     topics: set[str] = set()
     for e in events:
         kws = (e.get("data") or {}).get("topic_keywords") or []
@@ -222,9 +344,10 @@ def aggregate_memory_quality(events: list[dict], memory_root: Path) -> dict:
             if isinstance(k, str):
                 topics.add(k)
 
-    # Corpus-walk fields (require memory_root):
+    # Corpus-walk fields:
     by_source: dict[str, int] = defaultdict(int)
     ages: list[float] = []
+    age_source_counts: dict[str, int] = {"created_at": 0, "mtime": 0}
     file_count = 0
     if memory_root.is_dir():
         files = [
@@ -240,11 +363,18 @@ def aggregate_memory_quality(events: list[dict], memory_root: Path) -> dict:
             rel = f.relative_to(memory_root)
             if rel.parts:
                 by_source[rel.parts[0]] += 1
-            try:
-                mtime = _dt.datetime.fromtimestamp(f.stat().st_mtime, tz=_dt.timezone.utc)
-                ages.append((now - mtime).total_seconds() / 86400.0)
-            except OSError:
-                pass
+            # Prefer frontmatter created_at; fallback to mtime.
+            created = _read_memory_created_at(f)
+            if created is not None:
+                ages.append((now - created).total_seconds() / 86400.0)
+                age_source_counts["created_at"] += 1
+            else:
+                try:
+                    mtime = _dt.datetime.fromtimestamp(f.stat().st_mtime, tz=_dt.timezone.utc)
+                    ages.append((now - mtime).total_seconds() / 86400.0)
+                    age_source_counts["mtime"] += 1
+                except OSError:
+                    pass
 
     return {
         "memory_objects_total": file_count,
@@ -253,35 +383,65 @@ def aggregate_memory_quality(events: list[dict], memory_root: Path) -> dict:
         "by_source_count": dict(by_source),
         "memory_age_days_p50": round(percentile(ages, 50), 2) if ages else None,
         "memory_age_days_p95": round(percentile(ages, 95), 2) if ages else None,
+        "memory_age_source_distribution": age_source_counts,
     }
 
 
-def aggregate_source_economy(events: list[dict], memory_root: Path) -> dict:
-    """Per-source compression yield + retrieval utilization.
+def aggregate_source_economy(events: list[dict]) -> dict:
+    """Per-source compression yield, bucketed by **source_kind**.
 
-    Yield: compress_result count per source / harvest events per source.
-    Utilization: % of memory objects per source retrieved at least once during
-    the window (best-effort: counts memory_retrieve events with source-tagged
-    keywords, since we don't have memory IDs at retrieve time yet).
+    Per round-1 challenger blocker: previous version bucketed by
+    compress_result.data.kind (document type — thread / note / weekly), which
+    was mislabeled as "per source." Now joins compress_result back to its
+    matching compress_end via session_id + ts proximity to recover
+    source_kind (slack_thread / gmail_thread / granola_note).
+
+    Returns two top-level buckets so PR-D can chart both:
+    - by_source_kind: keyed by source (slack_thread / gmail_thread / ...)
+    - by_kind: keyed by document type (thread / note / weekly / ...)
     """
+    src_index = build_compress_source_index(events)
+
     by_source_compress: dict[str, int] = defaultdict(int)
     by_source_over_budget: dict[str, int] = defaultdict(int)
-    for e in events:
-        if e.get("event") == "compress_result":
-            d = e.get("data") or {}
-            kind = d.get("kind") or "unknown"
-            by_source_compress[kind] += 1
-            if d.get("over_budget"):
-                by_source_over_budget[kind] += 1
+    by_source_canonical: dict[str, int] = defaultdict(int)
+    by_kind_compress: dict[str, int] = defaultdict(int)
+    by_kind_over_budget: dict[str, int] = defaultdict(int)
 
-    out: dict = {}
-    for kind, count in by_source_compress.items():
-        out[kind] = {
-            "compress_result_count": count,
-            "over_budget_count": by_source_over_budget.get(kind, 0),
-            "over_budget_rate": round(by_source_over_budget.get(kind, 0) / count, 4) if count else 0.0,
-        }
-    return out
+    for e in events:
+        if e.get("event") != "compress_result":
+            continue
+        d = e.get("data") or {}
+        kind = d.get("kind") or "unknown"
+        sid = e.get("session_id") or ""
+        ts = e.get("ts") or ""
+        source_kind = lookup_source_kind(src_index, sid, ts)
+
+        by_kind_compress[kind] += 1
+        by_source_compress[source_kind] += 1
+        if d.get("over_budget"):
+            by_kind_over_budget[kind] += 1
+            by_source_over_budget[source_kind] += 1
+        if d.get("cluster_role") == "canonical":
+            by_source_canonical[source_kind] += 1
+
+    def _bucketize(counts, over_budget, extra=None):
+        out: dict = {}
+        for k, count in counts.items():
+            entry = {
+                "compress_result_count": count,
+                "over_budget_count": over_budget.get(k, 0),
+                "over_budget_rate": round(over_budget.get(k, 0) / count, 4) if count else 0.0,
+            }
+            if extra and k in extra:
+                entry["canonical_count"] = extra[k]
+            out[k] = entry
+        return out
+
+    return {
+        "by_source_kind": _bucketize(by_source_compress, by_source_over_budget, by_source_canonical),
+        "by_kind": _bucketize(by_kind_compress, by_kind_over_budget),
+    }
 
 
 def aggregate_system_health(events: list[dict], harvest_runs: list[dict]) -> dict:
@@ -336,6 +496,13 @@ def build_snapshot(
     *, metrics_dir: Path, runs_dir: Path, memory_root: Path,
     start: _dt.date, end: _dt.date,
 ) -> dict:
+    """Build a snapshot for the given window. See `tools/metrics-aggregate.py`
+    module docstring for schema details.
+
+    Schema versioning policy: schema_version is bumped on field RENAMES or
+    REMOVALS. Additive changes (new fields) do NOT bump the version —
+    downstream consumers (PR-D dashboard) must tolerate missing fields.
+    """
     events = read_events_for_window(metrics_dir, start, end)
     harvest_runs = read_harvest_runs(runs_dir, start, end)
 
@@ -349,7 +516,7 @@ def build_snapshot(
         "user_experience": aggregate_user_experience(events),
         "coverage": aggregate_coverage(events),
         "memory_quality": aggregate_memory_quality(events, memory_root),
-        "source_economy": aggregate_source_economy(events, memory_root),
+        "source_economy": aggregate_source_economy(events),
         "system_health": aggregate_system_health(events, harvest_runs),
     }
 
@@ -399,7 +566,11 @@ def main(argv: list[str]) -> int:
     else:
         snapshots_dir = metrics_dir / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
-        out_path = snapshots_dir / f"{start.isoformat()}_{end.isoformat()}.json"
+        # Include generation timestamp so re-running the same window doesn't
+        # silently overwrite a prior snapshot. PR-D's "compare two snapshots"
+        # workflow relies on prior versions being preserved.
+        gen_compact = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out_path = snapshots_dir / f"{start.isoformat()}_{end.isoformat()}_{gen_compact}.json"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")

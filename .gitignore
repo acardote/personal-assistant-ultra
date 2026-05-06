@@ -28,6 +28,11 @@
 # remains local-only.
 /.harvest/
 
+# Metrics events + snapshots (#41) stay local-only. Same rationale as
+# .harvest/: contains user-tied event metadata (topic keywords, latencies)
+# that's bounded but not for cross-machine sharing without explicit consent.
+/.metrics/
+
 # Standard Python / node detritus (pre-emptive — children #3+ may add tooling).
 __pycache__/
 *.pyc

@@ -199,25 +199,36 @@ def test_query_abandonment_rate():
 
 
 def test_compress_growth():
-    """T7: compress_result events count toward memory_growth_count_in_window."""
+    """T7: ONLY canonical compress_results count toward growth (round-1 fix).
+
+    Previous version counted all compress_result events as growth. Round-1
+    challenger flagged this as a 30-50% overcount on real workloads since
+    alternates don't add new memory. Fix filters on cluster_role=canonical.
+    """
     import datetime as _dt
     agg = setup_aggregate()
     with tempfile.TemporaryDirectory() as td:
         td_p = Path(td)
         events = [
             {"ts": "2026-05-06T10:00:00Z", "session_id": "h1", "event": "compress_result",
-             "data": {"kind": "thread", "body_tokens": 700, "over_budget": False}},
+             "data": {"kind": "thread", "body_tokens": 700, "over_budget": False, "cluster_role": "canonical"}},
             {"ts": "2026-05-06T10:00:01Z", "session_id": "h1", "event": "compress_result",
-             "data": {"kind": "note", "body_tokens": 900, "over_budget": True}},
+             "data": {"kind": "note", "body_tokens": 900, "over_budget": True, "cluster_role": "alternate"}},
+            {"ts": "2026-05-06T10:00:02Z", "session_id": "h1", "event": "compress_result",
+             "data": {"kind": "weekly", "body_tokens": 600, "over_budget": False, "cluster_role": "canonical"}},
         ]
         write_events_file(td_p / ".metrics", "2026-05-06", events)
         snap = agg.build_snapshot(
             metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
             start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
         )
-        assert snap["memory_quality"]["memory_growth_count_in_window"] == 2
+        # 3 compress_result events, but only 2 are canonical → growth is 2.
+        assert snap["memory_quality"]["memory_growth_count_in_window"] == 2, (
+            f"growth should count only canonical, got {snap['memory_quality']['memory_growth_count_in_window']}"
+        )
+        # token_budget_violations counts ALL compress_results with over_budget=true
         assert snap["system_health"]["token_budget_violations"] == 1
-    print("  T7 PASS — compress_result count + token_budget_violations from events.")
+    print("  T7 PASS — growth counts only canonical (alternates excluded).")
 
 
 def test_harvest_runs_aggregated():
@@ -401,6 +412,73 @@ def test_cli_writes_snapshot():
     print("  T14 PASS — CLI runs end-to-end and writes snapshot JSON.")
 
 
+def test_source_economy_buckets_by_source_kind():
+    """T15: source_economy joins compress_result back to compress_end via session_id+ts (round-1 BLOCKER fix).
+
+    Previously buckets by document.kind (thread/note/weekly), mislabeled as
+    per-source. Now properly joins to recover source_kind (slack_thread, etc).
+    """
+    import datetime as _dt
+    agg = setup_aggregate()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        events = [
+            # compress_end carries source_kind (slack_thread)
+            {"ts": "2026-05-06T10:00:00Z", "session_id": "h1", "event": "compress_end", "duration_ms": 5000,
+             "data": {"source_kind": "slack_thread", "raw_chars": 2000, "output_chars": 1500}},
+            # compress_result lands seconds later in same session
+            {"ts": "2026-05-06T10:00:05Z", "session_id": "h1", "event": "compress_result",
+             "data": {"kind": "thread", "body_tokens": 700, "over_budget": False, "cluster_role": "canonical"}},
+
+            # Different source — granola
+            {"ts": "2026-05-06T10:01:00Z", "session_id": "h1", "event": "compress_end", "duration_ms": 4000,
+             "data": {"source_kind": "granola_note", "raw_chars": 3000, "output_chars": 1800}},
+            {"ts": "2026-05-06T10:01:03Z", "session_id": "h1", "event": "compress_result",
+             "data": {"kind": "note", "body_tokens": 850, "over_budget": True, "cluster_role": "canonical"}},
+        ]
+        write_events_file(td_p / ".metrics", "2026-05-06", events)
+        snap = agg.build_snapshot(
+            metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
+            start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
+        )
+        se = snap["source_economy"]
+        # The round-1 BLOCKER: should bucket by source_kind, not by document kind.
+        assert "slack_thread" in se["by_source_kind"]
+        assert "granola_note" in se["by_source_kind"]
+        assert se["by_source_kind"]["slack_thread"]["compress_result_count"] == 1
+        assert se["by_source_kind"]["granola_note"]["compress_result_count"] == 1
+        assert se["by_source_kind"]["granola_note"]["over_budget_count"] == 1
+        # by_kind retained for completeness
+        assert "thread" in se["by_kind"]
+        assert "note" in se["by_kind"]
+    print("  T15 PASS — source_economy buckets by source_kind via session+ts join.")
+
+
+def test_memory_age_from_frontmatter():
+    """T16: memory_age uses frontmatter created_at when available, falls back to mtime."""
+    import datetime as _dt
+    agg = setup_aggregate()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        memory = td_p / "memory" / "slack_thread"
+        memory.mkdir(parents=True)
+        # File with frontmatter created_at (60 days ago)
+        old_iso = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (memory / "with-frontmatter.md").write_text(f"---\nid: x\ncreated_at: {old_iso}\n---\nbody\n")
+        # File without frontmatter — falls back to mtime (just-now)
+        (memory / "no-frontmatter.md").write_text("just text, no frontmatter")
+        snap = agg.build_snapshot(
+            metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
+            start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
+        )
+        mq = snap["memory_quality"]
+        assert mq["memory_age_source_distribution"]["created_at"] == 1
+        assert mq["memory_age_source_distribution"]["mtime"] == 1
+        # p95 reflects the older file (60 days)
+        assert mq["memory_age_days_p95"] >= 50
+    print("  T16 PASS — memory_age prefers frontmatter created_at; falls back to mtime.")
+
+
 if __name__ == "__main__":
     print("Running test_metrics_aggregate_acceptance.py...")
     test_empty_input_produces_snapshot()
@@ -417,4 +495,6 @@ if __name__ == "__main__":
     test_window_filtering()
     test_malformed_lines_tolerated()
     test_cli_writes_snapshot()
+    test_source_economy_buckets_by_source_kind()
+    test_memory_age_from_frontmatter()
     print("All metrics-aggregate tests passed.")
