@@ -78,6 +78,9 @@ THRESHOLDS = {
     "token_budget_violations": 10,       # medium: >10/window suggests bloat
     "mtime_to_created_at_ratio": 2.0,    # medium: vault rehydration likely
     "live_calls_per_query": 0.50,        # medium: half+ of queries need live (#39 not fully closed)
+    "live_call_error_rate": 0.10,        # high (provisional pre-data): >10% of live calls erroring → MCP auth/latency
+    "live_call_empty_rate": 0.40,        # medium (provisional pre-data): >40% empty → over-firing or wrong scope
+    "min_live_calls_to_flag": 5,         # gate live_call rules on ≥5 calls — avoids 1-of-3 = 33% noise
     "min_mcp_errors_to_flag": 1,         # low: any MCP error worth surfacing
     "min_memory_for_orphan_check": 5,    # low: source needs ≥5 memory objects to flag
 }
@@ -157,6 +160,32 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
             "finding": f"live_calls_per_query is {lcq:.2f} — over half of queries needed live MCP calls.",
             "suggested_action": "Live-call layer (#39) is a gap-filler, not a substitute for harvest. Inspect which topics consistently miss memory and add them to scheduled-harvest scope.",
         })
+
+    # Live-call status breakdown (#39-B). Use rates relative to total live calls,
+    # not total queries — a high error rate among 5 live calls is meaningful even
+    # if live_calls_per_query is low. Gated on min_live_calls_to_flag so 1-of-3
+    # noise doesn't trigger high-severity findings (per pr-challenger #58).
+    by_status = safe_get(snapshot, "coverage", "live_by_status") or {}
+    total_live = sum(by_status.values()) if isinstance(by_status, dict) else 0
+    if total_live >= THRESHOLDS["min_live_calls_to_flag"]:
+        errors = (by_status.get("error", 0) + by_status.get("timeout", 0))
+        empties = by_status.get("empty", 0)
+        err_rate = errors / total_live
+        emp_rate = empties / total_live
+        if err_rate > THRESHOLDS["live_call_error_rate"]:
+            recs.append({
+                "severity": "high",
+                "category": "live_calls",
+                "finding": f"live_call error+timeout rate is {err_rate:.0%} ({errors}/{total_live}) — MCP calls failing more than rarely.",
+                "suggested_action": "Check MCP auth status (most common cause). Run `nap diagnose` if the connector is internal. Inspect the per-source breakdown (live_by_source) to see which connector is failing.",
+            })
+        if emp_rate > THRESHOLDS["live_call_empty_rate"]:
+            recs.append({
+                "severity": "medium",
+                "category": "live_calls",
+                "finding": f"live_call empty rate is {emp_rate:.0%} ({empties}/{total_live}) — live searches consistently return nothing.",
+                "suggested_action": "Either the gap-detection trigger is over-firing (signal: high live_calls_per_query AND low success rate) or the search scope is wrong (e.g. label:important not populated). Inspect SKILL.md procedure scoping for the affected source.",
+            })
 
     # User experience
     ab = safe_get(snapshot, "user_experience", "query_abandonment_rate")

@@ -287,6 +287,23 @@ def render_current_state(latest: dict) -> str:
         if by_reason:
             reason_rows = sorted(by_reason.items(), key=lambda kv: -kv[1])
             sections.append("<h4>Gap reasons</h4>" + render_table(reason_rows, ["reason", "count"]))
+        # Live-call status breakdown (#39-B). Surfaces the success/empty/error/timeout
+        # mix per source so an operator can spot MCP auth issues, over-firing, or
+        # latency problems at a glance.
+        by_status = cov.get("live_by_status") or {}
+        if by_status:
+            status_rows = sorted(by_status.items(), key=lambda kv: -kv[1])
+            sections.append("<h4>Live-call status</h4>" + render_table(status_rows, ["status", "count"]))
+        by_live_src = cov.get("live_by_source") or {}
+        if by_live_src:
+            src_rows = sorted(by_live_src.items(), key=lambda kv: -kv[1])
+            sections.append("<h4>Live calls by source</h4>" + render_table(src_rows, ["source", "count"]))
+        truncated_count = cov.get("live_body_truncated_count", 0)
+        if truncated_count:
+            sections.append(
+                f"<p><strong>Live-call body truncations:</strong> {_esc(truncated_count)} "
+                "— check if MAX_BODY_CHARS=65536 needs raising for your typical thread sizes.</p>"
+            )
 
     # Source economy
     se = latest.get("source_economy") or {}

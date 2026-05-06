@@ -271,6 +271,9 @@ def aggregate_coverage(events: list[dict]) -> dict:
             "gap_detected_rate": None,
             "gap_by_reason": {},
             "live_calls_per_query": 0.0,
+            "live_by_status": {},
+            "live_by_source": {},
+            "live_body_truncated_count": 0,
             "total_queries": 0,
         }
     with_memory = sum(1 for e in query_ends if (e.get("data") or {}).get("memory_hits", 0) > 0)
@@ -280,7 +283,8 @@ def aggregate_coverage(events: list[dict]) -> dict:
         if (e.get("data") or {}).get("memory_hits", 0) == 0
         and (e.get("data") or {}).get("topic_keywords")
     )
-    live = sum(1 for e in events if e.get("event") == "live_call_end")
+    live_events = [e for e in events if e.get("event") == "live_call_end"]
+    live = len(live_events)
     # gap_detected events from #39-A. Distinct from gap_discovery_rate
     # (which only counts zero_hit + topic_keywords>0). gap_detected_rate
     # is the operational signal: how often did the router decide live
@@ -290,6 +294,20 @@ def aggregate_coverage(events: list[dict]) -> dict:
     for e in gap_events:
         r = (e.get("data") or {}).get("reason") or "unknown"
         by_reason[r] = by_reason.get(r, 0) + 1
+    # live_call_end status breakdown (#39-B.* — status ∈ success|empty|error|timeout).
+    # Operator-visibility: high `error` or `timeout` rate signals MCP auth /
+    # latency problems; high `empty` rate signals over-firing or wrong scope.
+    live_by_status: dict[str, int] = {}
+    live_by_source: dict[str, int] = {}
+    truncated = 0
+    for e in live_events:
+        d = e.get("data") or {}
+        s = d.get("status") or "unknown"
+        src = d.get("source") or "unknown"
+        live_by_status[s] = live_by_status.get(s, 0) + 1
+        live_by_source[src] = live_by_source.get(src, 0) + 1
+        if d.get("body_truncated") is True:
+            truncated += 1
     total = len(query_ends)
     return {
         "memory_hit_rate": round(with_memory / total, 4),
@@ -298,6 +316,9 @@ def aggregate_coverage(events: list[dict]) -> dict:
         "gap_detected_rate": round(len(gap_events) / total, 4) if total else 0.0,
         "gap_by_reason": by_reason,
         "live_calls_per_query": round(live / total, 4) if total else 0.0,
+        "live_by_status": live_by_status,
+        "live_by_source": live_by_source,
+        "live_body_truncated_count": truncated,
         "total_queries": total,
     }
 
