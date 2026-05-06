@@ -48,6 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _live import should_go_live  # noqa: E402
 from _metrics import emit, time_event, inherit_or_start  # noqa: E402
 
 _CFG = load_config()
@@ -336,6 +337,25 @@ def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -
             mem_tracker["memory_hits"] = len(memory_files)
             mem_tracker["memory_tokens"] = memory_tokens
 
+        # #39-A: gap detection. Live calls themselves come in #39-B; this
+        # only signals whether memory looks insufficient so future stages
+        # (and operators reading metrics) know when augmentation would
+        # have fired. Runs unconditionally — the signal is about memory
+        # sufficiency, not about which downstream stages will run, so we
+        # tag the event with the flag state for #39-B to consume.
+        gap = should_go_live(query, len(memory_files), content_root=_CFG.content_root)
+        if gap.should_go_live:
+            emit(
+                "gap_detected",
+                reason=gap.reason,
+                matched_topic=gap.matched_topic,
+                memory_hits=len(memory_files),
+                topic_keywords=topic_kws,
+                no_critic=no_critic,
+                no_specialist=no_specialist,
+            )
+            print(f"[route] gap_detected: {gap.reason}", file=sys.stderr)
+
         specialist = None if no_specialist else detect_specialist(query)
         context = build_context_block(kb_text, memory_text, query)
 
@@ -384,6 +404,8 @@ def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -
         q_tracker["specialist"] = specialist
         q_tracker["empty_handed"] = (memory_tokens == 0 and kb_tokens > 0)
         q_tracker["synthesized"] = bool(result.synthesized_response)
+        q_tracker["gap_detected"] = gap.should_go_live
+        q_tracker["gap_reason"] = gap.reason
 
     return result
 
