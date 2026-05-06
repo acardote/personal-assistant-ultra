@@ -273,6 +273,24 @@ Same shape as Slack (two-step search → read); differences below.
 - **Label-scope leak**: if the live query slips to broad inbox search (no `label:important`), F2 from #5/#6 fires — noise pollutes the answer and any future write-back. The procedure's "default scope to label:important" rule is honor-system; F2 below catches drift in production.
 - **Long threads**: legal / vendor email threads can be 40+ messages. The body cap from #39-B.2 (MAX_BODY_CHARS) protects against context blow-up; check `body_truncated=true` rate on the dashboard.
 
+### Write-back: live findings → memory (#39-D)
+
+Live raw artifacts written by `live-result-write.py` accumulate in `<content_root>/raw/live/<source>/`. They explicitly do NOT compress at fetch time — that latency would blow the <30s p95 query budget. Compression happens out-of-band via:
+
+```
+tools/live-writeback.py             # process all sources
+tools/live-writeback.py --source granola_note   # one source only
+tools/live-writeback.py --dry-run   # list, don't move
+```
+
+For each unprocessed file, the tool runs `tools/compress.py <file> --source-kind <source> --provenance live`. The `--provenance live` flag does two things:
+1. Adds `provenance: live` to the memory object's frontmatter — the dashboard / future analytics can distinguish live-born memory from harvest-born.
+2. Strips the `live/` segment when deriving the memory path, so the resulting object lands at `memory/<source>/<file>.md` alongside harvest-fetched memory. The existing #10 event-id dedup catches dupes across pipelines without separate state.
+
+Successfully-compressed raw files are moved to `<content_root>/raw/live/<source>/.processed/`. Failed compresses leave the file in place for the next run to retry.
+
+**When to invoke**: today, manually or via the daily harvest routine (the routine prompt should call `live-writeback.py` after harvest's compress step so live findings land in the same vault commit). Future: `/personal-assistant write-back` once #59 lands.
+
 ### Cross-source synthesis (#39-C)
 
 When `gap_detected` fires with `reason=zero_hit`, the procedure says "fire all sources." Multiple `live_call_end` events can land in one query. The skill's job at that point is to merge memory + KB + multiple live findings into one coherent answer, not stitch them as labeled sections. Rules in priority order:
