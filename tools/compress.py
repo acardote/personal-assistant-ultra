@@ -35,6 +35,7 @@ from jsonschema import Draft202012Validator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
+from _metrics import emit, time_event, inherit_or_start  # noqa: E402
 
 _CFG = load_config()
 METHOD_ROOT = _CFG.method_root
@@ -178,7 +179,18 @@ def main(argv: list[str]) -> int:
         except ValueError:
             return str(p)
     print(f"compressing {_disp(raw_path)} -> {_disp(out_path)} ...", file=sys.stderr)
-    output = call_claude(prompt, raw_text)
+
+    # Inherit parent's session id (e.g., from harvest routine) so all compress
+    # calls in one harvest run group together.
+    inherit_or_start()
+
+    # `compress` covers the LLM call (the slow part); the trailing
+    # `compress_result` event carries post-dedup, post-validation outcome
+    # data that isn't available until later in the function. Aggregator can
+    # join the two events on session_id + relative timestamp.
+    with time_event("compress", source_kind=args.source_kind, raw_chars=len(raw_text)) as ct:
+        output = call_claude(prompt, raw_text)
+        ct["output_chars"] = len(output)
     front, body = parse_memo_output(output)
 
     # Script-authored fields override whatever the model emitted.
@@ -300,11 +312,24 @@ def main(argv: list[str]) -> int:
     # Soft-warn on token budget (rough char-based estimate, see tools/_tokens.py).
     body_tokens = count_tokens(body)
     print(f"body tokens: {body_tokens} (budget {args.token_budget})", file=sys.stderr)
-    if body_tokens > args.token_budget:
+    over_budget = body_tokens > args.token_budget
+    if over_budget:
         print(
             f"WARNING: body {body_tokens} tokens exceeds budget {args.token_budget}",
             file=sys.stderr,
         )
+
+    # Compress_result carries post-LLM, post-validation outcome only. Fields
+    # that overlap with `compress_end` (source_kind) are NOT repeated — the
+    # aggregator joins on session_id + recency. Only emits NEW signal:
+    # the resulting kind, body token count, budget violation, dedup role.
+    emit(
+        "compress_result",
+        kind=kind,
+        body_tokens=body_tokens,
+        over_budget=over_budget,
+        cluster_role=cluster.role,
+    )
 
     print(str(out_path))
     return 0
