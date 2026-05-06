@@ -145,13 +145,13 @@ def test_run_synthesizer_prompt_includes_blocks():
     p = captured["prompt"]
     assert "<DRAFT>" in p and "advisor draft text" in p
     assert "<CRITIQUE>" in p and "critique text" in p
-    # Synthesize.md template mentions <SPECIALIST> in instructions, but the
-    # data block (with content) shouldn't be appended when there's no specialist.
-    # Count <SPECIALIST> occurrences: should be ≤1 (instruction reference only).
-    assert p.count("<SPECIALIST>") <= 1, (
-        f"unexpected SPECIALIST data block when none passed; count={p.count('<SPECIALIST>')}"
-    )
-    print("  T6 PASS — run_synthesizer builds prompt with DRAFT + CRITIQUE blocks.")
+    # synthesize.md template references <SPECIALIST> in instruction text;
+    # what we want to verify is that the DATA BLOCK (with closing tag) isn't
+    # appended when no specialist response was passed. A data block has the
+    # shape: "<SPECIALIST>\n...\n</SPECIALIST>" with actual content. Check
+    # for a closing tag, which only appears when run_synthesizer appended it.
+    assert "</SPECIALIST>" not in p, "SPECIALIST data block leaked when none was passed"
+    print("  T6 PASS — run_synthesizer builds prompt with DRAFT + CRITIQUE blocks (no SPECIALIST data).")
 
 
 def test_run_synthesizer_includes_specialist_when_present():
