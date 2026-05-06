@@ -129,7 +129,14 @@ def _is_valid_session_id(s: str) -> bool:
 
 
 def _load_config_via_spec():
-    """Import _config without sys.path mutation (per challenger-finding #5)."""
+    """Import _config without sys.path mutation (per PR-A challenger-finding #5).
+
+    Note: Python 3.14's dataclass implementation reads cls.__module__ from
+    sys.modules during decoration, so the module MUST be registered before
+    exec_module, or the frozen-dataclass at _config.py:41 crashes with
+    AttributeError: 'NoneType' object has no attribute '__dict__'.
+    """
+    import sys as _sys
     config_path = Path(__file__).resolve().parent / "_config.py"
     if not config_path.exists():
         return None
@@ -138,6 +145,7 @@ def _load_config_via_spec():
         if spec is None or spec.loader is None:
             return None
         module = importlib.util.module_from_spec(spec)
+        _sys.modules["_pa_metrics_config"] = module
         spec.loader.exec_module(module)
         return module
     except Exception:
