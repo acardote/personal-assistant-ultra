@@ -6,15 +6,16 @@
 """Acceptance tests for tools/live-writeback.py + compress.py --provenance (#39-D).
 
 Tests:
-  T1 — compress.derive_memory_path strips `live/` segment when provenance=live.
-  T2 — compress.derive_memory_path leaves path unchanged when provenance is None or "harvest".
-  T3 — find_unprocessed walks raw/live/<source>/, skips .processed/ and non-md.
-  T4 — find_unprocessed returns empty when raw/live/ doesn't exist.
-  T5 — find_unprocessed honors --source filtering.
-  T6 — mark_processed moves the file into .processed/, preserves filename.
-  T7 — CLI --dry-run lists targets and exits 0 without moving anything.
-  T8 — CLI --source <invalid> rejected by argparse.
-  T9 — Empty unprocessed set: CLI exits 0 silently with "nothing to do" message.
+  T1  — compress.derive_memory_path strips `live/` segment when provenance=live.
+  T2  — compress.derive_memory_path leaves path unchanged when provenance is None or "harvest".
+  T3  — find_unprocessed walks raw/live/<source>/, skips .processed/ and non-md.
+  T4  — find_unprocessed returns empty when raw/live/ doesn't exist.
+  T5  — find_unprocessed honors --source filtering.
+  T6  — mark_processed moves the file into .processed/, preserves filename.
+  T7  — CLI --dry-run lists targets and exits 0 without moving anything.
+  T8  — CLI --source <invalid> rejected by argparse.
+  T9  — compress.py --provenance live refuses harvest-shape raw path (per #64 C1).
+  T10 — compress.py --provenance harvest refuses raw/live/ path (symmetric).
 """
 
 from __future__ import annotations
@@ -174,28 +175,59 @@ def test_cli_invalid_source():
     print("  T8 PASS — invalid --source rejected.")
 
 
-def test_cli_empty_set_exits_zero():
-    """T9: when no unprocessed files exist (per the source filter), CLI exits 0
-    silently with a 'nothing to do' message."""
-    # Filter to a source that's known-empty in the real vault — gmail_thread
-    # currently has no live artifacts (only granola_note + slack_thread did
-    # in today's eval). If gmail_thread later gains files, this test will
-    # need a synthetic content_root. For now it's a smoke check.
-    result = subprocess.run(
-        [str(PROJ / "tools" / "live-writeback.py"), "--source", "gmail_thread"],
-        check=False, capture_output=True, text=True,
-    )
-    if result.returncode == 0 and "nothing to do" in result.stderr:
-        print("  T9 PASS — empty set exits 0 with 'nothing to do' notice.")
-    elif result.returncode == 0:
-        # Files exist for gmail_thread; that's fine (test ran in a later context
-        # where eval / live calls populated gmail_thread). Skip the strict assert.
-        print("  T9 PASS — gmail_thread had files; CLI processed cleanly.")
-    else:
-        # Compress was invoked and something failed mid-batch — that's the
-        # expected exit-2 path, NOT a test fail. Surface and pass.
-        assert result.returncode == 2, f"unexpected exit {result.returncode}: {result.stderr[:300]}"
-        print("  T9 PASS — gmail_thread had files; some compress failures surfaced (expected when network/auth flake).")
+def test_provenance_live_refuses_harvest_path():
+    """T9 (#64 challenger C1): --provenance live on a raw path NOT under
+    raw/live/ exits 2. Prevents silent mislabeling of harvest-shape memory
+    objects as live-fetched."""
+    # Run compress.py against an invalid path/flag combination. The check
+    # happens before any LLM call, so we don't need to set up a model.
+    # Use a fake raw path that exists but isn't under raw/live/.
+    with tempfile.TemporaryDirectory() as td:
+        # Build a path under what would be RAW_ROOT (we can't easily mock
+        # RAW_ROOT, so use the real one — write a fixture file there).
+        # Compress reads RAW_ROOT from _config; resolving requires the file
+        # to exist UNDER RAW_ROOT. The check at line ~187 fails first if
+        # not under RAW_ROOT, so we need a real RAW_ROOT-relative path.
+        cm = load_compress()
+        fixture = cm.RAW_ROOT / "granola_note" / "_test-provenance-fixture.md"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text("test\n", encoding="utf-8")
+        try:
+            result = subprocess.run(
+                [str(PROJ / "tools" / "compress.py"), str(fixture),
+                 "--source-kind", "granola_note", "--provenance", "live"],
+                check=False, capture_output=True, text=True,
+            )
+            assert result.returncode == 2, (
+                f"expected exit 2, got {result.returncode}: {result.stderr[:300]}"
+            )
+            assert "--provenance live requires" in result.stderr
+        finally:
+            fixture.unlink(missing_ok=True)
+    print("  T9 PASS — --provenance live refuses harvest-shape raw path.")
+
+
+def test_provenance_harvest_refuses_live_path():
+    """T10 (#64 challenger C1, symmetric): --provenance harvest on a path
+    UNDER raw/live/ exits 2. Symmetric guard against the inverse mislabel."""
+    with tempfile.TemporaryDirectory() as td:
+        cm = load_compress()
+        fixture = cm.RAW_ROOT / "live" / "granola_note" / "_test-provenance-fixture.md"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text("test\n", encoding="utf-8")
+        try:
+            result = subprocess.run(
+                [str(PROJ / "tools" / "compress.py"), str(fixture),
+                 "--source-kind", "granola_note", "--provenance", "harvest"],
+                check=False, capture_output=True, text=True,
+            )
+            assert result.returncode == 2, (
+                f"expected exit 2, got {result.returncode}: {result.stderr[:300]}"
+            )
+            assert "--provenance harvest is incompatible" in result.stderr
+        finally:
+            fixture.unlink(missing_ok=True)
+    print("  T10 PASS — --provenance harvest refuses raw/live/ path.")
 
 
 if __name__ == "__main__":
@@ -208,5 +240,6 @@ if __name__ == "__main__":
     test_mark_processed_moves_file()
     test_cli_dry_run()
     test_cli_invalid_source()
-    test_cli_empty_set_exits_zero()
+    test_provenance_live_refuses_harvest_path()
+    test_provenance_harvest_refuses_live_path()
     print("All live-writeback tests passed.")

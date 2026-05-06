@@ -304,6 +304,17 @@ def render_current_state(latest: dict) -> str:
                 f"<p><strong>Live-call body truncations:</strong> {_esc(truncated_count)} "
                 "— check if MAX_BODY_CHARS=65536 needs raising for your typical thread sizes.</p>"
             )
+        # Write-back pipeline (#39-D) — surfaces per-source success/error
+        # so an operator can spot live-writeback.py falling behind.
+        wb = cov.get("writeback_by_source") or {}
+        if wb:
+            wb_rows = []
+            for src in sorted(wb.keys()):
+                d = wb[src]
+                wb_rows.append((src, d.get("success", 0), d.get("error", 0), d.get("total", 0)))
+            sections.append("<h4>Write-back items (#39-D)</h4>" + render_table(
+                wb_rows, ["source", "success", "error", "total"]
+            ))
 
     # Source economy
     se = latest.get("source_economy") or {}

@@ -185,6 +185,16 @@ def main(argv: list[str]) -> int:
     except ValueError:
         print(f"raw_path must live under {RAW_ROOT}", file=sys.stderr)
         return 2
+    # Path/provenance consistency check (per pr-challenger C1 on PR #64).
+    # Without this, `compress.py raw/granola_note/foo.md --provenance live`
+    # silently mislabels a harvest-shape memory object as live-fetched.
+    is_live_path = rel_to_raw.parts and rel_to_raw.parts[0] == "live"
+    if args.provenance == "live" and not is_live_path:
+        print(f"--provenance live requires raw_path under raw/live/ (got {rel_to_raw})", file=sys.stderr)
+        return 2
+    if args.provenance == "harvest" and is_live_path:
+        print(f"--provenance harvest is incompatible with raw/live/ path (got {rel_to_raw})", file=sys.stderr)
+        return 2
 
     out_path = Path(args.out).resolve() if args.out else derive_memory_path(
         raw_path, args.source_kind, provenance=args.provenance,
