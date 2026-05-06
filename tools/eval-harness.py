@@ -174,11 +174,15 @@ def run_full_architecture(question: str) -> tuple[Run, int]:
     # This is the architecture's user-facing output; the harness scores the
     # composite, since that's what the user actually sees.
     parts: list[str] = []
-    parts.append(f"## Advisor\n\n{payload['advisor_response']}")
-    if payload.get("critic_response"):
-        parts.append(f"## Adversarial critic\n\n{payload['critic_response']}")
-    if payload.get("specialist_response"):
-        parts.append(f"## Specialist ({payload['specialist']})\n\n{payload['specialist_response']}")
+    # Per #40: the user-facing output is the synthesized response when
+    # synthesis ran (advisor + critic merged). Falls back to advisor's
+    # draft when --no-critic is in play.
+    if payload.get("synthesized_response"):
+        parts.append(payload["synthesized_response"])
+    else:
+        parts.append(payload["advisor_response"])
+        if payload.get("specialist_response"):
+            parts.append(f"## Specialist ({payload['specialist']})\n\n{payload['specialist_response']}")
     response = "\n\n".join(parts)
 
     retrieved_tokens = payload["kb_tokens"] + payload["memory_tokens"]
