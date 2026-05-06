@@ -215,7 +215,7 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 `tools/route.py` checks whether memory looks insufficient for the current query and emits a `gap_detected` metric event when so. Two triggers:
 
 - **zero_hit** — `load_memory_objects` returned 0 matches for the query keywords.
-- **topic_pinned** — the query mentions a topic listed in `<content_root>/.harvest/live-pinned.txt`. One topic per line; blank lines and lines starting with `#` are ignored. Matching is case-insensitive substring on the raw query. Use this for fast-evolving topics (e.g. weekly syncs) where harvest cadence lags reality.
+- **topic_pinned** — the query mentions a topic listed in `<content_root>/.harvest/live-pinned.txt`. One topic per line; blank lines and lines starting with `#` are ignored. Matching is **case-insensitive, word-boundary** against the raw query (so pinned `sync` matches `"the sync"` but not `"asynchronous"`). Use this for fast-evolving topics (e.g. weekly syncs) where harvest cadence lags reality. Pin entries surface in metrics events as a bounded `matched_topic` (≤64 chars), so keep them short and non-sensitive.
 
 #39-A only emits the signal — actual live-MCP augmentation lands in #39-B. Until then, `gap_detected` events let the dashboard show how often live would have fired and why.
 

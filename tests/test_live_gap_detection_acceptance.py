@@ -9,22 +9,28 @@ Live-call augmentation itself comes in #39-B; this PR only adds the
 decision module and wires its signal into route.py's metrics so we
 can observe how often live would fire and why.
 
-Tests:
-  T1 — should_go_live triggers on zero memory hits (reason=zero_hit).
-  T2 — should_go_live does NOT trigger when memory has hits and no pinned topic matches.
-  T3 — should_go_live triggers on topic-pinned match even with hits (reason=topic_pinned).
-  T4 — Topic match is case-insensitive substring.
-  T5 — load_pinned_topics returns [] when config file is absent.
-  T6 — load_pinned_topics ignores blank lines and # comments.
-  T7 — Empty pinned-topics list does NOT cause a topic_pinned trigger.
-  T8 — Zero-hit takes precedence over topic-pinned (reason=zero_hit, not topic_pinned).
-  T9 — Injectable pinned_topics arg bypasses file I/O.
+Tests (revised after PR #49 adversarial review):
+  T1  — should_go_live triggers on zero memory hits (reason=zero_hit).
+  T2  — should_go_live does NOT trigger when memory has hits and no pinned topic matches.
+  T3  — should_go_live triggers on topic-pinned match even with hits (reason=topic_pinned).
+  T4  — Topic match is case-insensitive.
+  T5  — load_pinned_topics returns [] when config file is absent.
+  T6  — load_pinned_topics ignores blank lines and # comments.
+  T7  — Empty pinned-topics list does NOT cause a topic_pinned trigger.
+  T8  — Zero-hit takes precedence (reason=zero_hit) but matched_topic is PRESERVED when a pin also matches.
+  T9  — Injectable _pinned_topics_override bypasses file I/O.
   T10 — LiveDecision is hashable / frozen.
+  T11 — Word-boundary match — pinned 'sync' does NOT match 'asynchronous'.
+  T12 — matched_topic is bounded to MATCHED_TOPIC_MAX_CHARS in the LiveDecision.
+  T13 — Integration: route.py emits gap_detected event with expected shape.
+  T14 — Integration: gap event payload carries no_critic / no_specialist flags.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -87,7 +93,7 @@ def test_topic_pinned_triggers_with_hits():
 
 
 def test_topic_match_case_insensitive():
-    """T4: case-insensitive substring match."""
+    """T4: case-insensitive match."""
     live = load_live()
     with tempfile.TemporaryDirectory() as td:
         root = make_root_with_pins(Path(td), ["BADAS Weekly"])
@@ -137,41 +143,43 @@ def test_empty_pin_file_no_trigger():
     print("  T7 PASS — empty (comments-only) pin file does not trigger.")
 
 
-def test_zero_hit_wins_over_pin():
-    """T8: when memory_hits=0 AND query matches a pin, reason=zero_hit (the broader signal)."""
+def test_zero_hit_preserves_matched_topic():
+    """T8 (revised after challenger F5): when memory_hits=0 AND a pin also matches,
+    reason=zero_hit (broader signal) BUT matched_topic is preserved so #39-B can
+    route to the pinned source preferentially. Throwing it away was a design loss."""
     live = load_live()
     with tempfile.TemporaryDirectory() as td:
         root = make_root_with_pins(Path(td), ["Acko Projects Weekly Sync"])
         d = live.should_go_live("Acko Projects Weekly Sync update?", 0, content_root=root)
     assert d.should_go_live is True
     assert d.reason == "zero_hit", f"expected zero_hit, got {d.reason}"
-    assert d.matched_topic is None
-    print("  T8 PASS — zero_hit wins over topic_pinned.")
+    assert d.matched_topic == "Acko Projects Weekly Sync", (
+        f"matched_topic should be preserved on zero_hit (got {d.matched_topic!r})"
+    )
+    print("  T8 PASS — zero_hit wins on reason but matched_topic preserved.")
 
 
-def test_injectable_pinned_topics():
-    """T9: passing pinned_topics= explicitly bypasses file I/O."""
+def test_injectable_override_arg():
+    """T9: passing _pinned_topics_override= explicitly bypasses file I/O. The
+    leading-underscore name signals 'test seam' (per challenger F3)."""
     live = load_live()
-    # No vault dir at all — must not touch disk if topics provided.
     fake_root = Path("/nonexistent/vault")
     d = live.should_go_live(
         "status of Acko Projects Weekly Sync",
         2,
         content_root=fake_root,
-        pinned_topics=["Acko Projects Weekly Sync"],
+        _pinned_topics_override=["Acko Projects Weekly Sync"],
     )
     assert d.should_go_live is True
     assert d.reason == "topic_pinned"
-    print("  T9 PASS — injectable pinned_topics bypasses file I/O.")
+    print("  T9 PASS — _pinned_topics_override bypasses file I/O.")
 
 
 def test_live_decision_frozen():
     """T10: LiveDecision is a frozen dataclass (hashable, immutable)."""
     live = load_live()
     d = live.LiveDecision(should_go_live=False, reason=None, matched_topic=None)
-    # Hashable
     _ = hash(d)
-    # Immutable
     raised = False
     try:
         d.reason = "mutated"  # type: ignore[misc]
@@ -179,6 +187,132 @@ def test_live_decision_frozen():
         raised = True
     assert raised, "LiveDecision should be frozen (immutable)"
     print("  T10 PASS — LiveDecision is frozen.")
+
+
+def test_word_boundary_match():
+    """T11 (challenger F2): word-boundary regex match — pinned 'sync' must NOT
+    match 'asynchronous' or 'syncretism'. Substring-contains was a false-positive
+    minefield for short pin entries inside larger words."""
+    live = load_live()
+    with tempfile.TemporaryDirectory() as td:
+        root = make_root_with_pins(Path(td), ["sync"])
+        # Pinned word inside another word: must NOT match
+        d1 = live.should_go_live("how do I write an asynchronous handler", 3, content_root=root)
+        d2 = live.should_go_live("the syncretism of two religions", 2, content_root=root)
+        # Standalone word: SHOULD match
+        d3 = live.should_go_live("what time is the sync today?", 4, content_root=root)
+    assert d1.should_go_live is False, "asynchronous must not match pinned 'sync'"
+    assert d2.should_go_live is False, "syncretism must not match pinned 'sync'"
+    assert d3.should_go_live is True and d3.reason == "topic_pinned"
+    print("  T11 PASS — word-boundary match (no false-positive on substring).")
+
+
+def test_matched_topic_bounded():
+    """T12: matched_topic exposed in LiveDecision is bounded to
+    MATCHED_TOPIC_MAX_CHARS so unbounded user pin entries don't bloat
+    metrics events (per pr-reviewer + challenger F1)."""
+    live = load_live()
+    long_topic = "X" * 200
+    with tempfile.TemporaryDirectory() as td:
+        root = make_root_with_pins(Path(td), [long_topic])
+        d = live.should_go_live(long_topic.lower(), 2, content_root=root)
+    assert d.should_go_live is True
+    assert d.matched_topic is not None
+    assert len(d.matched_topic) == live.MATCHED_TOPIC_MAX_CHARS, (
+        f"matched_topic should be bounded to {live.MATCHED_TOPIC_MAX_CHARS}, got {len(d.matched_topic)}"
+    )
+    print(f"  T12 PASS — matched_topic bounded to {live.MATCHED_TOPIC_MAX_CHARS} chars.")
+
+
+def _load_route():
+    """Load the route module fresh and invalidate the cached _METRICS_DIR
+    (which caches first-call resolution of PA_METRICS_DIR — without this
+    reset, two tests setting different env vars would share a dir)."""
+    sys.path.insert(0, str(PROJ / "tools"))
+    sys.modules.pop("route_test_int", None)
+    spec = importlib.util.spec_from_file_location("route_test_int", str(PROJ / "tools" / "route.py"))
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["route_test_int"] = m
+    spec.loader.exec_module(m)
+    # Invalidate the cached metrics dir on the (already-imported) _metrics module.
+    metrics_mod = sys.modules.get("_metrics")
+    if metrics_mod is not None:
+        metrics_mod._METRICS_DIR = None  # type: ignore[attr-defined]
+    return m
+
+
+def test_route_emits_gap_detected_event():
+    """T13 (challenger F6): integration — route.py actually emits a gap_detected
+    event with the expected keys when memory_hits=0. Stubs the LLM + retrieval
+    so the test is fast and deterministic."""
+    with tempfile.TemporaryDirectory() as td:
+        # Point metrics at a temp dir so we can read events back deterministically.
+        os.environ["PA_METRICS_DIR"] = td
+        try:
+            route = _load_route()
+
+            # Stub heavy I/O paths.
+            route.call_claude = lambda prompt: "stubbed-response"  # type: ignore[assignment]
+            route.assemble_kb_text = lambda: ("KB text", 5)  # type: ignore[assignment]
+            route.load_memory_objects = lambda q, *, max_items=12: ("", 0, [])  # type: ignore[assignment]
+
+            # Force should_go_live's content_root to a clean temp (no pin file).
+            content_root = Path(td) / "vault"
+            (content_root / ".harvest").mkdir(parents=True)
+            route._CFG = type(route._CFG)(  # rebuild Config with new content_root
+                method_root=route._CFG.method_root,
+                content_root=content_root,
+                config_source=route._CFG.config_source,
+                config_path=route._CFG.config_path,
+            )
+
+            r = route.route("any question with no memory", no_critic=True, no_specialist=True)
+            assert r.advisor_response == "stubbed-response"
+
+            # Read the events file and look for gap_detected.
+            events_files = list(Path(td).glob("events-*.jsonl"))
+            assert events_files, "no events file written"
+            events = [json.loads(line) for line in events_files[0].read_text().splitlines() if line.strip()]
+            gap_events = [e for e in events if e["event"] == "gap_detected"]
+            assert len(gap_events) == 1, f"expected exactly 1 gap_detected event, got {len(gap_events)}"
+            payload = gap_events[0]["data"]
+            assert payload["reason"] == "zero_hit"
+            assert payload["memory_hits"] == 0
+            print("  T13 PASS — route.py emits gap_detected event with expected shape.")
+        finally:
+            os.environ.pop("PA_METRICS_DIR", None)
+
+
+def test_route_event_carries_flags():
+    """T14: integration — gap_detected event carries no_critic + no_specialist
+    so #39-B can route accordingly even when caller degraded the pipeline."""
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["PA_METRICS_DIR"] = td
+        try:
+            route = _load_route()
+            route.call_claude = lambda prompt: "stub"  # type: ignore[assignment]
+            route.assemble_kb_text = lambda: ("KB", 3)  # type: ignore[assignment]
+            route.load_memory_objects = lambda q, *, max_items=12: ("", 0, [])  # type: ignore[assignment]
+
+            content_root = Path(td) / "vault"
+            (content_root / ".harvest").mkdir(parents=True)
+            route._CFG = type(route._CFG)(
+                method_root=route._CFG.method_root,
+                content_root=content_root,
+                config_source=route._CFG.config_source,
+                config_path=route._CFG.config_path,
+            )
+
+            route.route("anything", no_critic=True, no_specialist=False)
+
+            events_files = list(Path(td).glob("events-*.jsonl"))
+            events = [json.loads(line) for line in events_files[0].read_text().splitlines() if line.strip()]
+            gap = [e for e in events if e["event"] == "gap_detected"][0]
+            assert gap["data"]["no_critic"] is True
+            assert gap["data"]["no_specialist"] is False
+            print("  T14 PASS — gap_detected event carries no_critic / no_specialist flags.")
+        finally:
+            os.environ.pop("PA_METRICS_DIR", None)
 
 
 if __name__ == "__main__":
@@ -190,7 +324,11 @@ if __name__ == "__main__":
     test_load_pinned_topics_missing_file()
     test_load_pinned_topics_strips_comments_and_blanks()
     test_empty_pin_file_no_trigger()
-    test_zero_hit_wins_over_pin()
-    test_injectable_pinned_topics()
+    test_zero_hit_preserves_matched_topic()
+    test_injectable_override_arg()
     test_live_decision_frozen()
+    test_word_boundary_match()
+    test_matched_topic_bounded()
+    test_route_emits_gap_detected_event()
+    test_route_event_carries_flags()
     print("All live gap-detection tests passed.")

@@ -340,7 +340,9 @@ def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -
         # #39-A: gap detection. Live calls themselves come in #39-B; this
         # only signals whether memory looks insufficient so future stages
         # (and operators reading metrics) know when augmentation would
-        # have fired.
+        # have fired. Runs unconditionally — the signal is about memory
+        # sufficiency, not about which downstream stages will run, so we
+        # tag the event with the flag state for #39-B to consume.
         gap = should_go_live(query, len(memory_files), content_root=_CFG.content_root)
         if gap.should_go_live:
             emit(
@@ -349,6 +351,8 @@ def route(query: str, *, no_critic: bool = False, no_specialist: bool = False) -
                 matched_topic=gap.matched_topic,
                 memory_hits=len(memory_files),
                 topic_keywords=topic_kws,
+                no_critic=no_critic,
+                no_specialist=no_specialist,
             )
             print(f"[route] gap_detected: {gap.reason}", file=sys.stderr)
 
