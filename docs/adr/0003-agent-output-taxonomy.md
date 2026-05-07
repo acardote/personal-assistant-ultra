@@ -164,3 +164,159 @@ These come from the parent #76 + this child's adversarial pass. They post-deploy
 - Memory object schema: `docs/schemas/memory-object.schema.json` (provenance pattern this ADR mirrors).
 - ADR-0001 — Storage backend (the layer split this ADR extends).
 - Issue #4 — Always-in-context layer-3 KB (the editorial discipline this ADR honors for autonomous producers).
+
+## Amendment 1 — Project tier (2026-05-07)
+
+Source: parent [#88](https://github.com/acardote/personal-assistant-ultra/issues/88) (PA projects), child [#89](https://github.com/acardote/personal-assistant-ultra/issues/89). The original ADR treated every work-execution turn as standalone. Real agent-executed work clusters into multi-session efforts (drafting a strategy doc over weeks, building a presentation across machines, iterating on a memo with stakeholder feedback). Without a container, continuity depends entirely on keyword retrieval.
+
+This amendment introduces a **third top-level type** alongside `knowledge` and `artefact`.
+
+### `project` — multi-session container for agent-executed work
+
+Lives at `<content_root>/projects/<slug>/`. A project owns:
+
+- **`project.md`** — required. YAML frontmatter + body.
+- **`artefacts/<kind>/art-*.<ext>`** — project-scoped artefacts. Same body shape as flat artefacts, with one frontmatter addition: `project_id: <slug>`.
+- **`notes.md`** — optional. The running context the assistant maintains across sessions for this project. Free-form Markdown.
+
+Project-less artefacts continue to land at `<content_root>/artefacts/<kind>/` (flat tier). Default behavior on any turn without `PA_PROJECT_ID` set. **Project tier is opt-in** — most agent-executed work is one-shot and stays flat.
+
+### `project.md` frontmatter shape
+
+```yaml
+---
+id: <slug>                          # equals the folder name
+title: <short title>
+intent: <one-paragraph statement of what this project is producing and why>
+status: active | archived
+started_at: <iso8601 date>
+last_active: <iso8601 date>          # touched on every project-scoped write
+archived_at: <iso8601 date>          # present iff status=archived
+bruno_parent: <issue-url>            # optional; ties project to a vault-repo Bruno parent for discipline overlay
+---
+
+<body — running notes, decisions, sources cited, what's next. The assistant maintains this across sessions; humans may edit too.>
+```
+
+Required: `id`, `title`, `intent`, `status`, `started_at`, `last_active`. Optional: `archived_at`, `bruno_parent`.
+
+### Slug convention (F3 mitigation — slug collision across machines)
+
+Slugs follow `<YYYYMMDD>-<short-name>-<4hex>`. Example: `20260507-q3-strategy-doc-a91f`.
+
+- `<YYYYMMDD>` (UTC) gives chronological ordering and disambiguates same-name reuse across days.
+- `<short-name>` is the user-supplied kebab-case label (≤30 chars, `[a-z0-9-]+`).
+- `<4hex>` is a random 4-hex-digit suffix (`openssl rand -hex 2`) generated at create time.
+
+The 4-hex suffix makes same-day cross-machine collision probability ~1 in 65k per shared `<short-name>`. The `project new` command also performs a local existence check and refuses if the slug already exists in `<content_root>/projects/`. Cross-machine "both machines created same slug independently" is reduced to "both rolled the same 4 hex digits AND chose the same short-name on the same UTC day" — vanishingly rare. If it ever does, the second-to-push gets a non-fast-forward push rejection and the user reconciles manually.
+
+### Project-scoped vs flat artefact reference forms (F2 mitigation — promotion-path graph)
+
+Artefact-to-artefact references MUST use the canonical form `art://<uuid>`, not filesystem paths. This is added as a fourth canonical source form alongside the existing three from ADR-0003:
+
+- `kb#heading`
+- `mem://<memory-id>`
+- `https://...`
+- **`art://<art-uuid>`** (new) — references an artefact by its `id` field, not its path.
+
+Lookup is by `id`. Promotion (flat → project) and cross-project copy (described below) change physical location but **not** the artefact's `id`, so existing `art://...` references stay valid by construction. There is no graph traversal at promotion time because there is no path-based reference graph to rewrite. If an artefact body contains a path-based reference, that's a violation the verification lint surfaces (per #85, extended to recognize `art://` as canonical).
+
+`tools/lint-provenance.py` is extended to include `art://` in `CANONICAL_SOURCE_RE` and to refuse path-based artefact references in `produced_by.sources_cited`. Implementation lands in slice 5 of #88.
+
+**Resolver scope** (binding for slice 5): an `art://<uuid>` reference resolves by scanning, in order:
+1. `<content_root>/projects/*/artefacts/<kind>/art-<uuid>.<ext>` (active and archived projects both — archival is a status flag, not a hide).
+2. `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` (flat tier).
+
+Multiple matches are an invariant violation (`id` is content-addressable; duplicates only exist via the cross-project copy path, which mints a fresh `id`). The lint refuses if it finds duplicates. First-match-wins is therefore unambiguous.
+
+### `PA_PROJECT_ID` lifecycle (binding for slices 3 + 4)
+
+The active-project context is carried by the `PA_PROJECT_ID` environment variable in the Claude Code session.
+
+- **Set** by `/personal-assistant project resume <slug>` and `/personal-assistant project new <slug> ...`. Both verify the slug exists (resume) or is newly created (new) before exporting.
+- **Scope**: the env var lives only inside the current Claude Code session. It is NOT persisted across sessions. Re-resuming on a new session is an explicit user action — this is the F6 mitigation against stale-session bleed.
+- **Clear** by `/personal-assistant project clear` (no project active). Subsequent work-execution turns produce flat artefacts.
+- **Inspection**: `/personal-assistant project status` prints the current `PA_PROJECT_ID` (or "no project active") + the project's `last_active`.
+
+The skill's activation contract reads `PA_PROJECT_ID` early. If set, the work-execution procedure's Phase 3 (per #83) lands artefacts under `<content_root>/projects/<slug>/artefacts/`. If unset, flat. Knowledge contributions (KB updates) ignore `PA_PROJECT_ID` per the cross-reference in `docs/kb-editorial-rules.md`.
+
+### `project.md` body schema (deferred to slice 4, but bounded here)
+
+The body of `project.md` (below the YAML frontmatter) is deliberately free-form, but slice 4 will pin a minimal template the assistant fills:
+
+- A "## Sources" section listing canonical references (`kb#heading`, `mem://<id>`, `art://<uuid>`, `https://...`) the project draws from.
+- A "## Decisions" section listing decisions made in the project's scope that are NOT KB-worthy (project-local choices vs durable user decisions).
+- A "## What's next" section the assistant updates when context is sufficient.
+
+This template is not strictly enforced by the lint — `project.md` is the assistant's running notebook, not a gated document. Slice 4 may revise the template once we have one real project to test it against.
+
+### Promotion: flat → project
+
+Command: `/personal-assistant project promote <art-uuid> <slug>`. Effect:
+
+1. Locate the flat artefact at `<content_root>/artefacts/<kind>/art-<uuid>.<ext>`.
+2. Verify the target project exists and is `status=active`.
+3. Move the file (and its sidecar, if export) into `<content_root>/projects/<slug>/artefacts/<kind>/`.
+4. Add `project_id: <slug>` to the frontmatter.
+5. Touch `last_active` on the destination project's `project.md`.
+6. Commit + push via `tools/live-commit-push.sh`.
+
+Because references use `art://<uuid>`, no graph traversal is needed. The artefact keeps its `id`. This closes F2.
+
+### Cross-project artefact reuse: copy with `derived_from`
+
+When an artefact in project A should also appear in project B, the user runs `/personal-assistant project copy-artefact <art-uuid> <dest-slug>`. The destination gets:
+
+- A fresh `id` (new UUID).
+- `project_id: <dest-slug>`.
+- A new field `derived_from: <orig-art-uuid>` in the frontmatter, persisting the lineage.
+- The body content copied **verbatim** — `art://<...>` references inside the copied body are NOT rewritten. The copy points at the same upstream sources as the original; rewriting would silently fork the citation graph and confuse later tracing. If the user wants different sources for the copy, they edit the new file.
+- `last_active` on the destination project is touched (treat copy-in as activity on the destination, same as promotion does).
+
+The original is unchanged: its `last_active`, frontmatter, and body all stay. Each project owns its copy. `art://<orig-uuid>` references resolve to the original; `art://<new-uuid>` to the copy. No symlinks (Windows portability + git ergonomics).
+
+### Resume-context budget (F1 — clarification, NOT cap)
+
+Loading a project on resume reads `project.md` + the artefact manifest + `notes.md` into the turn's context. **No size cap is imposed** — partial loads yield a lossy continuation that defeats the feature.
+
+Critically: **projects are NOT layer-3.** Layer 3 is the always-in-context KB (`<method_root>/kb/glossary.md` + `<content_root>/kb/{people,org,decisions}.md`), bounded at 4K tokens by the invariant in #4. Projects are a **fourth tier** — *selective per-turn load*, opt-in via explicit `project resume <slug>`. Project loads do not count against the layer-3 budget; they consume the per-turn prompt context (200K+).
+
+If a project's `project.md` + manifest + notes ever grow large enough to bump the per-turn context window itself (rare; would need months of dense activity), the user can split it: `project archive <slug>` and `project new <new-slug>` continuing the work. The amendment doesn't pre-empt this with mandatory rotation; the practical bound is high enough that automating it would be premature.
+
+This closes F1: layer-3 invariant intact, project tier explicitly outside it.
+
+### Archival lifecycle
+
+Project transitions to `status: archived` after one month with no `last_active` update. Mechanism:
+
+- **Passive (always available)**: `/personal-assistant project archive <slug>` flips status, sets `archived_at`, commits.
+- **Active (optional, deferred)**: a routine sweeps projects, finds `last_active < now - 30d`, and proposes archives in the daily digest for the user to confirm.
+
+Archived projects stay in `projects/<slug>/` (not moved to `projects/.archive/` or similar — slug-based discovery should remain stable). `project list` filters by `status=active` by default; `project list --include-archived` shows the full set.
+
+### Bruno overlay (optional, not default)
+
+Most PA projects are fluid creative work where Bruno's falsifier + reconciliation overhead would be wrong. If a particular project warrants discipline (deliverable, deadline, stakeholder ask):
+
+1. The user runs `/bruno init` in the vault repo (sets up `<content_root>/.bruno/config.toml` with `github_repo = <vault-repo>`).
+2. From inside the vault, `/bruno parent` opens a parent issue against the vault repo.
+3. The PA project's `project.md` carries `bruno_parent: <issue-url>` to tie them.
+
+Method-development work (this repo, `acardote/personal-assistant-ultra`) keeps its existing Bruno discipline against this repo's issue tracker. The two layers are separated by which repo the `.bruno/config.toml` lives in. There is no "promote a PA project to a Bruno parent automatically" — the user makes the explicit call.
+
+If `bruno_parent` references an issue that closes while the PA project remains `status=active`, that's intentional — the discipline overlay was a Bruno milestone (e.g., "MVP-v1 reconciled") and the project's work continues. The two are coupled by reference, not by lifecycle.
+
+### Updated kinds + boundary
+
+The valid `artefact` kinds list (`analysis | plan | draft | report | export | memo`) is unchanged. `project` is **not an `artefact` kind** — it's a top-level type. The two-questions boundary rule from the original ADR remains the test for routing a piece of agent output: knowledge vs artefact. Whether an artefact lands in a project folder or flat is a separate question, decided by the active `PA_PROJECT_ID` env var (set by `project resume`).
+
+### Cross-reference to `docs/kb-editorial-rules.md`
+
+KB contributions (people, org, decisions, glossary) **do not become project-scoped** even when produced from inside a project. Knowledge is global to the user's content; projects scope artefacts only. The kind selector in editorial rules is unchanged; if the same insight produces both a project artefact (e.g., a memo) and a KB update (e.g., a `decision`), the artefact lands in the project folder while the KB update lands in `<content_root>/kb/decisions.md` per existing rules.
+
+### Falsifiers (added to original list)
+
+- **F5 (project sprawl)**: If `project list --include-archived` ever grows past 100 entries with no archival sweep having run, retract — the lifecycle wasn't actually closed by archival.
+- **F6 (ambiguous current-project)**: If a turn lands an artefact in the wrong project because `PA_PROJECT_ID` was inherited from a stale session, retract — the explicit-resume-only design didn't actually scope the env var per-session.
+- **F7 (slug collision in practice)**: If a real cross-machine slug collision occurs in production within the first 90 days, retract — the 4-hex suffix wasn't sufficient and we need a stronger scheme (machine-id, content-hash, or fail-on-conflict).
+- **F8 (path-based artefact references slip past lint)**: If an agent-produced artefact lands with a filesystem path in `sources_cited` instead of `art://<uuid>` and the lint exits clean, retract — the canonical-source enforcement isn't binding.

@@ -110,3 +110,9 @@ In this example there are no secondary diffs because no person or org referent i
 ## Cross-reference
 
 ADR-0003 is the parent design; this document operationalizes its `knowledge` half. The vault-side artefact layout (the `artefact` half) is documented at `<content_root>/artefacts/README.md` per child #79.
+
+## Project tier (per ADR-0003 Amendment 1)
+
+**Knowledge contributions are global, not project-scoped.** Even when an insight emerges from inside an active PA project (per #88), `person-update` / `org-update` / `decision` / `glossary-term` updates land in the same `<content_root>/kb/` files (or `<method_root>/kb/glossary.md`) — never under `<content_root>/projects/<slug>/`. The kind selector and triggers above are unchanged by the project tier.
+
+If the same insight produces both a project artefact (e.g., a memo summarizing Q3 strategy decisions) and a KB update (e.g., a new entry in `decisions.md`), they're separate diffs: the artefact lands in `<content_root>/projects/<slug>/artefacts/memo/`, the KB update lands in `<content_root>/kb/decisions.md`. The compound-insight rule (primary + secondary diffs) operates on the KB side only — projects don't appear in it.
