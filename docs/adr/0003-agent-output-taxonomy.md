@@ -30,7 +30,7 @@ The boundary follows **two questions answered in order**:
 1. **Does any part of this output update durable state about the user's people, org, decisions, or project glossary?** If yes, that part is `knowledge`, regardless of whether the surrounding narrative is also worth keeping.
 2. **If the surrounding narrative has standalone value beyond the KB update, the narrative is an `artefact`** (typically `kind=memo` or `kind=analysis`) that **cites the knowledge entry it produced**. The artefact links to the KB; the KB does not link back (KB is the always-in-context layer; cross-references would bloat it).
 
-Worked example: a "decision memo" that explains why the team picked storage backend X. The decision itself updates `kb/decisions.md` (knowledge). The memo explaining the reasoning lands in `artefacts/memo/<id>.md` (artefact) and references the decision heading. The KB stays terse; the memo stays long.
+Worked example: a "decision memo" that explains why the team picked storage backend X. The decision itself updates `<content_root>/kb/decisions.md` (knowledge). The memo explaining the reasoning lands in `<content_root>/artefacts/memo/<id>.md` (artefact) and references the decision heading. The KB stays terse; the memo stays long.
 
 If both questions answer no, the output isn't either type — it's chat output, ephemeral. Don't capture.
 
