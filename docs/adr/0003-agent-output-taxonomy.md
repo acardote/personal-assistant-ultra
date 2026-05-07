@@ -19,7 +19,11 @@ The decision below names two output types, where each lives, and how each carrie
 
 ### Two output types
 
-**`knowledge`** — the assistant updates the layer-3 KB. Lands in `<content_root>/kb/{people,org,decisions}.md` or `<method_root>/kb/glossary.md` depending on kind. Updates in place; does NOT create parallel files. Editorial discipline from #4 still applies.
+**`knowledge`** — the assistant updates the layer-3 KB. Lands in:
+- `<content_root>/kb/{people,org,decisions}.md` for `person-update`, `org-update`, `decision` kinds — these are **vault-scoped** (this user's content).
+- `<method_root>/kb/glossary.md` for `glossary-term` kind — this is **method-repo-scoped** (shipped to every user of the skill).
+
+Updates in place; does NOT create parallel files. Editorial discipline from #4 still applies. The two repo scopes have **different provenance flows** — see the Provenance shape section below.
 
 **`artefact`** — a deliverable the user wants to find later (a draft, a plan, a report, an export). Lands in a vault-tracked folder distinct from `memory/`, `raw/`, and `kb/`. Folder layout, naming, and gitignore rules are deferred to the follow-up vault-layout slice (#76 sequence-map item 2).
 
@@ -43,7 +47,7 @@ If both questions answer no, the output isn't either type — it's chat output, 
 
 **Artefacts** (full files we own):
 
-YAML frontmatter at the top of the file, mirroring memory-object frontmatter shape so the existing tooling pattern carries:
+YAML frontmatter at the top of the file, mirroring memory-object frontmatter shape so the existing tooling pattern carries. Note the two ID schemes and why: `id: art-<uuid>` is **content-addressable identity** (the artefact survives across sessions and is referenced by future queries), while `produced_by.session_id: <8-hex>` is **session-scoped lookup** (matches the dashboard's session table, valid only within a finite window). They serve different lookup paths — a UUID for "find this artefact" and a short session-id for "what else came out of this query/turn."
 
 ```yaml
 ---
@@ -64,7 +68,9 @@ summary: <one-line>
 
 For non-text artefacts (CSV, JSON, etc.), provenance lives in a sidecar `<id>.provenance.json` with the same fields. The body file (`<id>.csv`) is the actual artefact.
 
-**Knowledge** (in-place edits to existing KB files):
+**Knowledge — two flows depending on repo scope** (per pr-challenger B1 on PR #78):
+
+***Vault-scoped knowledge*** (`person-update`, `org-update`, `decision` → `<content_root>/kb/`):
 
 Inline HTML comment marker placed immediately above the contributed lines:
 
@@ -72,7 +78,26 @@ Inline HTML comment marker placed immediately above the contributed lines:
 <!-- produced_by: session=<8-hex>, query="<short>", at=<iso8601>, sources=[<heading|memory-uri|url>, ...] -->
 ```
 
-Inline because: KB is the always-in-context layer; a sidecar would force every consumer to do an extra read to know provenance. The comment is invisible to markdown rendering. **Critically, the comment must be stripped at assembly time** so it doesn't bloat the layer-3 prompt — `tools/assemble-kb.py` will be updated in a follow-up slice to filter `<!-- produced_by: ... -->` lines before concatenation. Until that slice lands, the comments are present in the prompt; their bytes are negligible (~150 chars each) but the principle still requires the strip step.
+Inline because: KB is the always-in-context layer; a sidecar would force every consumer to do an extra read to know provenance. The comment is invisible to markdown rendering. **Critically, the comment must be stripped at assembly time** so it doesn't bloat the layer-3 prompt — `tools/assemble-kb.py` will be updated in a follow-up slice to filter `<!-- produced_by: ... -->` lines before concatenation, scoped to **vault paths only**. Until that slice lands, the comments are present in the prompt; their bytes are negligible (~150 chars each) but the principle still requires the strip step.
+
+***Method-scoped knowledge*** (`glossary-term` → `<method_root>/kb/glossary.md`):
+
+The glossary file is shipped to every user of the skill, so embedding `session_id` + `query` in the source file would leak one user's context into a shared artifact and create per-user merge churn. Method-scoped knowledge therefore uses a **PR-only provenance flow**:
+
+1. The assistant proposes the glossary diff in chat.
+2. On approval, the assistant opens a PR against the method repo with the diff. The PR description carries the `produced_by` fields — that's the canonical record.
+3. No inline `<!-- produced_by -->` comment lands in `glossary.md`. The git history (PR + commit message) IS the provenance.
+
+This means `tools/assemble-kb.py`'s strip step only needs to handle vault paths. Method-repo glossary stays clean by construction.
+
+***Sources_cited canonical forms*** (per pr-challenger non-blocking on #78):
+
+Three accepted reference syntaxes, pinned for the verification-lint slice:
+- `kb#heading` — references a `## <heading>` in any layer-3 KB file (resolved by the assembled-KB index).
+- `mem://<memory-id>` — references a memory object by its `id:` frontmatter field (e.g., `mem://mem-abc123-...`).
+- `https://...` — bare URL for external sources (Slack permalinks, Granola URLs, GitHub issues).
+
+Anything else is invalid; the verification lint will refuse it.
 
 ### Diff-and-approve default
 
@@ -87,6 +112,12 @@ Silent commits to `kb/*` or `artefacts/*` are forbidden by default. The reasons:
 - Artefacts have user-facing value — silent generation creates noise the user has to clean up.
 
 A flag-gated `auto_commit` mode is **out of scope** for this ADR. If we ever add it, it should require an explicit affirmative configuration and apply per-kind (e.g., auto-commit `report` and `export` but never `decision`).
+
+### Retroactive scope (no grandfathering of past outputs)
+
+Today's session produced eight issues, an eval report, a recovery summary, and dozens of design decisions in chat that motivated this ADR. Those outputs are **grandfathered**: the taxonomy applies forward, not retroactively. We do NOT go back and add provenance frontmatter to existing artefacts in the vault. The motivating examples are referenced in this ADR's Context section as the rationale; that's their permanent provenance trail.
+
+If a specific past artefact turns out to be load-bearing later (e.g., a future query needs to cite the 2026-05-06 eval baseline) and we want it discoverable by the verification lint, the cleanup is one-off: add the frontmatter manually and commit. No bulk migration.
 
 ### F2 mitigation — autonomous producers
 
