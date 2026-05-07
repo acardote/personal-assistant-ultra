@@ -509,15 +509,23 @@ def test_cross_machine_resume_via_git():
         shutil.copy(PROJ / "tools" / "_config.py", method / "tools" / "_config.py")
         shutil.copy(PROJ / "tools" / "project.py", method / "tools" / "project.py")
 
-        # Bare upstream
+        # Bare upstream. Set HEAD to refs/heads/main so a fresh clone gets
+        # a checked-out main without `--branch main` — mirrors how
+        # GitHub-hosted upstreams behave (HEAD set on first push).
         upstream = td_path / "upstream.git"
         subprocess.run(["git", "init", "--bare", str(upstream)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(upstream), "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True, capture_output=True,
+        )
 
-        # Side A: working tree
+        # Side A: working tree. Disable gpg signing on commits so the test
+        # passes in environments where the developer has global gpgsign on.
         vault_a = td_path / "vault_a"
         subprocess.run(["git", "clone", str(upstream), str(vault_a)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(vault_a), "config", "user.email", "a@test"], check=True)
         subprocess.run(["git", "-C", str(vault_a), "config", "user.name", "a"], check=True)
+        subprocess.run(["git", "-C", str(vault_a), "config", "commit.gpgsign", "false"], check=True)
         # Initial empty commit so push-after-create succeeds.
         (vault_a / "README.md").write_text("# vault\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(vault_a), "add", "."], check=True, capture_output=True)
@@ -552,14 +560,9 @@ def test_cross_machine_resume_via_git():
         subprocess.run(["git", "-C", str(vault_a), "commit", "-m", "add project"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(vault_a), "push"], check=True, capture_output=True)
 
-        # Side B: fresh clone, NO active-project state. Pass --branch main
-        # because the bare upstream's HEAD was created without a default ref
-        # and the first push set main but didn't update HEAD.
+        # Side B: fresh clone, NO active-project state.
         vault_b = td_path / "vault_b"
-        subprocess.run(
-            ["git", "clone", "--branch", "main", str(upstream), str(vault_b)],
-            check=True, capture_output=True,
-        )
+        subprocess.run(["git", "clone", str(upstream), str(vault_b)], check=True, capture_output=True)
         # Repoint method config at vault_b.
         (method / ".assistant.local.json").write_text(json.dumps({
             "$schema_version": 1,
@@ -586,7 +589,17 @@ def test_cross_machine_resume_via_git():
         side_a_md = (vault_a / "projects" / slug / "project.md").read_text(encoding="utf-8")
         side_b_md = (vault_b / "projects" / slug / "project.md").read_text(encoding="utf-8")
         assert side_a_md == side_b_md, "project.md must round-trip identically across machines"
-    print("  T22 PASS — cross-machine resume preserves project state via git")
+
+        # Provenance lint passes on side B — catches frontmatter drift if
+        # either the lint or the producer schema evolves on only one side.
+        # Copy lint-provenance.py + its dependency into the test method tree.
+        shutil.copy(PROJ / "tools" / "lint-provenance.py", method / "tools" / "lint-provenance.py")
+        lint = subprocess.run(
+            [str(method / "tools" / "lint-provenance.py"), "--require-vault"],
+            capture_output=True, text=True,
+        )
+        assert lint.returncode == 0, f"side B lint failed:\n{lint.stderr}"
+    print("  T22 PASS — cross-machine resume preserves project state via git + lint")
 
 
 def test_promote_refuses_already_in_project():
