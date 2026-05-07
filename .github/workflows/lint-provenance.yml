@@ -1,0 +1,42 @@
+name: lint-provenance
+
+# Per ADR-0003 + #85: gate that agent-produced KB entries / artefacts carry
+# provenance back-references. The vault is not present in method-repo CI, so
+# this run uses --method-only — it catches glossary embedding produced_by
+# (which would land in this repo's PRs). Vault-side enforcement runs in the
+# vault repo's CI separately.
+
+on:
+  pull_request:
+    paths:
+      - "kb/**/*.md"
+      - "tools/lint-provenance.py"
+      - "tools/_config.py"
+      - "tests/test_lint_provenance_acceptance.py"
+      - ".github/workflows/lint-provenance.yml"
+      - "docs/adr/0003-agent-output-taxonomy.md"
+      - "docs/kb-editorial-rules.md"
+  push:
+    branches: [main]
+    paths:
+      - "kb/**/*.md"
+      - "tools/lint-provenance.py"
+      - "tools/_config.py"
+      - "tests/test_lint_provenance_acceptance.py"
+      - ".github/workflows/lint-provenance.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Run lint-provenance (method-only)
+        run: tools/lint-provenance.py --method-only
+      - name: Run acceptance tests
+        run: tests/test_lint_provenance_acceptance.py
