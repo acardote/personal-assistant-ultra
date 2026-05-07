@@ -42,7 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config
 
 SLUG_RE = re.compile(r"^\d{8}-[a-z0-9-]+-[0-9a-f]{4}$")
-SHORT_NAME_RE = re.compile(r"^[a-z0-9-]{1,30}$")
+# Short-name must start AND end alphanumeric, hyphens only between them — no
+# `-foo`, `foo-`, `--foo--`, etc. (S2 from PR #93 review).
+SHORT_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$")
 ART_FILENAME_RE = re.compile(r"^art-(?P<uuid>[\w-]+)\.")
 STATE_TTL_HOURS = 4
 
@@ -66,9 +68,13 @@ def read_state(content_root: Path) -> dict | None:
     if not p.is_file():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(data, dict):
+        # Wrong-shape JSON (array, scalar) — treat as no state. S1 fix.
+        return None
+    return data
 
 
 def write_state(content_root: Path, slug: str) -> None:
@@ -108,7 +114,13 @@ def project_dir(content_root: Path, slug: str) -> Path:
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Return (frontmatter-dict, body-string). Tolerates absent frontmatter."""
+    """Return (top-level-scalars-dict, body-string). Tolerates absent frontmatter.
+
+    NOTE: this parser is lossy by design — it only surfaces top-level scalars
+    for read-only inspection (`project status`, `list`, etc.). Do NOT use it
+    as a round-trip for editing files that may contain nested blocks (e.g.
+    artefacts with `produced_by:` — destroys provenance). For that path use
+    `surgical_update_frontmatter` below."""
     if not text.startswith("---\n"):
         return {}, text
     end = text.find("\n---", 4)
@@ -117,19 +129,86 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     block = text[4:end]
     body = text[end + 4:].lstrip("\n")
     fm: dict = {}
-    cur_key = None
     for line in block.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if line.startswith("  "):
-            # nested — skip; we only manipulate top-level scalar / one-line list keys
-            continue
+        if line.startswith(" "):
+            continue  # nested — read-only parser ignores
         if ":" not in line:
             continue
         k, _, v = line.partition(":")
         fm[k.strip()] = v.strip()
-        cur_key = k.strip()
     return fm, body
+
+
+_TOP_LEVEL_KEY_RE = re.compile(r"^([\w-]+):\s*(.*)$")
+
+
+def surgical_update_frontmatter(text: str, updates: dict) -> str:
+    """Update top-level YAML scalars in frontmatter line-by-line WITHOUT
+    touching nested blocks. Adds new keys at the end of the frontmatter block.
+
+    This preserves nested maps/lists like `produced_by: { session_id, query,
+    model, sources_cited }` verbatim — the lossy parse_frontmatter would drop
+    them, destroying provenance on every promote/copy/archive."""
+    if not text.startswith("---\n"):
+        # No frontmatter — synthesize one. Updates are flat by contract.
+        out = ["---"]
+        for k, v in updates.items():
+            out.append(f"{k}:" if v == "" else f"{k}: {v}")
+        out.append("---")
+        return "\n".join(out) + "\n" + text
+
+    end = text.find("\n---", 4)
+    if end == -1:
+        return text  # malformed; leave alone (will fail downstream lints)
+
+    block = text[4:end]
+    closing_and_body = text[end:]  # starts at "\n---..."
+
+    lines = block.split("\n")
+    out_lines: list[str] = []
+    keys_remaining = dict(updates)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Lines that are blank, indented (nested), or comments → preserve verbatim.
+        if not line or line.startswith(" ") or line.startswith("\t") or line.lstrip().startswith("#"):
+            out_lines.append(line)
+            i += 1
+            continue
+
+        match = _TOP_LEVEL_KEY_RE.match(line)
+        if not match:
+            out_lines.append(line)
+            i += 1
+            continue
+
+        key = match.group(1)
+        existing_val = match.group(2)
+
+        if key in keys_remaining:
+            new_val = keys_remaining.pop(key)
+            out_lines.append(f"{key}:" if new_val == "" else f"{key}: {new_val}")
+            i += 1
+            # If the existing value was empty AND followed by indented lines,
+            # those were the OLD nested block — drop them (we replaced with a
+            # scalar). For the use cases in this tool (overwriting project_id,
+            # last_active, status, archived_at, derived_from, id), the new
+            # value is always scalar so dropping the old nested block is safe.
+            if existing_val == "":
+                while i < len(lines) and lines[i].startswith((" ", "\t")):
+                    i += 1
+        else:
+            out_lines.append(line)
+            i += 1
+
+    # Append any keys that didn't already exist.
+    for k, v in keys_remaining.items():
+        out_lines.append(f"{k}:" if v == "" else f"{k}: {v}")
+
+    return "---\n" + "\n".join(out_lines) + closing_and_body
 
 
 def render_frontmatter(fm: dict) -> str:
@@ -162,10 +241,6 @@ def gen_slug(short_name: str) -> str:
     return f"{today_utc()}-{short_name}-{secrets.token_hex(2)}"
 
 
-def project_template_path(content_root: Path) -> Path:
-    return projects_dir(content_root) / ".template" / "project.md"
-
-
 def cmd_new(args, cfg) -> int:
     short = args.short_name
     intent = args.intent
@@ -182,8 +257,6 @@ def cmd_new(args, cfg) -> int:
 
     target.mkdir(parents=True)
     (target / "artefacts").mkdir()
-
-    template = project_template_path(cfg.content_root)
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
     # Write project.md directly (don't substitute against the annotated template
@@ -372,11 +445,12 @@ def cmd_archive(args, cfg) -> int:
         print(f"{project_md} not found", file=sys.stderr)
         return 1
 
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     text = project_md.read_text(encoding="utf-8")
-    fm, body = parse_frontmatter(text)
-    fm["status"] = "archived"
-    fm["archived_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    project_md.write_text(render_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    project_md.write_text(
+        surgical_update_frontmatter(text, {"status": "archived", "archived_at": today}),
+        encoding="utf-8",
+    )
 
     # If this was the active project, clear state.
     state = read_state(cfg.content_root)
@@ -439,21 +513,22 @@ def sibling_files(body_file: Path) -> list[Path]:
 
 
 def touch_last_active(project_md: Path) -> None:
+    """Set last_active = today on a project.md, preserving any nested blocks."""
     if not project_md.is_file():
         return
     text = project_md.read_text(encoding="utf-8")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    fm, body = parse_frontmatter(text)
-    fm["last_active"] = today
-    project_md.write_text(render_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    project_md.write_text(
+        surgical_update_frontmatter(text, {"last_active": today}),
+        encoding="utf-8",
+    )
 
 
 def update_artefact_frontmatter(art_md: Path, updates: dict) -> None:
-    """In-place frontmatter update for a Markdown artefact. Adds keys as needed."""
+    """In-place frontmatter update for a Markdown artefact. Surgical — preserves
+    nested blocks like `produced_by:` (B1 fix from #92)."""
     text = art_md.read_text(encoding="utf-8")
-    fm, body = parse_frontmatter(text)
-    fm.update(updates)
-    art_md.write_text(render_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    art_md.write_text(surgical_update_frontmatter(text, updates), encoding="utf-8")
 
 
 def update_sidecar(sidecar: Path, updates: dict) -> None:

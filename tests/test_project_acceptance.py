@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -153,11 +154,12 @@ def test_clear_removes_state():
 
 
 def test_promote_moves_flat_artefact():
+    """B1 closer: promote MUST preserve nested produced_by frontmatter."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
         run(method, "new", "x", "i")
         slug = get_active_slug(vault)
-        # Create a flat memo artefact.
+        # Create a flat memo artefact with realistic nested produced_by.
         flat_md = vault / "artefacts" / "memo" / "art-abc123.md"
         flat_md.write_text(
             "---\nid: art-abc123\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
@@ -171,8 +173,15 @@ def test_promote_moves_flat_artefact():
         moved = vault / "projects" / slug / "artefacts" / "memo" / "art-abc123.md"
         assert moved.is_file()
         text = moved.read_text(encoding="utf-8")
+        # B1 critical assertions: nested produced_by must survive.
         assert f"project_id: {slug}" in text
-    print("  T7 PASS — promote moves + rewrites frontmatter")
+        assert "produced_by:" in text, "B1: produced_by block dropped!"
+        assert "session_id: aaaaaaaa" in text, "B1: session_id dropped!"
+        assert "query: x" in text, "B1: query dropped!"
+        assert "model: m" in text, "B1: model dropped!"
+        assert "https://x.test" in text, "B1: sources_cited entry dropped!"
+        assert "body" in text, "body should survive"
+    print("  T7 PASS — promote preserves nested produced_by (B1 closed)")
 
 
 def test_promote_export_moves_sidecar():
@@ -202,36 +211,45 @@ def test_promote_export_moves_sidecar():
 
 
 def test_copy_artefact():
+    """B1: nested produced_by must survive copy. B2: id must rotate."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
         run(method, "new", "alpha", "i")
         run(method, "new", "beta", "i")
-        slug_b = get_active_slug(vault)
-        # alpha is the previous slug
-        slug_a_state = json.loads((vault / ".pa-active-project.json").read_text())
-        # We need both slugs — list all dirs.
         dirs = sorted(d.name for d in (vault / "projects").iterdir() if d.is_dir())
         slug_a = next(d for d in dirs if "alpha" in d)
         slug_b = next(d for d in dirs if "beta" in d)
 
-        # Place an artefact in alpha.
+        # Place an artefact with nested produced_by in alpha.
         art = vault / "projects" / slug_a / "artefacts" / "memo"
         art.mkdir(parents=True)
-        body_v = "---\nid: art-orig123\nkind: memo\nproject_id: " + slug_a + "\n---\nORIGINAL"
+        body_v = (
+            "---\nid: art-orig123\nkind: memo\nproject_id: " + slug_a + "\n"
+            "produced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+            "  sources_cited:\n    - https://x.test\n---\nORIGINAL"
+        )
         (art / "art-orig123.md").write_text(body_v, encoding="utf-8")
 
         r = run(method, "copy-artefact", "orig123", slug_b)
         assert "copied" in r.stdout
+
         # Original unchanged
         assert (art / "art-orig123.md").read_text(encoding="utf-8") == body_v
-        # Copy exists in beta with fresh id + derived_from
+
         copies = list((vault / "projects" / slug_b / "artefacts" / "memo").iterdir())
         assert len(copies) == 1
         copy_text = copies[0].read_text(encoding="utf-8")
         assert "derived_from: art-orig123" in copy_text
         assert f"project_id: {slug_b}" in copy_text
         assert "ORIGINAL" in copy_text
-    print("  T9 PASS — copy-artefact mints fresh id + derived_from")
+        # B1: nested produced_by preserved
+        assert "session_id: aaaaaaaa" in copy_text
+        assert "https://x.test" in copy_text
+        # B2: id rotated to fresh uuid (must NOT be art-orig123)
+        assert "id: art-orig123" not in copy_text, "id should be rotated, not reused"
+        assert re.search(r"^id: art-(?!orig123)[\w-]+$", copy_text, re.MULTILINE), \
+            "copy must have a fresh art-<uuid> id"
+    print("  T9 PASS — copy-artefact preserves nested + rotates id")
 
 
 def test_short_name_validation():
@@ -247,10 +265,9 @@ def test_short_name_validation():
 
 
 def test_resume_ambiguous_short_name():
+    """B2: state file must NOT be written on rejection."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
-        # Two projects with identical short-name (same day, different hex).
-        # Force this by manually creating two folders.
         (vault / "projects" / "20260507-thing-aaaa").mkdir()
         (vault / "projects" / "20260507-thing-aaaa" / "project.md").write_text(
             "---\nid: 20260507-thing-aaaa\ntitle: a\nstatus: active\n---\n",
@@ -261,10 +278,13 @@ def test_resume_ambiguous_short_name():
             "---\nid: 20260507-thing-bbbb\ntitle: b\nstatus: active\n---\n",
             encoding="utf-8",
         )
+        state_path = vault / ".pa-active-project.json"
+        assert not state_path.exists(), "no state should exist before run"
         r = run(method, "resume", "thing", expect_rc=None)
         assert r.returncode == 1
         assert "ambiguous" in r.stderr.lower()
-    print("  T11 PASS — resume rejects ambiguous short-name")
+        assert not state_path.exists(), "state must NOT be written on ambiguous rejection"
+    print("  T11 PASS — resume rejects ambiguous + leaves state untouched")
 
 
 def test_promote_refuses_already_in_project():
