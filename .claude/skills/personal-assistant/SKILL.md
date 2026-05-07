@@ -100,6 +100,17 @@ If the check exits 0 silently, proceed with the user's request — the harvest i
 - **Cite the KB.** When a claim about the user, their org, or a durable decision rests on a KB entry, mention which file/heading it came from. This makes drift detectable.
 - **Honor the Bruno Method discipline.** Method-architectural decisions live in `<method_root>/docs/adr/*` (immutable, ADR-style); user-domain durable decisions live in `<content_root>/kb/decisions.md`. Don't propose closing claims without reconciliation against landed state; don't accept work without explicit falsifiers.
 
+## How to capture agent-produced outputs (per [ADR-0003](../../../docs/adr/0003-agent-output-taxonomy.md))
+
+When the assistant **executes work** (drafts, plans, reports, analyses, decisions) — beyond just answering from memory — the outputs are typed and have a home:
+
+- **Knowledge** (KB updates) → in-place edits to `<content_root>/kb/{people,org,decisions}.md` (vault-scoped) or `<method_root>/kb/glossary.md` (method-scoped, PR-only flow). See "How to extend the KB" below.
+- **Artefacts** (drafts/plans/reports/analyses/exports/memos) → `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` with YAML provenance frontmatter. See `<content_root>/artefacts/README.md` for the kind layout and provenance shape.
+
+**Default flow for both: diff-and-approve.** Propose the change in chat; wait for explicit user approval before committing or pushing. Silent writes to KB or artefacts are forbidden by default. Autonomous producers (harvest / watchdog routines) MAY produce `memo/` artefacts but MUST NOT update KB silently — surface candidate KB updates as memos for human review in the next interactive session.
+
+The full procedure (pre-execute gather → mid-execute capture → post-execute write-back) lands in a follow-up slice on parent [#76](https://github.com/acardote/personal-assistant-ultra/issues/76); this section is the pointer to ADR-0003 and the artefacts/ home until that procedure lands.
+
 ## How to extend the KB
 
 The KB is split between method (canonical project terms) and content vault (user-specific). Edit the right side based on what you're adding:
