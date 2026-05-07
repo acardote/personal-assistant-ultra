@@ -417,6 +417,80 @@ def cmd_clear(args, cfg) -> int:
     return 0
 
 
+def cmd_sweep(args, cfg) -> int:
+    """List active projects whose last_active is older than the threshold.
+
+    Read-only — does NOT modify any file. The user reviews the list and runs
+    `project archive <slug>` per project they want to archive. Per ADR-0003
+    Amendment 1's diff-and-approve default."""
+    if args.days < 0:
+        print(f"--days must be >= 0 (got {args.days})", file=sys.stderr)
+        return 1
+
+    pdir = projects_dir(cfg.content_root)
+    if not pdir.is_dir():
+        if args.json:
+            print("[]")
+        return 0
+
+    threshold = args.days
+    today = dt.datetime.now(dt.timezone.utc).date()
+    candidates: list[dict] = []
+    for child in sorted(pdir.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        fm = project_summary(child / "project.md")
+        if fm.get("status", "active") != "active":
+            continue
+        last_active_str = fm.get("last_active")
+        if not last_active_str:
+            # Per pr-challenger #101: silent skip hides exactly the projects
+            # most likely to need archival. Surface as stderr so the user is
+            # informed without polluting --json stdout.
+            print(
+                f"[sweep] WARN: {child.name}/project.md has no `last_active` field",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            last_active = dt.date.fromisoformat(last_active_str)
+        except (ValueError, TypeError):
+            print(
+                f"[sweep] WARN: {child.name}/project.md `last_active` "
+                f"unparseable ({last_active_str!r})",
+                file=sys.stderr,
+            )
+            continue
+        days_since = (today - last_active).days
+        # Strict: project becomes a candidate only AFTER the threshold elapses
+        # (day-31+ at default 30). Day-of-threshold is not yet stale, matching
+        # ADR-0003 Amendment 1's "after one month with no last_active update".
+        if days_since <= threshold:
+            continue
+        candidates.append({
+            "slug": child.name,
+            "title": fm.get("title", "?"),
+            "last_active": last_active_str,
+            "days_since_active": days_since,
+        })
+
+    if args.json:
+        print(json.dumps(candidates))
+        return 0
+
+    if not candidates:
+        print(f"no archive candidates (threshold {threshold} days)")
+        return 0
+
+    width = max(len(c["slug"]) for c in candidates)
+    print(f"Archive candidates (last_active > {threshold} days ago):")
+    for c in candidates:
+        print(f"  {c['slug']:<{width}}  {c['last_active']}  ({c['days_since_active']}d)  {c['title']}")
+    print()
+    print("Review the list above, then run `project archive <slug>` per project to archive.")
+    return 0
+
+
 def cmd_touch(args, cfg) -> int:
     """Touch last_active on a project. Surgical update preserves nested blocks
     (B1 closer for SKILL.md procedure — the assistant must NOT hand-rewrite
@@ -712,6 +786,11 @@ def main(argv=None) -> int:
     p_touch = sub.add_parser("touch", help="touch last_active on a project (surgical, preserves nested frontmatter)")
     p_touch.add_argument("slug")
     p_touch.set_defaults(func=cmd_touch)
+
+    p_sweep = sub.add_parser("sweep", help="list archive candidates (active projects past staleness threshold)")
+    p_sweep.add_argument("--days", type=int, default=30, help="staleness threshold in days (default: 30)")
+    p_sweep.add_argument("--json", action="store_true", help="emit JSON array for routine consumption")
+    p_sweep.set_defaults(func=cmd_sweep)
 
     p_status = sub.add_parser("status", help="print active project info")
     p_status.set_defaults(func=cmd_status)

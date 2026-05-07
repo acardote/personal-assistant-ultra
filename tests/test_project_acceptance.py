@@ -25,6 +25,7 @@ Tests:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -312,6 +313,185 @@ def test_touch_preserves_nested_frontmatter():
     print("  T13 PASS — touch preserves nested frontmatter")
 
 
+def test_sweep_lists_stale_projects():
+    """Project last_active >30d ago is listed; under threshold is not."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+
+        # Make two projects with hand-crafted last_active dates.
+        old = vault / "projects" / "20260101-old-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-old-aaaa\ntitle: stale-project\n"
+            "status: active\nstarted_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        recent = vault / "projects" / "20260507-recent-bbbb"
+        recent.mkdir()
+        (recent / "project.md").write_text(
+            "---\nid: 20260507-recent-bbbb\ntitle: recent-project\n"
+            "status: active\nstarted_at: 2026-05-07\nlast_active: 2026-05-07\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep")
+        assert "20260101-old-aaaa" in r.stdout
+        assert "20260507-recent-bbbb" not in r.stdout
+    print("  T14 PASS — sweep lists only stale active projects")
+
+
+def test_sweep_skips_archived():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        old = vault / "projects" / "20260101-archived-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-archived-aaaa\ntitle: arch\n"
+            "status: archived\narchived_at: 2026-02-01\n"
+            "started_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep")
+        assert "20260101-archived-aaaa" not in r.stdout
+    print("  T15 PASS — sweep skips archived projects")
+
+
+def test_sweep_does_not_mutate():
+    """Tree-wide snapshot (per pr-challenger #101): sweep must not touch ANY file."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Three projects: stale-active, recent-active, archived. Plus a flat artefact.
+        old = vault / "projects" / "20260101-old-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-old-aaaa\ntitle: t\nstatus: active\n"
+            "started_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        recent = vault / "projects" / "20260507-recent-bbbb"
+        recent.mkdir()
+        (recent / "project.md").write_text(
+            "---\nid: 20260507-recent-bbbb\nstatus: active\n"
+            "started_at: 2026-05-07\nlast_active: 2026-05-07\n---\n",
+            encoding="utf-8",
+        )
+        archived = vault / "projects" / "20260101-arch-cccc"
+        archived.mkdir()
+        (archived / "project.md").write_text(
+            "---\nid: 20260101-arch-cccc\nstatus: archived\n"
+            "archived_at: 2026-02-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        flat_art = vault / "artefacts" / "memo" / "art-flat.md"
+        flat_art.write_text("---\nid: art-flat\nkind: memo\n---\nbody", encoding="utf-8")
+
+        snapshot: dict[Path, tuple[int, str]] = {}
+        for p in vault.rglob("*"):
+            if p.is_file():
+                snapshot[p] = (p.stat().st_mtime_ns, p.read_text(encoding="utf-8"))
+
+        run(method, "sweep")
+
+        for p, (mtime, content) in snapshot.items():
+            assert p.exists(), f"sweep deleted {p}"
+            assert p.stat().st_mtime_ns == mtime, f"sweep mutated mtime of {p}"
+            assert p.read_text(encoding="utf-8") == content, f"sweep mutated content of {p}"
+        # State file must not have been created either.
+        assert not (vault / ".pa-active-project.json").exists(), "sweep wrote state file"
+    print("  T16 PASS — sweep does not mutate any file (tree-wide)")
+
+
+def test_sweep_json_mode():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        old = vault / "projects" / "20260101-old-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-old-aaaa\ntitle: t\nstatus: active\n"
+            "started_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep", "--json")
+        data = json.loads(r.stdout)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["slug"] == "20260101-old-aaaa"
+        assert data[0]["days_since_active"] > 30
+    print("  T17 PASS — sweep --json emits parseable array")
+
+
+def test_sweep_json_zero_candidates():
+    """--json must emit a valid empty array even when no projects match."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Empty projects/ → []
+        r = run(method, "sweep", "--json")
+        assert json.loads(r.stdout) == []
+        # One non-stale project → still []
+        recent = vault / "projects" / "20260507-recent-bbbb"
+        recent.mkdir()
+        (recent / "project.md").write_text(
+            "---\nid: 20260507-recent-bbbb\nstatus: active\n"
+            "started_at: 2026-05-07\nlast_active: 2026-05-07\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep", "--json")
+        assert json.loads(r.stdout) == []
+    print("  T18 PASS — sweep --json emits [] on zero candidates")
+
+
+def test_sweep_negative_days_refused():
+    with tempfile.TemporaryDirectory() as td:
+        method, _vault = make_fixture(Path(td))
+        r = run(method, "sweep", "--days", "-5", expect_rc=None)
+        assert r.returncode == 1
+        assert "must be >= 0" in r.stderr
+    print("  T19 PASS — sweep --days <0 refused")
+
+
+def test_sweep_threshold_strict_boundary():
+    """ADR-0003 Amendment 1: stale = AFTER threshold (strict). Day-of-threshold
+    is NOT yet a candidate."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Project last_active EXACTLY 30 days ago — must NOT be listed at default threshold.
+        thirty = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=30)).isoformat()
+        thirty_one = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=31)).isoformat()
+        p30 = vault / "projects" / "20260101-thirty-aaaa"
+        p30.mkdir()
+        (p30 / "project.md").write_text(
+            f"---\nid: 20260101-thirty-aaaa\nstatus: active\n"
+            f"started_at: 2026-01-01\nlast_active: {thirty}\n---\n",
+            encoding="utf-8",
+        )
+        p31 = vault / "projects" / "20260101-thirtyone-bbbb"
+        p31.mkdir()
+        (p31 / "project.md").write_text(
+            f"---\nid: 20260101-thirtyone-bbbb\nstatus: active\n"
+            f"started_at: 2026-01-01\nlast_active: {thirty_one}\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep")
+        assert "20260101-thirty-aaaa" not in r.stdout, "day-30 should NOT be listed (strict)"
+        assert "20260101-thirtyone-bbbb" in r.stdout, "day-31 SHOULD be listed"
+    print("  T20 PASS — sweep threshold strict: day-30 not, day-31 yes")
+
+
+def test_sweep_warns_on_missing_last_active():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        broken = vault / "projects" / "20260101-broken-aaaa"
+        broken.mkdir()
+        (broken / "project.md").write_text(
+            "---\nid: 20260101-broken-aaaa\nstatus: active\nstarted_at: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep")
+        assert "[sweep] WARN" in r.stderr
+        assert "20260101-broken-aaaa" in r.stderr
+        assert "no `last_active`" in r.stderr
+    print("  T21 PASS — sweep warns on missing last_active")
+
+
 def test_promote_refuses_already_in_project():
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
@@ -341,5 +521,13 @@ if __name__ == "__main__":
     test_short_name_validation()
     test_resume_ambiguous_short_name()
     test_touch_preserves_nested_frontmatter()
+    test_sweep_lists_stale_projects()
+    test_sweep_skips_archived()
+    test_sweep_does_not_mutate()
+    test_sweep_json_mode()
+    test_sweep_json_zero_candidates()
+    test_sweep_negative_days_refused()
+    test_sweep_threshold_strict_boundary()
+    test_sweep_warns_on_missing_last_active()
     test_promote_refuses_already_in_project()
     print("All project tests passed.")

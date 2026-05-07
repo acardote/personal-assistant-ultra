@@ -54,6 +54,7 @@ Parse the SECOND whitespace-separated token of `$ARGUMENTS` as the project subco
 | `clear` | `tools/project.py clear` | Removes the active-project state file. |
 | `status` | `tools/project.py status` | Prints active slug + age + frontmatter scalars. If age > 4h, the tool flags STALE — surface that to the user. |
 | `touch <slug>` | `tools/project.py touch <slug>` | Updates `last_active` on the project's frontmatter using the surgical updater (preserves nested blocks). Used by the SKILL's Phase 3 after a project-scoped write. |
+| `sweep [--days N] [--json]` | `tools/project.py sweep [<flags>]` | Lists active projects whose `last_active` is older than N days (default 30). Read-only — does NOT auto-archive (per ADR-0003 Amendment 1's diff-and-approve default). Run `archive <slug>` per candidate to archive. |
 
 **Active-project state**: lives at `<content_root>/.pa-active-project.json`. The 4-hour staleness threshold (per ADR-0003 Amendment 1) means: if `status` reports STALE, treat the slug as cleared and prompt the user to explicitly `project resume <slug>` if they want to continue. Do NOT silently inherit a stale project's context.
 
