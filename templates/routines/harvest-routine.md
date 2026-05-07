@@ -146,6 +146,16 @@ Per-source instructions (in this order):
 - Expected order of magnitude: tens of channels × multiple threads each = dozens of memory objects on a 30-day cold-start.
 - **Hard floor (gate, not log)**: on cold-start, if you produce <5 Slack memory objects, this is a sign the enumeration was incomplete. Set `ok: false` on the run-status JSON with `error: "incomplete_slack_enumeration"` so the freshness check / watchdog surface it. Do NOT silently complete with low counts.
 
+**Slack DMs and group-DMs** (via Slack MCP, per #68):
+- Separate source kind from channel threads. Call `slack_search_public_and_private` with:
+  - `query`: `from:<@<YOUR_SLACK_USER_ID>> after:<cutoff>` (the user's Slack ID + cutoff date)
+  - `sort`: `timestamp`
+  - `channel_types`: `im,mpim` (DMs and group-DMs only)
+  - Paginate via `cursor` until exhausted.
+- For each unique DM channel discovered, call `slack_read_thread` on the message's `(channel_id, message_ts)`. Render each to `$VAULT/raw/slack_dm/<channel-id>-<thread-ts>.md` with `## <iso> — user:<id>` headers per message; include a leading participants line so compress preserves the conversational structure.
+- Compress each via `tools/compress.py --kind thread --source-kind slack_dm`. Memory lands at `$VAULT/memory/slack_dm/...`.
+- Update `$VAULT/.harvest/slack_dm.json` with new dedup_keys (shape: `slack_dm-<channel-id>-<thread-ts>`).
+
 **Gmail** (via Gmail MCP — UUID-namespaced tools):
 - Use `search_threads` with `label:important newer_than:<since>` (or per-user override). Iterate paginated results until exhausted.
 - For each: fetch via `get_thread`, render to `$VAULT/raw/gmail_thread/<thread-id>.md`, compress with `--kind email --source-kind gmail_thread`.

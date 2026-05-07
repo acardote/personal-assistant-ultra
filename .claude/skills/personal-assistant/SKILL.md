@@ -150,6 +150,23 @@ When the user asks the skill to harvest (or the routine prompt invokes the skill
 6. Append a per-thread line to today's daily digest (see digest format below).
 7. **Hard floor (per [#34](https://github.com/acardote/personal-assistant-ultra/issues/34))**: if a 30-day cold-start produces <5 Slack memory objects despite the user having known active channels, set `ok: false` on the run-status JSON with `error: "incomplete_slack_enumeration"`. This is a gate, not a log line — the freshness check + watchdog will surface the failure to the user. Right-shape number is dozens (channels × threads), not single digits.
 
+### Slack DMs and group-DMs (via Slack MCP, per [#68](https://github.com/acardote/personal-assistant-ultra/issues/68))
+
+DMs and group-DMs are a separate source kind — `slack_dm` — because they have a different participant model and dedup shape than channel threads (no channel name; D-prefix or G-prefix IDs only). Both 1:1 and multi-party DMs share the kind; participant count and IDs land in the rendered Markdown so compress can pick up the structure.
+
+1. **Discovery**: call `slack_search_public_and_private` with:
+   - `query: "from:<@<USER_ID>> after:<cutoff>"`
+   - `sort: "timestamp"`
+   - `channel_types: "im,mpim"` — DMs only; channels are covered by the `slack_thread` procedure above.
+   - Paginate via `cursor` until exhausted.
+2. **Per DM**: extract `channel_id` (D-prefix for 1:1, G-prefix for group) and `message_ts`. For threaded DMs, use the parent message's ts; for top-level DM messages, use the message's own ts. Call `mcp__claude_ai_Slack__slack_read_thread`. The same tool that reads channel threads handles DMs identically (verified A1 probe 2026-05-07).
+3. **Render** to `<content_root>/raw/slack_dm/<channel-id>-<thread-ts>.md` with `## <iso> — user:<id>` headers per message (same shape as `slack_thread`). Include a leading line listing participants by user ID so compress can preserve the conversational structure.
+4. **Compress** via `tools/compress.py <raw-path> --kind thread --source-kind slack_dm`. The output lands at `<content_root>/memory/slack_dm/...`. The existing `thread` prompt is reused (per A4 — if quality turns out poor, F2/F3 on #70 cover that and a DM-specific prompt is the follow-up).
+5. **Update** `<content_root>/.harvest/slack_dm.json` with the new dedup_keys (shape: `slack_dm-<channel-id>-<thread-ts>`).
+6. **Append** to today's daily digest as a separate per-source line (`slack_dm: N new`).
+
+**Privacy posture**: DMs typically contain more candid / unfiltered content than channel threads. Same vault-only storage as other `raw/` artifacts; no automatic sharing. If a DM is on a topic the user explicitly considers off-limits for memory, they can `.harvest/slack-dm-deny.txt` (one channel-id per line) to block it from harvest — that file is read-first like `slack-allow.txt`. (This deny-list mechanism is a follow-up; default behavior today is harvest-all-DMs-from-active-window.)
+
 ### Gmail (via Gmail MCP)
 
 1. Use a query scoped to a labeled / starred set the user maintains (default: `label:important newer_than:<since>` if no per-user override). Refuse to default to broad inbox harvesting (F2 mitigation).
