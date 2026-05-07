@@ -34,7 +34,7 @@ The LLM proposes a KB update when one of these observable conditions holds. Trig
 
 ### `person-update`
 - **Trigger**: ≥2 distinct memory objects from different sources (e.g., one Slack thread + one Granola note) consistently report the same person in a role/responsibility different from the existing entry in `<content_root>/kb/people.md`. Single-source observations are NOT enough — they could be a single misattribution.
-- **Worked example**: memory shows Leonor in three meetings as the Atlas engineering lead, but `kb/people.md`'s heading "## Leonor Mendonça" still lists her as Product Manager. LLM proposes a person-update.
+- **Worked example**: memory shows Leonor in three meetings as the Atlas engineering lead, but `<content_root>/kb/people.md`'s heading "## Leonor Mendonça" still lists her as Product Manager. LLM proposes a person-update.
 
 ### `org-update`
 - **Trigger**: ≥2 distinct memory objects (any sources) report a structural change to a team / org / external organization (head changes, team renames, customer status changes from prospect → pilot → customer, vendor relationship terminating).
