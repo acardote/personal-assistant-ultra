@@ -148,7 +148,7 @@ Per-source instructions (in this order):
 
 **Slack DMs and group-DMs** (via Slack MCP, per #68):
 - Separate source kind from channel threads. Call `slack_search_public_and_private` with:
-  - `query`: `from:<@<YOUR_SLACK_USER_ID>> after:<cutoff>` (the user's Slack ID + cutoff date)
+  - `query`: `after:<cutoff>` (NO `from:@me` — that would only capture DMs the user authored in; a DM where the counterpart did the talking would be invisible. Auth-scope visibility means the search only returns DMs the user is a participant in.)
   - `sort`: `timestamp`
   - `channel_types`: `im,mpim` (DMs and group-DMs only)
   - Paginate via `cursor` until exhausted.

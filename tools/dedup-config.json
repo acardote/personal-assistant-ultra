@@ -5,6 +5,7 @@
     "gmail_thread": 1,
     "slack_thread_note": 2,
     "slack_thread": 2,
+    "slack_dm": 2,
     "granola_note": 3,
     "gmeet_transcript": 4,
     "transcript_file": 5,

@@ -155,7 +155,7 @@ When the user asks the skill to harvest (or the routine prompt invokes the skill
 DMs and group-DMs are a separate source kind — `slack_dm` — because they have a different participant model and dedup shape than channel threads (no channel name; D-prefix or G-prefix IDs only). Both 1:1 and multi-party DMs share the kind; participant count and IDs land in the rendered Markdown so compress can pick up the structure.
 
 1. **Discovery**: call `slack_search_public_and_private` with:
-   - `query: "from:<@<USER_ID>> after:<cutoff>"`
+   - `query: "after:<cutoff>"` (NO `from:@me` filter — that would only capture DMs the user authored in. A DM where the counterpart did the talking would be invisible. The user is a participant in every DM the search returns by virtue of having auth-scope visibility.)
    - `sort: "timestamp"`
    - `channel_types: "im,mpim"` — DMs only; channels are covered by the `slack_thread` procedure above.
    - Paginate via `cursor` until exhausted.
