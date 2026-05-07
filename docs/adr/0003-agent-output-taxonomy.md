@@ -223,6 +223,33 @@ Lookup is by `id`. Promotion (flat → project) and cross-project copy (describe
 
 `tools/lint-provenance.py` is extended to include `art://` in `CANONICAL_SOURCE_RE` and to refuse path-based artefact references in `produced_by.sources_cited`. Implementation lands in slice 5 of #88.
 
+**Resolver scope** (binding for slice 5): an `art://<uuid>` reference resolves by scanning, in order:
+1. `<content_root>/projects/*/artefacts/<kind>/art-<uuid>.<ext>` (active and archived projects both — archival is a status flag, not a hide).
+2. `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` (flat tier).
+
+Multiple matches are an invariant violation (`id` is content-addressable; duplicates only exist via the cross-project copy path, which mints a fresh `id`). The lint refuses if it finds duplicates. First-match-wins is therefore unambiguous.
+
+### `PA_PROJECT_ID` lifecycle (binding for slices 3 + 4)
+
+The active-project context is carried by the `PA_PROJECT_ID` environment variable in the Claude Code session.
+
+- **Set** by `/personal-assistant project resume <slug>` and `/personal-assistant project new <slug> ...`. Both verify the slug exists (resume) or is newly created (new) before exporting.
+- **Scope**: the env var lives only inside the current Claude Code session. It is NOT persisted across sessions. Re-resuming on a new session is an explicit user action — this is the F6 mitigation against stale-session bleed.
+- **Clear** by `/personal-assistant project clear` (no project active). Subsequent work-execution turns produce flat artefacts.
+- **Inspection**: `/personal-assistant project status` prints the current `PA_PROJECT_ID` (or "no project active") + the project's `last_active`.
+
+The skill's activation contract reads `PA_PROJECT_ID` early. If set, the work-execution procedure's Phase 3 (per #83) lands artefacts under `<content_root>/projects/<slug>/artefacts/`. If unset, flat. Knowledge contributions (KB updates) ignore `PA_PROJECT_ID` per the cross-reference in `docs/kb-editorial-rules.md`.
+
+### `project.md` body schema (deferred to slice 4, but bounded here)
+
+The body of `project.md` (below the YAML frontmatter) is deliberately free-form, but slice 4 will pin a minimal template the assistant fills:
+
+- A "## Sources" section listing canonical references (`kb#heading`, `mem://<id>`, `art://<uuid>`, `https://...`) the project draws from.
+- A "## Decisions" section listing decisions made in the project's scope that are NOT KB-worthy (project-local choices vs durable user decisions).
+- A "## What's next" section the assistant updates when context is sufficient.
+
+This template is not strictly enforced by the lint — `project.md` is the assistant's running notebook, not a gated document. Slice 4 may revise the template once we have one real project to test it against.
+
 ### Promotion: flat → project
 
 Command: `/personal-assistant project promote <art-uuid> <slug>`. Effect:
@@ -243,9 +270,10 @@ When an artefact in project A should also appear in project B, the user runs `/p
 - A fresh `id` (new UUID).
 - `project_id: <dest-slug>`.
 - A new field `derived_from: <orig-art-uuid>` in the frontmatter, persisting the lineage.
-- The body content copied verbatim.
+- The body content copied **verbatim** — `art://<...>` references inside the copied body are NOT rewritten. The copy points at the same upstream sources as the original; rewriting would silently fork the citation graph and confuse later tracing. If the user wants different sources for the copy, they edit the new file.
+- `last_active` on the destination project is touched (treat copy-in as activity on the destination, same as promotion does).
 
-The original is unchanged. Each project owns its copy. `art://<orig-uuid>` references resolve to the original; `art://<new-uuid>` to the copy. No symlinks (Windows portability + git ergonomics).
+The original is unchanged: its `last_active`, frontmatter, and body all stay. Each project owns its copy. `art://<orig-uuid>` references resolve to the original; `art://<new-uuid>` to the copy. No symlinks (Windows portability + git ergonomics).
 
 ### Resume-context budget (F1 — clarification, NOT cap)
 
