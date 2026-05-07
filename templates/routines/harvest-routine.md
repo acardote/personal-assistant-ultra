@@ -135,7 +135,11 @@ Per-source instructions (in this order):
 
 **Slack** (via Slack MCP — UUID-namespaced tools):
 - Use `slack_search_channels` with name patterns `external-*`, `customer-*`, `partner-*` to enumerate **ALL** matching channels — not just a few. Iterate `cursor` pagination until exhausted.
-- Additionally: use `slack_search_public_and_private` for `from:@me after:<cutoff>` to find activity-driven channels not matching the prefix patterns.
+- Additionally: use `slack_search_public_and_private` for activity-driven channels not matching the prefix patterns. **MUST pass these parameters** (per #67 — the defaults silently miss most channel posts):
+  - `query`: `from:<@U03LA1MHLG0> after:<cutoff>` (the user's Slack ID + cutoff date)
+  - `sort`: `timestamp` (NOT default `score` — `score` ranks DMs above channel posts and they fall off page 1)
+  - `channel_types`: `public_channel,private_channel` (exclude DMs/group-DMs; DM scope tracked in #68)
+  - Paginate via `cursor` until exhausted. Do NOT stop at page 1.
 - Additionally: search for threads carrying the user's `:pencil:` reaction (flag) regardless of channel.
 - For each unique channel discovered, list threads since cutoff and call `slack_read_thread` per thread. Render each to `$VAULT/raw/slack_thread/<channel>-<thread_ts>.md`.
 - Compress each via `tools/compress.py --kind thread --source-kind slack_thread`.

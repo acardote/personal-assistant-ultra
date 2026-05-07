@@ -138,7 +138,12 @@ When the user asks the skill to harvest (or the routine prompt invokes the skill
 ### Slack (via Slack MCP)
 
 1. Read `<content_root>/.harvest/slack-allow.txt` if it exists for the user's explicit channel allow-list (one channel ID or `#name` per line). If absent, fall back to discovery via search.
-2. **Discovery (when no allow-list)**: enumerate **comprehensively** — not just a sample. Call `slack_search_channels` with name patterns `external-*`, `customer-*`, `partner-*`, paginating via `cursor` until exhausted. Then `slack_search_public_and_private` for `from:@me after:<cutoff>` to find activity-driven channels not matching the prefix patterns. Then channels whose threads carry the user's `:pencil:` reaction (flagged threads) regardless of channel name.
+2. **Discovery (when no allow-list)**: enumerate **comprehensively** — not just a sample. Call `slack_search_channels` with name patterns `external-*`, `customer-*`, `partner-*`, paginating via `cursor` until exhausted. Then `slack_search_public_and_private` for activity-driven channels not matching the prefix patterns, **using these explicit parameters** (per #67 fix — the defaults silently miss most channel posts):
+   - `query: "from:<@U03LA1MHLG0> after:<cutoff>"` (substitute the user's Slack ID + cutoff date)
+   - `sort: "timestamp"` — NOT the default `score`. Default `sort=score` ranks DMs above channel posts, so on a typical day the first 20 results are ALL DMs and channel posts fall off page 1 entirely. The routine has been silently missing channel-thread activity for this reason.
+   - `channel_types: "public_channel,private_channel"` — exclude DMs/group-DMs from the channel-discovery search. (DM/group-DM harvesting is tracked separately in [#68](https://github.com/acardote/personal-assistant-ultra/issues/68).)
+   - **Paginate via `cursor` until the API returns no more pages.** Don't stop at page 1 — a power-day will span multiple pages.
+   Then channels whose threads carry the user's `:pencil:` reaction (flagged threads) regardless of channel name.
 3. **Per thread to harvest**: call `mcp__claude_ai_Slack__slack_read_thread`. Render to a Markdown file with `## <iso> — user:<id>` headers per message (preserves speaker attribution per F3). Write to `<content_root>/raw/slack_thread/<channel>-<thread_ts>.md`.
 4. Run `tools/compress.py <raw-path> --kind thread --source-kind slack_thread` to produce the memory object. Compress writes to `<content_root>/memory/slack_thread/...` and applies clustering per #10.
 5. Update `<content_root>/.harvest/slack.json` with the new dedup_keys.
