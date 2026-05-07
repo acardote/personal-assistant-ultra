@@ -229,16 +229,28 @@ Lookup is by `id`. Promotion (flat → project) and cross-project copy (describe
 
 Multiple matches are an invariant violation (`id` is content-addressable; duplicates only exist via the cross-project copy path, which mints a fresh `id`). The lint refuses if it finds duplicates. First-match-wins is therefore unambiguous.
 
-### `PA_PROJECT_ID` lifecycle (binding for slices 3 + 4)
+### Active-project state (binding for slices 3 + 4)
 
-The active-project context is carried by the `PA_PROJECT_ID` environment variable in the Claude Code session.
+Originally specified as a `PA_PROJECT_ID` environment variable. Pr-challenger F1 on #92 surfaced that env vars don't survive across the assistant's separate Bash tool invocations — each tool call is a new shell. Replaced with a hybrid mechanism:
 
-- **Set** by `/personal-assistant project resume <slug>` and `/personal-assistant project new <slug> ...`. Both verify the slug exists (resume) or is newly created (new) before exporting.
-- **Scope**: the env var lives only inside the current Claude Code session. It is NOT persisted across sessions. Re-resuming on a new session is an explicit user action — this is the F6 mitigation against stale-session bleed.
-- **Clear** by `/personal-assistant project clear` (no project active). Subsequent work-execution turns produce flat artefacts.
-- **Inspection**: `/personal-assistant project status` prints the current `PA_PROJECT_ID` (or "no project active") + the project's `last_active`.
+- **Primary: assistant's conversation context**. The assistant remembers "active project = `<slug>`" after `project new` / `project resume` and prepends `export PA_PROJECT_ID=<slug> &&` to subsequent project-relevant Bash calls within the conversation. This makes the env var available to each tool that reads it.
+- **Backup: state file `<content_root>/.pa-active-project.json`**. Written by `project new` / `project resume`, cleared by `project clear`. Schema:
 
-The skill's activation contract reads `PA_PROJECT_ID` early. If set, the work-execution procedure's Phase 3 (per #83) lands artefacts under `<content_root>/projects/<slug>/artefacts/`. If unset, flat. Knowledge contributions (KB updates) ignore `PA_PROJECT_ID` per the cross-reference in `docs/kb-editorial-rules.md`.
+  ```json
+  {"slug": "<slug>", "set_at": "<iso8601>"}
+  ```
+
+  Used to recover state when the assistant's conversation context is compacted, or when a new Claude Code session starts before the user explicitly resumes.
+
+- **Staleness rule** (F6 mitigation): on activation, the skill reads the state file. If `set_at` is within the last 4 hours, the assistant silently treats the slug as active. If older, the assistant surfaces *"Previous active project `<slug>` from `<age>h` ago. Run `/personal-assistant project resume <slug>` to continue, or `project clear` to start fresh."* and proceeds in flat-artefact mode until the user disambiguates.
+
+- **Set** by `/personal-assistant project resume <slug>` and `/personal-assistant project new <slug> ...`. Both update the state file.
+- **Clear** by `/personal-assistant project clear`. Removes the state file.
+- **Inspection**: `/personal-assistant project status` reads the state file + frontmatter, prints active slug + `last_active` + recent artefact count.
+
+The skill's activation contract reads the state file early. If active (within 4h), the work-execution procedure's Phase 3 (per #83) lands artefacts under `<content_root>/projects/<slug>/artefacts/`. If stale, prompt the user. If absent, flat. Knowledge contributions (KB updates) ignore the active project per the cross-reference in `docs/kb-editorial-rules.md`.
+
+The 4-hour window is approximate "same-conversation-session." Tightening it would force re-resumes during routine breaks (lunch, meetings); widening it would risk silent stale-session bleed (F6). Four hours balances both.
 
 ### `project.md` body schema (deferred to slice 4, but bounded here)
 

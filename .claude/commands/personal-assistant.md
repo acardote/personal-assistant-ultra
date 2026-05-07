@@ -1,5 +1,5 @@
 ---
-description: Personal-assistant routine ops — dispatches metrics / freshness-check / harvest / live-writeback subcommands.
+description: Personal-assistant routine ops — dispatches metrics / freshness-check / harvest / live-writeback / project subcommands.
 ---
 
 The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root.
@@ -19,6 +19,7 @@ The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root.
 | `freshness-check` | `tools/check-harvest-freshness.py <flags>` |
 | `harvest` | follow harvest orchestration in SKILL.md (uses MCP tools, can't go through Bash alone) |
 | `live-writeback` | `tools/live-writeback.py <flags>` |
+| `project` | nested router (see "Subcommand: project" below) — dispatches to `tools/project.py <subcmd>` |
 
 ## Per-subcommand notes
 
@@ -36,10 +37,33 @@ Then follow the per-source procedures in SKILL.md ("Harvest orchestration"). Tre
 ### `live-writeback`
 Walks `<content_root>/raw/live/<source>/`, runs `compress.py --provenance live` per file, moves processed files to `.processed/`. Pass-through: `--source <granola_note|slack_thread|gmail_thread>`, `--dry-run`. Useful after a session that fired multiple live calls.
 
+### `project`
+
+PA project tier (per [ADR-0003 Amendment 1](../../docs/adr/0003-agent-output-taxonomy.md#amendment-1--project-tier-2026-05-07)) — multi-session containers for agent-executed work, with start/resume/promote/copy mechanics.
+
+Parse the SECOND whitespace-separated token of `$ARGUMENTS` as the project subcommand:
+
+| Project subcommand | Dispatch | Notes |
+|---|---|---|
+| `new <short-name> "<intent>"` | `tools/project.py new <short> "<intent>"` | Generates slug `YYYYMMDD-<short>-<4hex>`, scaffolds folder, sets active state. |
+| `resume <slug-or-shortname>` | `tools/project.py resume <ref>` | Sets active state. The tool prints `project.md` + manifest + `notes.md` to stdout — read the output to load the project's context into your working memory. |
+| `list [--include-archived]` | `tools/project.py list [<flag>]` | Active by default; flag adds archived. |
+| `archive <slug>` | `tools/project.py archive <slug>` | Flips status. Then `tools/live-commit-push.sh <content_root> "project: archive <slug>"`. |
+| `promote <art-uuid> <slug>` | `tools/project.py promote <uuid> <slug>` | Moves a flat artefact + sidecars into a project. Then `tools/live-commit-push.sh ... "project: promote <art-uuid> -> <slug>"`. |
+| `copy-artefact <art-uuid> <dest-slug>` | `tools/project.py copy-artefact <uuid> <dest>` | Copies (fresh id, derived_from). Then commit-push. |
+| `clear` | `tools/project.py clear` | Removes the active-project state file. |
+| `status` | `tools/project.py status` | Prints active slug + age + frontmatter scalars. If age > 4h, the tool flags STALE — surface that to the user. |
+
+**Active-project state**: lives at `<content_root>/.pa-active-project.json`. The 4-hour staleness threshold (per ADR-0003 Amendment 1) means: if `status` reports STALE, treat the slug as cleared and prompt the user to explicitly `project resume <slug>` if they want to continue. Do NOT silently inherit a stale project's context.
+
+**On `project new` / `project resume`**: after the tool runs, remember the active slug in your conversation context and prepend `export PA_PROJECT_ID=<slug> &&` to subsequent project-relevant Bash calls in this session — this is the env-var bridge across the assistant's separate Bash invocations (each is a new shell).
+
+**On unknown `<project-subcmd>`**: print the valid project subcommand list and stop. Do NOT activate the skill or infer intent.
+
 ## Empty / unknown response template
 
 When `$ARGUMENTS` is empty or unknown, respond with EXACTLY this shape (substituting the literal subcommand list):
 
-> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
+> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`, `project`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
 
 No skill activation, no clarifying question, no inference.
