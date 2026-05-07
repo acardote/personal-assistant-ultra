@@ -669,7 +669,6 @@ def check_vault_artefacts(content_root: Path) -> list[Violation]:
             ))
 
     return out
-    return out
 
 
 def main(argv: list[str] | None = None) -> int:
