@@ -423,6 +423,10 @@ def cmd_sweep(args, cfg) -> int:
     Read-only — does NOT modify any file. The user reviews the list and runs
     `project archive <slug>` per project they want to archive. Per ADR-0003
     Amendment 1's diff-and-approve default."""
+    if args.days < 0:
+        print(f"--days must be >= 0 (got {args.days})", file=sys.stderr)
+        return 1
+
     pdir = projects_dir(cfg.content_root)
     if not pdir.is_dir():
         if args.json:
@@ -440,13 +444,28 @@ def cmd_sweep(args, cfg) -> int:
             continue
         last_active_str = fm.get("last_active")
         if not last_active_str:
+            # Per pr-challenger #101: silent skip hides exactly the projects
+            # most likely to need archival. Surface as stderr so the user is
+            # informed without polluting --json stdout.
+            print(
+                f"[sweep] WARN: {child.name}/project.md has no `last_active` field",
+                file=sys.stderr,
+            )
             continue
         try:
             last_active = dt.date.fromisoformat(last_active_str)
         except (ValueError, TypeError):
+            print(
+                f"[sweep] WARN: {child.name}/project.md `last_active` "
+                f"unparseable ({last_active_str!r})",
+                file=sys.stderr,
+            )
             continue
         days_since = (today - last_active).days
-        if days_since < threshold:
+        # Strict: project becomes a candidate only AFTER the threshold elapses
+        # (day-31+ at default 30). Day-of-threshold is not yet stale, matching
+        # ADR-0003 Amendment 1's "after one month with no last_active update".
+        if days_since <= threshold:
             continue
         candidates.append({
             "slug": child.name,
