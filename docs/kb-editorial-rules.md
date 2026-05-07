@@ -16,17 +16,33 @@ Every step below uses one of three explicit roles:
 
 The user **never authors** under these rules — they review and approve. If the user wants to author KB content directly, they edit the file and commit; that path bypasses these rules entirely.
 
-## Kind selector (F2 mitigation — deterministic routing)
+## Kind selector — primary + compound (F2 mitigation, with #82 challenger fix)
 
-The four kinds are mutually exclusive on the target file. Pick the FIRST rule below that matches; do not consider later rules:
+The kind selector picks the **primary** kind (which file is the canonical home for this insight). Compound insights — where one observation legitimately updates multiple kinds — emit **secondary** diff proposals so no facet of the change is lost.
 
-1. If the insight defines or refines a **project term** (a noun used inside this project's vocabulary — e.g., "memory object", "harvester", "live-call adapter") → **`glossary-term`**, target `<method_root>/kb/glossary.md`.
-2. If the insight is **a decision the user made or committed to** (architectural, scope, policy, partnership) → **`decision`**, target `<content_root>/kb/decisions.md`.
-3. If the insight is about **a person's role, responsibilities, or relationship to the user** (the user's colleagues, partners, customers, contacts) → **`person-update`**, target `<content_root>/kb/people.md`.
-4. If the insight is about **a team, org, business unit, or external organization** (Nexar internal teams, customer companies, vendor companies) → **`org-update`**, target `<content_root>/kb/org.md`.
+### Primary kind (rules 1–4, first-match-wins)
+
+1. If the insight defines or refines a **project term** (a noun used inside this project's vocabulary — e.g., "memory object", "harvester", "live-call adapter") → primary kind **`glossary-term`**, target `<method_root>/kb/glossary.md`.
+2. If the insight is **a decision the user made or committed to** (architectural, scope, policy, partnership) → primary kind **`decision`**, target `<content_root>/kb/decisions.md`.
+3. If the insight is about **a person's role, responsibilities, or relationship to the user** (the user's colleagues, partners, customers, contacts) → primary kind **`person-update`**, target `<content_root>/kb/people.md`.
+4. If the insight is about **a team, org, business unit, or external organization** → primary kind **`org-update`**, target `<content_root>/kb/org.md`.
 5. If none of 1–4 match → it is NOT a KB contribution. Either it's an artefact (route to `<content_root>/artefacts/<kind>/...` per ADR-0003) or it's chat output (don't capture).
 
-The LLM must apply rules 1–4 IN ORDER. A statement like "We decided that Leonor leads the Atlas team" is `decision` (rule 2 fires first), even though it also looks org-shaped (rule 4) and person-shaped (rule 3). Order eliminates two-readers ambiguity.
+### Secondary diffs — the compound-insight rule
+
+After picking the primary kind, the LLM **must also check** whether the same insight references a person, org, or term that already has a heading in its respective KB file. For each match, propose a **secondary diff** under the corresponding kind. Examples:
+
+- **"We decided that Leonor leads the Atlas team"** — primary: `decision` (decisions.md). Secondaries: `person-update` if `## Leonor Mendonça` exists in people.md (her role line changes); `org-update` if `## Atlas` exists in org.md (its lead line changes). All three diffs proposed in chat together; user can approve any subset.
+- **"Decided to drop Polestar from the H2 customer list"** — primary: `decision`. Secondary: `org-update` if `## Polestar` exists in org.md (status changes from prospect/customer to dropped).
+- **"Live-call adapter is now the term for #39's per-source live MCP wrappers"** — primary: `glossary-term`. No secondaries; the term is purely vocabulary.
+
+The first-match-wins rule resolves which file gets the *named* version of the change (the entry headed `### 2026-05-07 — Atlas leadership change` lives in decisions.md). Secondaries are smaller, follow-on updates that keep people.md and org.md from going stale on referents they already track.
+
+The user can approve all, some, or none of the proposed diffs. Each diff is a separate commit (so one rejection doesn't block the others).
+
+### When a referent doesn't yet exist in a secondary file
+
+If the primary insight is about Leonor but `## Leonor Mendonça` doesn't yet exist in `<content_root>/kb/people.md`, the LLM does NOT auto-create a person heading — that would be silent over-capture. The LLM proposes only the primary kind. New headings come from rules 3/4 firing as their OWN primary in a future observation, once the trigger threshold is met.
 
 ## Triggers — when the LLM proposes an update
 
@@ -88,6 +104,8 @@ User chat: *"let's go with Option 2 for #51"*.
    ```
 5. **User** reviews, approves.
 6. **Skill** writes the diff to `<content_root>/kb/decisions.md`, commits with message `kb: live-call orchestration architecture (decision per #51)`, pushes.
+
+In this example there are no secondary diffs because no person or org referent is named in the decision. A counter-example with secondaries: "decided that Leonor leads Atlas" would emit one primary `decision` diff plus a secondary `person-update` diff (if Leonor exists in people.md) and a secondary `org-update` diff (if Atlas exists in org.md), each as a separate commit on user approval.
 
 ## Cross-reference
 
