@@ -25,6 +25,11 @@ Tests:
   T17 — undated heading without entry shape (format docs) is grandfathered.
   T18 — `**Last verified:**` qualifies as a date marker for grandfathering.
   T19 — schema/format examples inside fenced code blocks don't trip heading detection.
+  T20 — project-scoped artefact missing project_id fails (#88 / #96).
+  T21 — project-scoped artefact with mismatched project_id fails.
+  T22 — `art://<uuid>` is accepted as canonical source form.
+  T23 — same uuid in two locations triggers artefact-uuid-collision.
+  T24 — project-scoped export sidecar must carry project_id too.
 """
 
 from __future__ import annotations
@@ -346,6 +351,107 @@ def test_code_fence_examples_dont_trip_lint():
     print("  T19 PASS — fenced code examples ignored")
 
 
+def _project_dirs(vault: Path, slug: str) -> Path:
+    proj = vault / "projects" / slug
+    (proj / "artefacts" / "memo").mkdir(parents=True, exist_ok=True)
+    (proj / "artefacts" / "export").mkdir(parents=True, exist_ok=True)
+    return proj
+
+
+def _project_artefact_md(slug: str, art_uuid: str, project_id: str | None,
+                         sources: list[str] = None) -> str:
+    sources = sources or ["https://x.test"]
+    src_lines = "\n".join(f"    - {s}" for s in sources)
+    pid_line = f"\nproject_id: {project_id}" if project_id else ""
+    return (
+        f"---\nid: art-{art_uuid}\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+        f"title: t{pid_line}\nproduced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+        f"  sources_cited:\n{src_lines}\n---\nbody"
+    )
+
+
+def test_project_scoped_missing_project_id():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-noproject.md").write_text(
+            _project_artefact_md("20260507-test-aaaa", "noproject", None),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "artefact-missing-project-id" in r.stderr
+    print("  T20 PASS — project-scoped artefact missing project_id fails")
+
+
+def test_project_scoped_mismatched_project_id():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-mismatch.md").write_text(
+            _project_artefact_md("20260507-test-aaaa", "mismatch", "20260101-other-bbbb"),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "artefact-project-id-mismatch" in r.stderr
+    print("  T21 PASS — project_id mismatch fails")
+
+
+def test_art_canonical_source_accepted():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-uses-art-ref.md").write_text(
+            _project_artefact_md("20260507-test-aaaa", "uses-art-ref", "20260507-test-aaaa",
+                                  sources=["art://orig-123", "kb#some-heading"]),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"art:// should be canonical\n{r.stderr}"
+    print("  T22 PASS — art://<uuid> accepted as canonical source")
+
+
+def test_uuid_collision_across_tiers():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Same uuid in flat AND in a project
+        flat_md = vault / "artefacts" / "memo" / "art-collision.md"
+        flat_md.write_text(
+            "---\nid: art-collision\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+            "title: t\nproduced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+            "  sources_cited:\n    - https://x.test\n---\nbody",
+            encoding="utf-8",
+        )
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-collision.md").write_text(
+            _project_artefact_md("20260507-test-aaaa", "collision", "20260507-test-aaaa"),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "artefact-uuid-collision" in r.stderr
+    print("  T23 PASS — uuid collision across tiers detected")
+
+
+def test_project_scoped_export_sidecar_project_id():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        body = proj / "artefacts" / "export" / "art-sheet.csv"
+        sidecar = proj / "artefacts" / "export" / "art-sheet.provenance.json"
+        body.write_text("a,b\n1,2\n", encoding="utf-8")
+        # Missing project_id
+        sidecar.write_text(json.dumps({
+            "session_id": "aaaaaaaa", "query": "x", "model": "m",
+            "sources_cited": ["https://x.test"],
+        }), encoding="utf-8")
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "artefact-missing-project-id" in r.stderr
+    print("  T24 PASS — project-scoped export sidecar requires project_id")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -367,4 +473,9 @@ if __name__ == "__main__":
     test_undated_format_section_grandfathered()
     test_last_verified_qualifies_as_date_marker()
     test_code_fence_examples_dont_trip_lint()
+    test_project_scoped_missing_project_id()
+    test_project_scoped_mismatched_project_id()
+    test_art_canonical_source_accepted()
+    test_uuid_collision_across_tiers()
+    test_project_scoped_export_sidecar_project_id()
     print("All lint-provenance tests passed.")
