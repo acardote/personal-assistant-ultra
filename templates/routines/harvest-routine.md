@@ -140,7 +140,7 @@ Per-source instructions (in this order):
   - `sort`: `timestamp` (NOT default `score` — `score` ranks DMs above channel posts and they fall off page 1)
   - `channel_types`: `public_channel,private_channel` (exclude DMs/group-DMs; DM scope tracked in #68)
   - Paginate via `cursor` until exhausted. Do NOT stop at page 1.
-- Additionally: search for threads carrying the user's `:pencil:` reaction (flag) regardless of channel.
+- Additionally: search for threads carrying the user's `:pencil:` reaction (flag) regardless of channel — apply the **same `sort=timestamp`, `channel_types=public_channel,private_channel`, full pagination** parameters as the activity-driven query above (the pencil branch uses the same `slack_search_public_and_private` tool and inherits the same default-sort bug if you skip these).
 - For each unique channel discovered, list threads since cutoff and call `slack_read_thread` per thread. Render each to `$VAULT/raw/slack_thread/<channel>-<thread_ts>.md`.
 - Compress each via `tools/compress.py --kind thread --source-kind slack_thread`.
 - Expected order of magnitude: tens of channels × multiple threads each = dozens of memory objects on a 30-day cold-start.
