@@ -160,6 +160,7 @@ These come from the parent #76 + this child's adversarial pass. They post-deploy
 ## References
 
 - Parent #76 — Capture knowledge + artefacts produced by agent work execution.
+- Per-kind editorial rules: [`docs/kb-editorial-rules.md`](../kb-editorial-rules.md) (child #81) — operationalizes the knowledge half of this ADR with deterministic kind selection, mechanical diff shape, and explicit actor model.
 - Memory object schema: `docs/schemas/memory-object.schema.json` (provenance pattern this ADR mirrors).
 - ADR-0001 — Storage backend (the layer split this ADR extends).
 - Issue #4 — Always-in-context layer-3 KB (the editorial discipline this ADR honors for autonomous producers).
