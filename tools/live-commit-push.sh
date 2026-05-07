@@ -21,6 +21,8 @@
 #       partial; user must reconcile. Stderr carries the underlying error.
 #   3 — push twice rejected (rebase-retry didn't resolve); local commits
 #       remain unpushed. Working tree is clean (rebase aborted on conflict).
+#   4 — provenance lint refused (per #85); nothing committed. Fix the
+#       malformed entry and retry.
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
@@ -43,6 +45,19 @@ cd "$CONTENT_ROOT"
 # stderr capture before grep classified the failure).
 ERR_FILE=$(mktemp -t live-push.XXXXXX)
 trap 'rm -f "$ERR_FILE"' EXIT
+
+# Provenance lint gate (per #85, B4 fixup): refuse to commit malformed
+# agent-produced KB / artefact entries. The lint lives next to this script
+# in <method_root>/tools/. Running --require-vault keeps method-only mode
+# from silently passing here. Failures are LOUD and abort.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+LINT="$SCRIPT_DIR/lint-provenance.py"
+if [[ -x "$LINT" ]]; then
+    if ! "$LINT" --require-vault >&2; then
+        echo "[live-commit-push] provenance lint refused — fix violations and retry" >&2
+        exit 4
+    fi
+fi
 
 # Stage memory/, .harvest/, kb/, artefacts/ — never raw/ (gitignored anyway,
 # but defensive). kb/ and artefacts/ added per #83 (work-execution procedure):

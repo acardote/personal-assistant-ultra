@@ -131,10 +131,10 @@ Once the user has the answer/draft visible in chat:
 
 1. **Propose** the diff(s) explicitly — show the file path, the proposed contents, and the `produced_by` provenance. For compound insights, propose ALL diffs together (one per kind) so the user sees the full set; explain that they can approve any subset.
 2. **Wait for explicit user approval.** "yes", "approve", "go", "land that" all count. Idle conversation, "ok", "thanks" do NOT count — when ambiguous, ask. Silent writes are forbidden by ADR-0003.
-3. **Write per-type, then commit + push**:
-   - **Artefact**: write to `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` (generate the UUID inline with `uuidgen` or Python's `uuid.uuid4()`). For exports, write the body file plus `<id>.provenance.json` sidecar in the same directory. Then run `tools/live-commit-push.sh <content_root> "art: <kind> <short-title>"` — re-uses #74's commit-push helper with rebase-retry.
-   - **Vault-scoped knowledge** (people / org / decision): apply the diff to the target file with the inline `<!-- produced_by: ... -->` comment per editorial rules. Then `tools/live-commit-push.sh <content_root> "kb: <kind> <heading-or-summary>"`.
-   - **Method-scoped knowledge** (glossary): open a PR against `acardote/personal-assistant-ultra` with the diff. Provenance lives in the PR description (NOT in `glossary.md`). The PR is the canonical record.
+3. **Write per-type, then lint, then commit + push**:
+   - **Artefact**: write to `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` (generate the UUID inline with `uuidgen` or Python's `uuid.uuid4()`). For exports, write the body file plus `<id>.provenance.json` sidecar in the same directory. Run `tools/lint-provenance.py --require-vault` before commit — it refuses malformed `produced_by` shape, missing sidecars, or non-canonical `sources_cited` entries. If the lint fails, fix the file and re-run; do not bypass. Then run `tools/live-commit-push.sh <content_root> "art: <kind> <short-title>"` — re-uses #74's commit-push helper with rebase-retry.
+   - **Vault-scoped knowledge** (people / org / decision): apply the diff to the target file with the inline `<!-- produced_by: ... -->` comment per editorial rules. Run `tools/lint-provenance.py --require-vault` before commit (catches missing-comment-on-post-ADR-heading + non-canonical sources). Then `tools/live-commit-push.sh <content_root> "kb: <kind> <heading-or-summary>"`.
+   - **Method-scoped knowledge** (glossary): open a PR against `acardote/personal-assistant-ultra` with the diff. Provenance lives in the PR description (NOT in `glossary.md`). The PR is the canonical record. CI runs `tools/lint-provenance.py --method-only` on glossary PRs to refuse accidental `<!-- produced_by -->` leakage.
 4. **Confirm to the user** which commits landed. Run `git -C <content_root> rev-parse HEAD` (the helper itself doesn't print the SHA) and paste the result, or the PR URL for the glossary path.
 
 ### Non-interactive producers
@@ -159,7 +159,7 @@ User has been chatting about live-call architecture. They say: *"draft a one-pag
   kind: memo
   ...
   produced_by:
-    session_id: EXAMPLE8           # current 8-hex from $PA_SESSION_ID
+    session_id: aaaaaaaa           # placeholder — replace with current 8-hex from $PA_SESSION_ID
     query: "draft a one-page memo capturing why we picked Option 2 for #51..."
     sources_cited:
       - kb#Live-call-orchestration-architecture
