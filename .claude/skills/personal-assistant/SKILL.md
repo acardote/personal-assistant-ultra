@@ -113,7 +113,7 @@ Apply the three-phase procedure below for any work-execution turn.
 
 Ground the work on KB + memory + (optionally) live calls — same retrieval as a question-answering query.
 
-**Skip the gather** when this turn is a continuation of an in-flight conversation that already loaded the relevant context (e.g., the user just asked a related question, you answered, now they ask for a draft based on the answer). Re-grounding burns 30+ seconds of latency to re-read the same memory you already have in the prompt. The skip rule: if the same `PA_SESSION_ID` has already emitted `kb_load_end` + `memory_retrieve_end` for an overlapping topic, do not re-emit — proceed directly to Phase 2 with the context already in hand.
+**Skip the gather** when this turn is a continuation of an in-flight conversation that already loaded the relevant context (e.g., the user just asked a related question, you answered, now they ask for a draft based on the answer). Re-grounding burns 30+ seconds of latency to re-read the same memory you already have in the prompt. The skip rule (concrete test): if the same `PA_SESSION_ID` already emitted `kb_load_end` + `memory_retrieve_end` AND the primary noun phrase from the current turn (proper nouns, project terms from glossary, issue refs) appears in either a previous turn's KB headings OR a memory id retrieved this session — proceed directly to Phase 2 with the context in hand. If neither overlaps, gather fresh.
 
 ### Phase 2 — Mid-execute capture (in-memory, not on disk)
 
@@ -135,7 +135,7 @@ Once the user has the answer/draft visible in chat:
    - **Artefact**: write to `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` (generate the UUID inline with `uuidgen` or Python's `uuid.uuid4()`). For exports, write the body file plus `<id>.provenance.json` sidecar in the same directory. Then run `tools/live-commit-push.sh <content_root> "art: <kind> <short-title>"` — re-uses #74's commit-push helper with rebase-retry.
    - **Vault-scoped knowledge** (people / org / decision): apply the diff to the target file with the inline `<!-- produced_by: ... -->` comment per editorial rules. Then `tools/live-commit-push.sh <content_root> "kb: <kind> <heading-or-summary>"`.
    - **Method-scoped knowledge** (glossary): open a PR against `acardote/personal-assistant-ultra` with the diff. Provenance lives in the PR description (NOT in `glossary.md`). The PR is the canonical record.
-4. **Confirm to the user** which commits landed (paste the SHAs or PR URL).
+4. **Confirm to the user** which commits landed. Run `git -C <content_root> rev-parse HEAD` (the helper itself doesn't print the SHA) and paste the result, or the PR URL for the glossary path.
 
 ### Non-interactive producers
 
@@ -146,26 +146,27 @@ The phases above assume an interactive Claude session with a human reviewing in 
   - Routines MAY produce **artefacts** of `kind=memo` (per ADR-0003 autonomous-producer carve-out) — the memo describes a candidate KB update WITHOUT proposing the diff. The next interactive session reads the memo and runs the full Phase 3 from there.
   - Routines MUST NOT update knowledge directly. No exceptions.
 - Phase 3 collapses for routines: they write the memo artefact to disk, run `tools/live-commit-push.sh` (no human gate), and surface the memo path in the daily digest. There is no "user approves" step because there is no synchronous user.
+- **Session id**: the activation contract's `PA_SESSION_ID` bootstrap is interactive-only. Routines mint their own at routine start (`export PA_SESSION_ID=$(openssl rand -hex 4)` in the routine prompt) so the artefact's `produced_by.session_id` is non-empty.
 
 ### Worked example
 
 User has been chatting about live-call architecture. They say: *"draft a one-page memo capturing why we picked Option 2 for #51, suitable for sharing with the eng team."*
 
 - **Phase 1**: skip — the same session has already retrieved memory about #51 in earlier turns. Context is loaded.
-- **Phase 2**: kind = `artefact / memo` (primary). No secondary diffs — the memo describes a decision but the decision was already captured to `<content_root>/kb/decisions.md` earlier in the session, so this isn't a NEW decision update; the memo is a sharing artefact about an existing decision. Sources cited: the existing decisions.md heading, issue #51, the issue body. Draft the memo body in chat with proposed frontmatter:
+- **Phase 2**: kind = `artefact / memo` (primary). No secondary diffs — the memo describes a decision but the decision was already captured to `<content_root>/kb/decisions.md` earlier in the session, so this isn't a NEW decision update; the memo is a sharing artefact about an existing decision. Sources cited: the existing decisions.md heading, issue #51, the issue body. Draft the memo body in chat with proposed frontmatter (placeholders shown — generate real values at write time, never reuse these strings verbatim):
   ```yaml
-  id: art-<uuid-generated-now>
+  id: art-EXAMPLE-uuid-here       # generate fresh: uuidgen / uuid.uuid4()
   kind: memo
   ...
   produced_by:
-    session_id: <current 8-hex>
+    session_id: EXAMPLE8           # current 8-hex from $PA_SESSION_ID
     query: "draft a one-page memo capturing why we picked Option 2 for #51..."
     sources_cited:
       - kb#Live-call-orchestration-architecture
       - https://github.com/acardote/personal-assistant-ultra/issues/51
   title: Why we picked Option 2 for live-call orchestration
   ```
-- **Phase 3**: propose the file path + body in chat. User reviews, says "approve." Skill writes to `<content_root>/artefacts/memo/art-<uuid>.md`, runs `tools/live-commit-push.sh <content_root> "art: memo on live-call architecture choice"`, surfaces the commit SHA.
+- **Phase 3**: propose the file path + body in chat. User reviews, says "approve." Skill writes to `<content_root>/artefacts/memo/art-<uuid>.md`, runs `tools/live-commit-push.sh <content_root> "art: memo on live-call architecture choice"`, then runs `git -C <content_root> rev-parse HEAD` and surfaces that SHA to the user.
 
 In this example there are no secondary diffs because the decision already existed in `<content_root>/kb/decisions.md`. A counter-example with secondaries is in [editorial rules](../../../docs/kb-editorial-rules.md).
 
@@ -310,6 +311,8 @@ The first scheduled harvest after install is a 30-day backfill. The wrapper at `
 
 #39-A emits the signal; #39-B implements the live-call adapters. The skill is the live-call orchestrator (per the architecture decision on #51): when `route.py --json` returns `gap_detected: true`, the skill makes the live MCP call, captures the result via `tools/live-result-write.py`, and folds the findings into the answer. Live calls are sequential (not parallel) and per-source.
 
+If the user's question requires *producing* something (a memo, draft, plan, analysis, KB update) — not just answering from gathered context — also follow the [Work execution procedure](#work-execution-procedure-per-adr-0003-editorial-rules) above. Live findings count as `sources_cited` in the artefact's frontmatter.
+
 ### Live-call procedure (Granola — #39-B.1)
 
 When you'd otherwise answer a question and the gap signal points at meetings / weekly-sync content:
@@ -409,6 +412,8 @@ For operator tasks that don't need the full skill activation contract (no KB loa
 - `/personal-assistant live-writeback [--source <kind>|--dry-run]` — fold accumulated live findings into memory after a live-call-heavy session.
 
 The slash command is operator-task-shaped: it doesn't run the freshness pre-flight check before dispatch (re-running freshness-check on every dashboard refresh is noise). For free-form questions and exploratory work, address the skill directly via prose — that path runs the full activation contract.
+
+A future operator-task entry that *produces content* (e.g., `/personal-assistant draft …`) MUST go through the [Work execution procedure](#work-execution-procedure-per-adr-0003-editorial-rules) for write-back — operator tasks don't bypass the diff-and-approve floor.
 
 Empty / unknown subcommands list the valid set rather than silently falling through to skill activation, so typos surface as typos.
 

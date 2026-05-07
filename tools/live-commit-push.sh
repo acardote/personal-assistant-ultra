@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Commit + push memory/ from <content_root> with rebase-retry on non-fast-forward.
+# Commit + push vault changes (memory/, .harvest/, kb/, artefacts/) from
+# <content_root> with rebase-retry on non-fast-forward.
 #
 # Per #74: per-query live-writeback writes new memory objects locally; this
 # script commits + pushes them so the vault stays the single source of truth
 # across machines. On non-fast-forward rejection (another machine pushed
 # between our pull and push), retries once with `git pull --rebase`.
+#
+# Per #83: also stages kb/ + artefacts/ so the same helper covers the
+# work-execution procedure's Phase 3 write-back path (KB updates and
+# artefact files).
 #
 # Usage:
 #   tools/live-commit-push.sh <content_root> "<commit-message>"
@@ -39,10 +44,18 @@ cd "$CONTENT_ROOT"
 ERR_FILE=$(mktemp -t live-push.XXXXXX)
 trap 'rm -f "$ERR_FILE"' EXIT
 
-# Stage memory/ and .harvest/ — never raw/ (gitignored anyway, but defensive).
-# Use `|| true` because git add returns non-zero only on real errors, not
-# on "nothing to add"; we tolerate "nothing matched" silently.
-git add memory/ .harvest/ 2>/dev/null || true
+# Stage memory/, .harvest/, kb/, artefacts/ — never raw/ (gitignored anyway,
+# but defensive). kb/ and artefacts/ added per #83 (work-execution procedure):
+# Phase 3 write-back uses this helper for KB diffs and artefact files; without
+# them in the stage list the helper exits 0 silently with nothing committed.
+#
+# Stage each path individually because `git add a b c` aborts on the FIRST
+# nonexistent path and skips the rest (smoke-tested 2026-05-07 — passing
+# .harvest/ when it doesn't exist made artefacts/ never reach the index).
+# Per-path `|| true` tolerates nonexistent paths silently.
+for path in memory/ .harvest/ kb/ artefacts/; do
+    [[ -e "$path" ]] && git add "$path" 2>/dev/null || true
+done
 
 # Skip if nothing to commit. The `if` context disables set -e for the test,
 # so this is the safe way to branch on commit-cleanliness.
