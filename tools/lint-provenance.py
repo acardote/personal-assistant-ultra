@@ -64,8 +64,19 @@ CANONICAL_SOURCE_RE = re.compile(
 # `## <heading>` capture (ATX-style only; KB files don't use Setext).
 H2_RE = re.compile(r"^##\s+(?P<title>\S.*?)\s*$", re.MULTILINE)
 
-# `**Date:** YYYY-MM-DD` with optional trailing punctuation/text.
-DATE_RE = re.compile(r"^\s*[-*]?\s*\*\*Date:\*\*\s*(?P<date>\d{4}-\d{2}-\d{2})", re.MULTILINE)
+# Date markers across the three KB files: decisions.md uses `**Date:**`; people.md
+# / org.md use `**Last verified:**`. Either qualifies as the date for grandfathering.
+DATE_RE = re.compile(
+    r"^\s*[-*]?\s*\*\*(?:Date|Last verified|Created|Verified):\*\*\s*(?P<date>\d{4}-\d{2}-\d{2})",
+    re.MULTILINE,
+)
+
+# Entry-indicator: a section is an "entry" (vs format docs / schema) iff its
+# body has at least one bullet of the shape `- **<field>:**`. Catches the
+# F1 failure mode where an agent adds a new heading but forgets the date
+# marker — the section still looks like an entry, so it can't slip past
+# grandfathering by being undated.
+ENTRY_BULLET_RE = re.compile(r"^\s*-\s+\*\*[A-Z][\w\s/-]*:\*\*", re.MULTILINE)
 
 # 8 lowercase hex chars per ADR-0003 session_id format.
 SESSION_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -195,8 +206,42 @@ def check_method_glossary(method_root: Path) -> list[Violation]:
     return out
 
 
+def _strip_code_fences(text: str) -> str:
+    """Replace text inside fenced code blocks with blank lines so heading /
+    bullet regexes don't match against schema examples documented inside them.
+    The line count stays correct so line_of() still reports right line numbers.
+    Recognizes triple-backtick and triple-tilde fences (no info-string parsing
+    — only fence detection). Indented code blocks are not stripped (rare in
+    KB files; over-engineering would be premature)."""
+    out: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append("")  # the fence opener line itself isn't markdown content
+            continue
+        if in_fence and stripped.startswith(fence_marker):
+            in_fence = False
+            fence_marker = ""
+            out.append("")
+            continue
+        if in_fence:
+            out.append("")  # blank line preserves the line count
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def split_kb_sections(text: str) -> list[tuple[str, int, str]]:
-    """Return list of (heading_title, heading_line_no, section_body)."""
+    """Return list of (heading_title, heading_line_no, section_body).
+
+    Strips fenced code blocks so format-template examples documented inside
+    backticks (e.g., the `## <Decision title>` schema example in decisions.md)
+    don't get treated as real headings."""
+    text = _strip_code_fences(text)
     matches = list(H2_RE.finditer(text))
     sections: list[tuple[str, int, str]] = []
     for i, m in enumerate(matches):
@@ -225,7 +270,9 @@ def check_vault_kb(content_root: Path) -> list[Violation]:
             date_match = DATE_RE.search(body)
             entry_date = date_match.group("date") if date_match else None
             comment_match = PRODUCED_BY_RE.search(body)
+            looks_like_entry = bool(ENTRY_BULLET_RE.search(body))
 
+            # F1 closer: post-acceptance dated entry without provenance.
             if entry_date and entry_date >= ADR_ACCEPTANCE_DATE and not comment_match:
                 out.append(Violation(
                     path=path,
@@ -238,11 +285,28 @@ def check_vault_kb(content_root: Path) -> list[Violation]:
                     ),
                 ))
 
+            # F1 closer (B1 fixup): undated *entry* sections — body has bullet
+            # fields like `- **Role:**` — can't slip through grandfathering. If
+            # there is no date marker but the section is shaped like an entry,
+            # require provenance regardless. Format/schema sections (no bullet
+            # fields) stay grandfathered.
+            if not entry_date and looks_like_entry and not comment_match:
+                out.append(Violation(
+                    path=path,
+                    line=line,
+                    kind="kb-missing-produced-by",
+                    message=(
+                        f"heading '## {title}' has entry-shape body (bullet fields) "
+                        f"but no date marker (`**Date:**` / `**Last verified:**`) "
+                        f"AND no <!-- produced_by: ... --> — cannot be grandfathered"
+                    ),
+                ))
+
             if comment_match:
                 ctx = f"heading '## {title}'"
                 ok, errors = validate_produced_by_comment(comment_match.group("body"), ctx=ctx)
                 if not ok:
-                    body_line_offset = line_of(text, sections[0][1] + body.find(comment_match.group(0))) if False else line + body[:comment_match.start()].count("\n")
+                    body_line_offset = line + body[:comment_match.start()].count("\n")
                     for err in errors:
                         out.append(Violation(
                             path=path,

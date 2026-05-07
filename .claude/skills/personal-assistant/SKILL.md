@@ -159,7 +159,7 @@ User has been chatting about live-call architecture. They say: *"draft a one-pag
   kind: memo
   ...
   produced_by:
-    session_id: EXAMPLE8           # current 8-hex from $PA_SESSION_ID
+    session_id: aaaaaaaa           # placeholder — replace with current 8-hex from $PA_SESSION_ID
     query: "draft a one-page memo capturing why we picked Option 2 for #51..."
     sources_cited:
       - kb#Live-call-orchestration-architecture

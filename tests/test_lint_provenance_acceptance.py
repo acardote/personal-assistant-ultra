@@ -21,6 +21,10 @@ Tests:
   T13 — produced_by with malformed session id exits 1.
   T14 — KB section with no Date line is grandfathered (no produced_by required).
   T15 — produced_by with all required fields and canonical sources exits 0.
+  T16 — undated heading with entry-shape body (bullet **field:**) requires produced_by.
+  T17 — undated heading without entry shape (format docs) is grandfathered.
+  T18 — `**Last verified:**` qualifies as a date marker for grandfathering.
+  T19 — schema/format examples inside fenced code blocks don't trip heading detection.
 """
 
 from __future__ import annotations
@@ -272,6 +276,76 @@ def test_well_formed_produced_by_passes():
     print("  T15 PASS — well-formed produced_by passes")
 
 
+def test_undated_entry_shape_requires_produced_by():
+    """B1 fixup: people.md / org.md don't use `**Date:**`; an undated entry
+    section can't slip past grandfathering by lacking a date marker."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "kb" / "people.md").write_text(
+            "# People\n\n## Jane Doe\n- **Role / relation:** Engineer\n- **Source:** manual\n\nbody.\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1, f"expected 1 (entry shape without produced_by), got {r.returncode}\n{r.stderr}"
+        assert "entry-shape body" in r.stderr or "kb-missing-produced-by" in r.stderr
+    print("  T16 PASS — undated entry-shape body requires produced_by")
+
+
+def test_undated_format_section_grandfathered():
+    """Format/schema sections (no bullet **field:** lines) stay grandfathered
+    regardless of date — they're documentation, not entries."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "kb" / "people.md").write_text(
+            "# People\n\n## Format\n\nEach entry follows the format below. See template.\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"format section should be grandfathered\n{r.stderr}"
+    print("  T17 PASS — format section is grandfathered")
+
+
+def test_last_verified_qualifies_as_date_marker():
+    """people.md / org.md use `**Last verified:**` instead of `**Date:**` —
+    must qualify as the date marker for grandfathering decisions."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "kb" / "people.md").write_text(
+            "# People\n\n## Pre-existing\n- **Role / relation:** Engineer\n"
+            "- **Last verified:** 2026-04-01\n- **Source:** manual\n\nbody.\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"pre-ADR Last-verified should be grandfathered\n{r.stderr}"
+        # Now flip to post-ADR — same field — should NOW require produced_by.
+        (vault / "kb" / "people.md").write_text(
+            "# People\n\n## New\n- **Role / relation:** PM\n"
+            "- **Last verified:** 2026-06-01\n- **Source:** manual\n\nbody.\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "kb-missing-produced-by" in r.stderr
+    print("  T18 PASS — `**Last verified:**` qualifies as date marker")
+
+
+def test_code_fence_examples_dont_trip_lint():
+    """The KB files document their entry schema inside fenced code blocks.
+    Those `## <Title>` + `- **Field:**` examples must NOT be treated as real
+    entries — they're documentation."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "kb" / "decisions.md").write_text(
+            "# Decisions\n\nEach entry follows the format:\n\n"
+            "```\n## <Decision title>\n- **Date:** <YYYY-MM-DD>\n- **Status:** decided\n```\n\n"
+            "Real content below — none yet.\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"code-fence examples should be ignored\n{r.stderr}"
+    print("  T19 PASS — fenced code examples ignored")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -289,4 +363,8 @@ if __name__ == "__main__":
     test_malformed_session_id_fails()
     test_kb_section_without_date_grandfathered()
     test_well_formed_produced_by_passes()
+    test_undated_entry_shape_requires_produced_by()
+    test_undated_format_section_grandfathered()
+    test_last_verified_qualifies_as_date_marker()
+    test_code_fence_examples_dont_trip_lint()
     print("All lint-provenance tests passed.")
