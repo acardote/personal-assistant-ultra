@@ -52,11 +52,12 @@ PRODUCED_BY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Canonical source forms per ADR-0003.
+# Canonical source forms per ADR-0003 (with art:// added in Amendment 1).
 CANONICAL_SOURCE_RE = re.compile(
     r"^(?:"
     r"kb#[\w\-]+"                      # kb#heading-slug
     r"|mem://[\w\-]+"                  # mem://<memory-id>
+    r"|art://[\w\-]+"                  # art://<art-uuid> (per Amendment 1)
     r"|https?://\S+"                   # bare URL
     r")$"
 )
@@ -422,8 +423,12 @@ def _parse_simple_yaml(text: str) -> dict | None:
     return out
 
 
-def check_artefact_md(path: Path) -> list[Violation]:
-    """Markdown artefact: must have YAML frontmatter with required produced_by."""
+def check_artefact_md(path: Path, *, expected_project_id: str | None = None) -> list[Violation]:
+    """Markdown artefact: must have YAML frontmatter with required produced_by.
+
+    `expected_project_id` is set when the artefact lives under
+    `<content_root>/projects/<slug>/artefacts/...` — frontmatter `project_id`
+    must equal `<slug>`. Flat artefacts pass `None` and skip the check."""
     out: list[Violation] = []
     text = path.read_text(encoding="utf-8")
     fm = parse_yaml_frontmatter(text)
@@ -451,6 +456,28 @@ def check_artefact_md(path: Path) -> list[Violation]:
             kind="artefact-invalid-kind",
             message=f"kind must be one of {sorted(VALID_KINDS)} (got {kind!r})",
         ))
+
+    # Project-id check (Amendment 1).
+    if expected_project_id is not None:
+        actual = fm.get("project_id")
+        if actual is None or actual == "":
+            out.append(Violation(
+                path=path,
+                line=1,
+                kind="artefact-missing-project-id",
+                message=f"project-scoped artefact missing project_id (expected {expected_project_id!r})",
+            ))
+        elif actual != expected_project_id:
+            out.append(Violation(
+                path=path,
+                line=1,
+                kind="artefact-project-id-mismatch",
+                message=(
+                    f"project_id={actual!r} doesn't match parent project "
+                    f"directory {expected_project_id!r}"
+                ),
+            ))
+
     pb = fm.get("produced_by")
     if not isinstance(pb, dict):
         out.append(Violation(
@@ -492,13 +519,13 @@ def _validate_produced_by_dict(path: Path, pb: dict) -> list[Violation]:
                     kind="artefact-non-canonical-source",
                     message=(
                         f"sources_cited entry {src!r} not canonical "
-                        f"(need kb#heading | mem://<id> | https://...)"
+                        f"(need kb#heading | mem://<id> | art://<id> | https://...)"
                     ),
                 ))
     return out
 
 
-def check_artefact_export(path: Path) -> list[Violation]:
+def check_artefact_export(path: Path, *, expected_project_id: str | None = None) -> list[Violation]:
     """Non-text artefact: must have sibling `<id>.provenance.json` with produced_by."""
     sidecar = path.with_suffix(".provenance.json")
     if not sidecar.is_file():
@@ -524,12 +551,36 @@ def check_artefact_export(path: Path) -> list[Violation]:
             kind="export-sidecar-malformed",
             message="sidecar root must be a JSON object",
         )]
-    return _validate_produced_by_dict(sidecar, data)
 
-
-def check_vault_artefacts(content_root: Path) -> list[Violation]:
     out: list[Violation] = []
-    art_dir = content_root / "artefacts"
+    if expected_project_id is not None:
+        actual = data.get("project_id")
+        if actual is None or actual == "":
+            out.append(Violation(
+                path=sidecar,
+                line=None,
+                kind="artefact-missing-project-id",
+                message=f"project-scoped export sidecar missing project_id (expected {expected_project_id!r})",
+            ))
+        elif actual != expected_project_id:
+            out.append(Violation(
+                path=sidecar,
+                line=None,
+                kind="artefact-project-id-mismatch",
+                message=(
+                    f"project_id={actual!r} doesn't match parent project "
+                    f"directory {expected_project_id!r}"
+                ),
+            ))
+    out.extend(_validate_produced_by_dict(sidecar, data))
+    return out
+
+
+def _walk_artefact_tree(art_dir: Path, *, expected_project_id: str | None) -> list[Violation]:
+    """Walk artefacts/<kind>/art-* and dispatch each file to the right checker.
+    Returns also a dict-of-uuid-to-paths via the sentinel uuid_index parameter
+    to enable cross-tier duplicate detection at the caller level."""
+    out: list[Violation] = []
     if not art_dir.is_dir():
         return out
     for kind_dir in sorted(art_dir.iterdir()):
@@ -542,15 +593,81 @@ def check_vault_artefacts(content_root: Path) -> list[Violation]:
             if not path.is_file():
                 continue
             name = path.name
-            # Skip non-art files (.gitkeep, README, etc.) and sidecars (validated alongside).
             if not name.startswith("art-"):
                 continue
             if name.endswith(".provenance.json"):
                 continue
             if kind == "export":
-                out.extend(check_artefact_export(path))
+                out.extend(check_artefact_export(path, expected_project_id=expected_project_id))
             elif name.endswith(".md"):
-                out.extend(check_artefact_md(path))
+                out.extend(check_artefact_md(path, expected_project_id=expected_project_id))
+    return out
+
+
+def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
+    """Map art-uuid → list of body file paths under this artefacts/ root.
+    Used by check_vault_artefacts to detect cross-tier id collisions
+    (Amendment 1 invariant: each art-<uuid> resolves to exactly one file)."""
+    index: dict[str, list[Path]] = {}
+    if not art_dir.is_dir():
+        return index
+    for kind_dir in art_dir.iterdir():
+        if not kind_dir.is_dir() or kind_dir.name not in VALID_KINDS:
+            continue
+        for path in kind_dir.iterdir():
+            if not path.is_file():
+                continue
+            name = path.name
+            if not name.startswith("art-") or name.endswith(".provenance.json"):
+                continue
+            # Strip "art-" and the file extension to get the uuid.
+            stem = path.stem  # filename without final extension
+            if not stem.startswith("art-"):
+                continue
+            art_uuid = stem[len("art-"):]
+            index.setdefault(art_uuid, []).append(path)
+    return index
+
+
+def check_vault_artefacts(content_root: Path) -> list[Violation]:
+    out: list[Violation] = []
+
+    # Flat tier
+    flat_root = content_root / "artefacts"
+    out.extend(_walk_artefact_tree(flat_root, expected_project_id=None))
+
+    # Project tier
+    projects_root = content_root / "projects"
+    project_uuid_indices: dict[str, dict[str, list[Path]]] = {}
+    if projects_root.is_dir():
+        for proj_dir in sorted(projects_root.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            slug = proj_dir.name
+            if slug.startswith("."):
+                continue  # .template/ etc.
+            art_root = proj_dir / "artefacts"
+            out.extend(_walk_artefact_tree(art_root, expected_project_id=slug))
+            project_uuid_indices[slug] = _collect_artefact_uuids(art_root)
+
+    # Cross-tier duplicate-uuid invariant (Amendment 1).
+    flat_uuids = _collect_artefact_uuids(flat_root)
+    all_uuids: dict[str, list[Path]] = {k: list(v) for k, v in flat_uuids.items()}
+    for slug_index in project_uuid_indices.values():
+        for uid, paths in slug_index.items():
+            all_uuids.setdefault(uid, []).extend(paths)
+    for uid, paths in all_uuids.items():
+        if len(paths) > 1:
+            out.append(Violation(
+                path=paths[0],
+                line=None,
+                kind="artefact-uuid-collision",
+                message=(
+                    f"art://{uid} resolves to {len(paths)} files — invariant violation "
+                    f"per ADR-0003 Amendment 1. Files: {[str(p.relative_to(content_root)) for p in paths]}"
+                ),
+            ))
+
     return out
 
 
