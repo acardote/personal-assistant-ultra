@@ -83,7 +83,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
 from _metrics import emit, inherit_or_start  # noqa: E402
 
-VALID_SOURCES = {"granola_note", "slack_thread", "gmail_thread"}
+VALID_SOURCES = {"granola_note", "slack_thread", "slack_dm", "gmail_thread"}
 QUERY_HASH_LEN = 8
 
 # Cap a single live-fetched body. Slack threads in particular can run 50+
