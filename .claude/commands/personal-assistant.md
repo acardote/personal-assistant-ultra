@@ -53,6 +53,7 @@ Parse the SECOND whitespace-separated token of `$ARGUMENTS` as the project subco
 | `copy-artefact <art-uuid> <dest-slug>` | `tools/project.py copy-artefact <uuid> <dest>` | Copies (fresh id, derived_from). Then commit-push. |
 | `clear` | `tools/project.py clear` | Removes the active-project state file. |
 | `status` | `tools/project.py status` | Prints active slug + age + frontmatter scalars. If age > 4h, the tool flags STALE — surface that to the user. |
+| `touch <slug>` | `tools/project.py touch <slug>` | Updates `last_active` on the project's frontmatter using the surgical updater (preserves nested blocks). Used by the SKILL's Phase 3 after a project-scoped write. |
 
 **Active-project state**: lives at `<content_root>/.pa-active-project.json`. The 4-hour staleness threshold (per ADR-0003 Amendment 1) means: if `status` reports STALE, treat the slug as cleared and prompt the user to explicitly `project resume <slug>` if they want to continue. Do NOT silently inherit a stale project's context.
 

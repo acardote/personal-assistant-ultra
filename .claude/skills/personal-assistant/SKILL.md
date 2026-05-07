@@ -94,6 +94,22 @@ If the check exits 0 silently, proceed with the user's request — the harvest i
 
 **Honest scope note**: this check fires *only* when the user invokes the skill. It does not provide a true 26h SLA on detection — the detection window is bounded by user invocation cadence, not by the threshold. Out-of-band alerting (Slack self-DM from the harvest itself, daily-digest entry consumed by another surface) is tracked separately as follow-up work to fully close F1.
 
+### Active project check (per [ADR-0003 Amendment 1](../../../docs/adr/0003-agent-output-taxonomy.md#amendment-1--project-tier-2026-05-07))
+
+After the freshness check, run:
+
+```
+tools/project.py status
+```
+
+Three outcomes:
+
+- **`no project active`** — proceed normally. Phase 3 of the work-execution procedure (below) produces flat artefacts at `<content_root>/artefacts/<kind>/`.
+- **`active: <slug>` with `age: <h>h`** AND no `STALE` substring on the `age:` line — load the project's context. Run `tools/project.py resume <slug>` to print `project.md` + manifest + `notes.md` and read it into your working context. Phase 3 routes artefacts under `<content_root>/projects/<slug>/artefacts/<kind>/`. Remember `PA_PROJECT_ID=<slug>` and prepend `export PA_PROJECT_ID=<slug> &&` to every Bash call that touches `tools/lint-provenance.py`, `tools/live-commit-push.sh`, or any artefact path under the vault — those are the consumers that read it.
+- **`age: <h>h (STALE — re-resume to confirm)`** (substring `STALE` present on the age line; >4h) — surface to the user verbatim: *"Previous active project `<slug>` from `<age>h` ago. Run `/personal-assistant project resume <slug>` to continue, or `/personal-assistant project clear` to start fresh."* Proceed in flat-artefact mode until the user disambiguates. Do NOT silently inherit the stale project — that's the F6 bleed the staleness rule is designed to prevent.
+
+If the project's context is loaded into your working memory, you have the full project body + recent artefacts available for the rest of this turn. Resume budget is intentionally uncapped (per ADR-0003 Amendment 1) — partial loads yield lossy continuation.
+
 ## Editorial discipline
 
 - **Never invent KB entries.** If the user asks about something that isn't in the KB and isn't derivable from layer-2 memory objects (when retrieval lands), say so explicitly. Hallucinated grounding is the failure mode that poisons every downstream consumer (see falsifier F2 on issue #3 / #4).
@@ -132,7 +148,10 @@ Once the user has the answer/draft visible in chat:
 1. **Propose** the diff(s) explicitly — show the file path, the proposed contents, and the `produced_by` provenance. For compound insights, propose ALL diffs together (one per kind) so the user sees the full set; explain that they can approve any subset.
 2. **Wait for explicit user approval.** "yes", "approve", "go", "land that" all count. Idle conversation, "ok", "thanks" do NOT count — when ambiguous, ask. Silent writes are forbidden by ADR-0003.
 3. **Write per-type, then lint, then commit + push**:
-   - **Artefact**: write to `<content_root>/artefacts/<kind>/art-<uuid>.<ext>` (generate the UUID inline with `uuidgen` or Python's `uuid.uuid4()`). For exports, write the body file plus `<id>.provenance.json` sidecar in the same directory. Run `tools/lint-provenance.py --require-vault` before commit — it refuses malformed `produced_by` shape, missing sidecars, or non-canonical `sources_cited` entries. If the lint fails, fix the file and re-run; do not bypass. Then run `tools/live-commit-push.sh <content_root> "art: <kind> <short-title>"` — re-uses #74's commit-push helper with rebase-retry.
+   - **Artefact**: target depends on whether a project is active (per the activation contract's project check above):
+     - **Project-active path** (`PA_PROJECT_ID=<slug>` set): write to `<content_root>/projects/<slug>/artefacts/<kind>/art-<uuid>.<ext>`. Frontmatter MUST include `project_id: <slug>` (per ADR-0003 Amendment 1). Touch `last_active` on `project.md` via `tools/project.py touch <slug>` — the helper does a surgical frontmatter update that preserves nested `produced_by` blocks. **Do NOT hand-rewrite `last_active`** — that's a known vector for nested-block destruction. Update `notes.md` only when the artefact represents NEW project state (a new draft section, a fresh decision, an analysis result the user will act on). Skip on pure re-renders (typo fix, formatting). When you do update, append a dated bullet to `## What's next` saying what's outstanding, not what was done.
+     - **Flat path** (no active project): write to `<content_root>/artefacts/<kind>/art-<uuid>.<ext>`. No `project_id` field.
+     - For exports (both paths), write the body file plus `<id>.provenance.json` sidecar in the same directory. Run `tools/lint-provenance.py --require-vault` before commit — it refuses malformed `produced_by` shape, missing sidecars, or non-canonical `sources_cited` entries. If the lint fails, fix the file and re-run; do not bypass. Then run `tools/live-commit-push.sh <content_root> "art: <kind> <short-title>"` — re-uses #74's commit-push helper with rebase-retry.
    - **Vault-scoped knowledge** (people / org / decision): apply the diff to the target file with the inline `<!-- produced_by: ... -->` comment per editorial rules. Run `tools/lint-provenance.py --require-vault` before commit (catches missing-comment-on-post-ADR-heading + non-canonical sources). Then `tools/live-commit-push.sh <content_root> "kb: <kind> <heading-or-summary>"`.
    - **Method-scoped knowledge** (glossary): open a PR against `acardote/personal-assistant-ultra` with the diff. Provenance lives in the PR description (NOT in `glossary.md`). The PR is the canonical record. CI runs `tools/lint-provenance.py --method-only` on glossary PRs to refuse accidental `<!-- produced_by -->` leakage.
 4. **Confirm to the user** which commits landed. Run `git -C <content_root> rev-parse HEAD` (the helper itself doesn't print the SHA) and paste the result, or the PR URL for the glossary path.
@@ -148,9 +167,9 @@ The phases above assume an interactive Claude session with a human reviewing in 
 - Phase 3 collapses for routines: they write the memo artefact to disk, run `tools/live-commit-push.sh` (no human gate), and surface the memo path in the daily digest. There is no "user approves" step because there is no synchronous user.
 - **Session id**: the activation contract's `PA_SESSION_ID` bootstrap is interactive-only. Routines mint their own at routine start (`export PA_SESSION_ID=$(openssl rand -hex 4)` in the routine prompt) so the artefact's `produced_by.session_id` is non-empty.
 
-### Worked example
+### Worked example — flat (no project active)
 
-User has been chatting about live-call architecture. They say: *"draft a one-page memo capturing why we picked Option 2 for #51, suitable for sharing with the eng team."*
+User has been chatting about live-call architecture. They say: *"draft a one-page memo capturing why we picked Option 2 for #51, suitable for sharing with the eng team."* No project is active (`tools/project.py status` printed `no project active`).
 
 - **Phase 1**: skip — the same session has already retrieved memory about #51 in earlier turns. Context is loaded.
 - **Phase 2**: kind = `artefact / memo` (primary). No secondary diffs — the memo describes a decision but the decision was already captured to `<content_root>/kb/decisions.md` earlier in the session, so this isn't a NEW decision update; the memo is a sharing artefact about an existing decision. Sources cited: the existing decisions.md heading, issue #51, the issue body. Draft the memo body in chat with proposed frontmatter (placeholders shown — generate real values at write time, never reuse these strings verbatim):
@@ -169,6 +188,16 @@ User has been chatting about live-call architecture. They say: *"draft a one-pag
 - **Phase 3**: propose the file path + body in chat. User reviews, says "approve." Skill writes to `<content_root>/artefacts/memo/art-<uuid>.md`, runs `tools/live-commit-push.sh <content_root> "art: memo on live-call architecture choice"`, then runs `git -C <content_root> rev-parse HEAD` and surfaces that SHA to the user.
 
 In this example there are no secondary diffs because the decision already existed in `<content_root>/kb/decisions.md`. A counter-example with secondaries is in [editorial rules](../../../docs/kb-editorial-rules.md).
+
+### Worked example — project active
+
+Earlier in the session the user ran `/personal-assistant project resume 20260507-q3-strategy-doc-a91f`. The activation contract's project check loaded `project.md` + `notes.md` into context. Now they say: *"draft the section on competitive positioning."*
+
+- **Phase 1**: skip — project context is in working memory from the resume.
+- **Phase 2**: kind = `artefact / draft` (primary, scoped to the active project). Secondary: none (project-local drafting doesn't update KB). Sources cited: relevant project sources from `project.md`'s `## Sources`, plus any `mem://` entries the draft draws from. Frontmatter must carry `project_id: 20260507-q3-strategy-doc-a91f`.
+- **Phase 3** (diff-and-approve flow per Phase 3 above): propose path `<content_root>/projects/20260507-q3-strategy-doc-a91f/artefacts/draft/art-<uuid>.md`. User approves. Skill writes the file, runs `tools/project.py touch 20260507-q3-strategy-doc-a91f` to update `last_active`, appends a dated bullet to `notes.md`'s `## What's next` ("competitive positioning needs board review"), runs `tools/lint-provenance.py --require-vault` then `tools/live-commit-push.sh <content_root> "art: draft competitive-positioning in 20260507-q3-strategy-doc-a91f"`, surfaces the SHA.
+
+Cross-project artefact reuse is also command-driven, not LLM-judgment-driven: if the user wants to copy this draft into another project, they invoke `/personal-assistant project copy-artefact <art-uuid> <other-slug>` — the skill doesn't auto-decide to copy.
 
 ## How to extend the KB
 
