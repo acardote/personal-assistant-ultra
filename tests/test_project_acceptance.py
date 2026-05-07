@@ -312,6 +312,83 @@ def test_touch_preserves_nested_frontmatter():
     print("  T13 PASS — touch preserves nested frontmatter")
 
 
+def test_sweep_lists_stale_projects():
+    """Project last_active >30d ago is listed; under threshold is not."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+
+        # Make two projects with hand-crafted last_active dates.
+        old = vault / "projects" / "20260101-old-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-old-aaaa\ntitle: stale-project\n"
+            "status: active\nstarted_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        recent = vault / "projects" / "20260507-recent-bbbb"
+        recent.mkdir()
+        (recent / "project.md").write_text(
+            "---\nid: 20260507-recent-bbbb\ntitle: recent-project\n"
+            "status: active\nstarted_at: 2026-05-07\nlast_active: 2026-05-07\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep")
+        assert "20260101-old-aaaa" in r.stdout
+        assert "20260507-recent-bbbb" not in r.stdout
+    print("  T14 PASS — sweep lists only stale active projects")
+
+
+def test_sweep_skips_archived():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        old = vault / "projects" / "20260101-archived-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-archived-aaaa\ntitle: arch\n"
+            "status: archived\narchived_at: 2026-02-01\n"
+            "started_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep")
+        assert "20260101-archived-aaaa" not in r.stdout
+    print("  T15 PASS — sweep skips archived projects")
+
+
+def test_sweep_does_not_mutate():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        old = vault / "projects" / "20260101-old-aaaa"
+        old.mkdir()
+        path = old / "project.md"
+        original = (
+            "---\nid: 20260101-old-aaaa\ntitle: t\nstatus: active\n"
+            "started_at: 2026-01-01\nlast_active: 2026-01-01\n---\n"
+        )
+        path.write_text(original, encoding="utf-8")
+        run(method, "sweep")
+        assert path.read_text(encoding="utf-8") == original, "sweep must not mutate any file"
+    print("  T16 PASS — sweep does not mutate any file")
+
+
+def test_sweep_json_mode():
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        old = vault / "projects" / "20260101-old-aaaa"
+        old.mkdir()
+        (old / "project.md").write_text(
+            "---\nid: 20260101-old-aaaa\ntitle: t\nstatus: active\n"
+            "started_at: 2026-01-01\nlast_active: 2026-01-01\n---\n",
+            encoding="utf-8",
+        )
+        r = run(method, "sweep", "--json")
+        data = json.loads(r.stdout)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["slug"] == "20260101-old-aaaa"
+        assert data[0]["days_since_active"] > 30
+    print("  T17 PASS — sweep --json emits parseable array")
+
+
 def test_promote_refuses_already_in_project():
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
@@ -341,5 +418,9 @@ if __name__ == "__main__":
     test_short_name_validation()
     test_resume_ambiguous_short_name()
     test_touch_preserves_nested_frontmatter()
+    test_sweep_lists_stale_projects()
+    test_sweep_skips_archived()
+    test_sweep_does_not_mutate()
+    test_sweep_json_mode()
     test_promote_refuses_already_in_project()
     print("All project tests passed.")
