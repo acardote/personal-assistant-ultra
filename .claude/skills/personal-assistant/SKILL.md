@@ -250,7 +250,9 @@ When you'd otherwise answer a question and the gap signal points at meetings / w
 3. **Targeted Granola query.** Call `mcp__claude_ai_Granola__query_granola_meetings` with `{"query": "<the user's question, lightly rephrased to Granola's natural-language style>"}`. Unlike harvest's two-step enumerate-then-fetch (#34), live mode is single-shot — Granola's natural-language path is fine for a focused query, and the latency budget (<30s p95 from #39) doesn't allow the two-step pattern.
 4. **Capture the result.** Pipe the raw response body to `tools/live-result-write.py --source granola_note --query "<original user query>" --start-iso "<start_iso>"`. The helper writes `<content_root>/raw/live/granola_note/<ts-with-ms>-<hash>.md` with a leading provenance HTML comment, and emits a `live_call_end` event with `status=success` and `duration_ms` so the dashboard's `live_calls_per_query` and live latency p95 stay accurate.
 5. **Fold findings into the answer.** Treat the live response as if it were just-loaded memory: cite specifics, prefer it over staler memory hits, and quote where the user's intent is "what's the latest." Do not duplicate the live findings in your response when they merely confirm memory — fold them inline.
-6. **Don't compress yet.** Write-back (compress live → memory with provenance preservation) is #39-D's scope. Until #39-D lands, files in `<content_root>/raw/live/granola_note/` accumulate without flowing to memory — that's the documented trade-off, not a bug. The path-separation (`raw/live/<source>/` ≠ `raw/<source>/`) keeps live artifacts away from harvest's compress + dedup paths so harvest doesn't accidentally pollute memory with no-provenance live notes.
+6. **Inline write-back AFTER answering** (per [#74](https://github.com/acardote/personal-assistant-ultra/issues/74)): once the user has the answer on screen, run `tools/live-writeback.py --source granola_note` to compress the just-written raw artifact into memory, then `tools/live-commit-push.sh <content_root> "live: <query-hash> granola"` to commit + push with rebase-retry on non-fast-forward. Foreground (~30–60s); the user already has the answer, so this delays only the next prompt. Skip if the live call returned `status=empty` — there's nothing to compress.
+
+The path-separation (`raw/live/<source>/` ≠ `raw/<source>/`) keeps live artifacts away from harvest's compress + dedup paths so harvest doesn't accidentally pollute memory with no-provenance live notes; `live-writeback.py` does the compress with `--provenance live` so the resulting memory object is correctly tagged.
 
 **Failure paths**: if the Granola MCP call fails (timeout, auth, no results), emit a `live_call_end` event with `status=error` (or `status=timeout`) via `tools/log-event.py live_call_end --inherit-session --data source=granola_note --json-data status='"error"'`, **NOT** a separate `live_call_error` event — the unified-event approach (per pr-challenger C3 on #53) keeps the dashboard's start/end pairing intact so latency p95 doesn't get biased low by orphan starts. Then proceed with memory-only answer, surfacing the gap to the user (e.g., *"I don't have current notes on this — Granola was unavailable just now"*).
 
@@ -268,7 +270,7 @@ Same shape as the Granola path; differences below.
    - Repeat the read for at most 2 additional matches if the first thread didn't answer the question. Hard cap: **3 thread reads per live call**, to stay within the <30s budget.
 4. **Capture the result.** Render the thread(s) to Markdown with `## <iso> — user:<id>` per message (same format as harvest writes for `slack_thread`), concatenate, and pipe to `tools/live-result-write.py --source slack_thread --query "<original user query>" --start-iso "<start_iso>"`. Helper writes to `<content_root>/raw/live/slack_thread/<ts-ms>-<hash>.md`.
 5. **Fold findings into the answer.** Quote speaker attribution where it matters (per #5/#6 F3: "the speaker matters as much as the content"). If multiple threads contribute, group by channel.
-6. **Don't compress yet** — same as Granola. #39-D handles write-back.
+6. **Inline write-back AFTER answering** — same as Granola: `tools/live-writeback.py --source slack_thread` then `tools/live-commit-push.sh <content_root> "live: <query-hash> slack"`. Skip when `status=empty`.
 
 **Failure paths**: same contract as Granola — emit `live_call_end` with `status=error` / `status=timeout`, NOT a separate `live_call_error` event. Surface gaps to the user (e.g., *"I couldn't find a current thread on this — Slack search returned nothing relevant"*).
 
@@ -287,7 +289,7 @@ Same shape as Slack (two-step search → read); differences below.
    - **Hard cap: 2 thread reads per live call** (provisional — Gmail threads typically denser than Slack; revisit at Move 5 once `live_call_end.duration_ms` data exists). Body cap (`MAX_BODY_CHARS=65536`) inherited from the helper.
 4. **Capture the result.** Render to Markdown preserving headers (From, Subject, Date) and message boundaries — same format harvest writes for `gmail_thread`. Pipe to `tools/live-result-write.py --source gmail_thread --query "<original user query>" --start-iso "<start_iso>"`. Helper writes to `<content_root>/raw/live/gmail_thread/<ts-ms>-<hash>.md`.
 5. **Fold findings into the answer.** Quote sender + date when citing — for email, "who said what when" is load-bearing context. If multiple threads contribute, group by subject.
-6. **Don't compress yet** — same as the other adapters. #39-D handles write-back.
+6. **Inline write-back AFTER answering** — same as Granola/Slack: `tools/live-writeback.py --source gmail_thread` then `tools/live-commit-push.sh <content_root> "live: <query-hash> gmail"`. Skip when `status=empty`.
 
 **Failure paths**: same contract — emit `live_call_end` with `status=error` / `status=timeout` via `tools/log-event.py`, NOT a separate `live_call_error` event. Surface the gap to the user (e.g., *"I couldn't find a labeled-important thread on this — Gmail returned nothing relevant"*).
 
@@ -311,7 +313,10 @@ For each unprocessed file, the tool runs `tools/compress.py <file> --source-kind
 
 Successfully-compressed raw files are moved to `<content_root>/raw/live/<source>/.processed/`. Failed compresses leave the file in place for the next run to retry.
 
-**When to invoke**: today, manually or via the daily harvest routine (the routine prompt should call `live-writeback.py` after harvest's compress step so live findings land in the same vault commit). Future: `/personal-assistant write-back` once #59 lands.
+**When to invoke** (per [#74](https://github.com/acardote/personal-assistant-ultra/issues/74)):
+- **Per-query (primary)**: every live-call procedure above ends with `live-writeback.py` + `live-commit-push.sh` after the user has their answer. Memory is up-to-date on origin within ~30–60s of the live call landing.
+- **Daily harvest routine (catch-up)**: the routine ends with one final `live-writeback.py` + commit pass to absorb anything the per-query path missed (machine off, skill exited ungracefully, push collisions that didn't recover).
+- **Manual escape hatch**: `/personal-assistant live-writeback` (slash command) for ad-hoc clearing of any backlog the operator wants to inspect first.
 
 ### Cross-source synthesis (#39-C)
 

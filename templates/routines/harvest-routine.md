@@ -196,13 +196,15 @@ Bound the run by cadence:
 
 If a source is unreachable (MCP auth expired, tool not available), log to the digest's "errors:" line and the run-status JSON's "errors" key, then continue with other sources — do NOT retry.
 
-After all sources complete, from $VAULT:
+**Live write-back catch-up (per #74)**: after the per-source harvest completes, run `tools/live-writeback.py` to absorb any artifacts the per-query path missed (machine off when a live finding was captured, skill exited ungracefully, push-collisions that didn't recover). Expected: typically 0-3 deferred artifacts per day in steady state; counts in the dozens during the rollout window.
+
+After all sources complete (including the live write-back catch-up), from $VAULT:
 
   git add -A
   git commit -m "harvest $(date -u +%Y-%m-%d) (routine)"
   git push origin main
 
-If `git push` fails (e.g., non-fast-forward because another machine pushed first), do NOT loop — write the failure to the run-status JSON and exit. The next day's run will pull and proceed.
+If `git push` fails (e.g., non-fast-forward because another machine pushed first), do NOT loop — write the failure to the run-status JSON and exit. The next day's run will pull and proceed. (Per #74 the per-query path uses `tools/live-commit-push.sh` with rebase-retry; the routine doesn't yet — keeping the simpler exit-on-fail behavior here is a deliberate choice for the daily-batch surface, where loud-fail is acceptable.)
 
 In your final response, summarize:
 - Which sources fired and what each produced.
