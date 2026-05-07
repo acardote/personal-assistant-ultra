@@ -287,6 +287,31 @@ def test_resume_ambiguous_short_name():
     print("  T11 PASS — resume rejects ambiguous + leaves state untouched")
 
 
+def test_touch_preserves_nested_frontmatter():
+    """touch must use the surgical updater — hand-rewriting reintroduces B1."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        run(method, "new", "x", "i")
+        slug = get_active_slug(vault)
+        # Inject a nested produced_by block into project.md (simulate after
+        # the assistant wrote sources_cited or other nested data).
+        proj_md = vault / "projects" / slug / "project.md"
+        text = proj_md.read_text(encoding="utf-8")
+        # Add a nested produced_by block before closing ---
+        text = text.replace(
+            "last_active:",
+            "produced_by:\n  session_id: aaaaaaaa\n  query: x\n  sources_cited:\n    - https://x.test\nlast_active:",
+        )
+        proj_md.write_text(text, encoding="utf-8")
+
+        run(method, "touch", slug)
+        out = proj_md.read_text(encoding="utf-8")
+        assert "produced_by:" in out, "B1: nested block dropped on touch"
+        assert "session_id: aaaaaaaa" in out, "B1: nested key dropped on touch"
+        assert "https://x.test" in out, "B1: list item dropped on touch"
+    print("  T13 PASS — touch preserves nested frontmatter")
+
+
 def test_promote_refuses_already_in_project():
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
@@ -315,5 +340,6 @@ if __name__ == "__main__":
     test_copy_artefact()
     test_short_name_validation()
     test_resume_ambiguous_short_name()
+    test_touch_preserves_nested_frontmatter()
     test_promote_refuses_already_in_project()
     print("All project tests passed.")

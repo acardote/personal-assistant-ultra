@@ -417,6 +417,24 @@ def cmd_clear(args, cfg) -> int:
     return 0
 
 
+def cmd_touch(args, cfg) -> int:
+    """Touch last_active on a project. Surgical update preserves nested blocks
+    (B1 closer for SKILL.md procedure — the assistant must NOT hand-rewrite
+    frontmatter; rewriting by hand is a known vector for the B1 nested-block
+    destruction failure)."""
+    slug = find_slug(cfg.content_root, args.slug)
+    if not slug:
+        print(f"no project matching {args.slug!r}", file=sys.stderr)
+        return 1
+    project_md = project_dir(cfg.content_root, slug) / "project.md"
+    if not project_md.is_file():
+        print(f"{project_md} not found", file=sys.stderr)
+        return 1
+    touch_last_active(project_md)
+    print(f"touched: {slug}")
+    return 0
+
+
 def cmd_status(args, cfg) -> int:
     state = read_state(cfg.content_root)
     if not state:
@@ -690,6 +708,10 @@ def main(argv=None) -> int:
 
     p_clear = sub.add_parser("clear", help="clear active project")
     p_clear.set_defaults(func=cmd_clear)
+
+    p_touch = sub.add_parser("touch", help="touch last_active on a project (surgical, preserves nested frontmatter)")
+    p_touch.add_argument("slug")
+    p_touch.set_defaults(func=cmd_touch)
 
     p_status = sub.add_parser("status", help="print active project info")
     p_status.set_defaults(func=cmd_status)
