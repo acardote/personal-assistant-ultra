@@ -198,7 +198,11 @@ If a source is unreachable (MCP auth expired, tool not available), log to the di
 
 **Live write-back catch-up (per #74)**: after the per-source harvest completes, run `tools/live-writeback.py` to absorb any artifacts the per-query path missed (machine off when a live finding was captured, skill exited ungracefully, push-collisions that didn't recover). Expected: typically 0-3 deferred artifacts per day in steady state; counts in the dozens during the rollout window.
 
-After all sources complete (including the live write-back catch-up), from $VAULT:
+**KB candidate scan (per #116 / #119)**: after the live write-back, run `tools/kb-scan.py --since-last-run` to walk new memory objects since the last scan watermark and emit candidate KB updates as `kind=memo` artefacts under `$VAULT/artefacts/memo/.unprocessed/`. Per ADR-0003 F2 (autonomous-producer carve-out), this step MAY emit memos but MUST NOT write to `$VAULT/kb/*` directly — those candidates land in the user's next interactive `/personal-assistant kb-process` session for the diff-and-approve flow. The routine's `PA_SESSION_ID` (minted at routine start) is what kb-scan uses for the memo's `produced_by.session_id`; when the user later approves a candidate via `kb-process apply`, the inline kb provenance comment carries the user's interactive session_id, NOT this routine session (per #121's F3 closer). Expected steady-state: 0-3 candidates per daily run; bootstrap (first run with `kb-scan --all` invoked manually via `/personal-assistant kb-backfill`) produces ~10-25.
+
+In the daily digest entry, after the per-source counts, add: `- kb candidates: N pending review` where N = count of files matching `$VAULT/artefacts/memo/.unprocessed/art-*.md` after the kb-scan step. If N > 0, surface the count so the user knows to run `/personal-assistant kb-process` to walk them.
+
+After all sources complete (including the live write-back catch-up + kb-scan), from $VAULT:
 
   git add -A
   git commit -m "harvest $(date -u +%Y-%m-%d) (routine)"
