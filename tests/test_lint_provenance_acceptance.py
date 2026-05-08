@@ -30,6 +30,8 @@ Tests:
   T22 — `art://<uuid>` is accepted as canonical source form.
   T23 — same uuid in two locations triggers artefact-uuid-collision.
   T24 — project-scoped export sidecar must carry project_id too.
+  T25 — dangling art:// reference fails (#98).
+  T26 — flat artefact citing art://<flat-uuid> resolves cleanly.
 """
 
 from __future__ import annotations
@@ -399,9 +401,17 @@ def test_project_scoped_mismatched_project_id():
 
 
 def test_art_canonical_source_accepted():
+    """art://<uuid> is a canonical source form — provided the uuid resolves
+    to an existing artefact in the vault (project tier ∪ flat tier)."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
         proj = _project_dirs(vault, "20260507-test-aaaa")
+        # Create the artefact that art://orig-123 will reference.
+        (proj / "artefacts" / "memo" / "art-orig-123.md").write_text(
+            _project_artefact_md("20260507-test-aaaa", "orig-123", "20260507-test-aaaa"),
+            encoding="utf-8",
+        )
+        # Create the referencing artefact.
         (proj / "artefacts" / "memo" / "art-uses-art-ref.md").write_text(
             _project_artefact_md("20260507-test-aaaa", "uses-art-ref", "20260507-test-aaaa",
                                   sources=["art://orig-123", "kb#some-heading"]),
@@ -409,7 +419,7 @@ def test_art_canonical_source_accepted():
         )
         r = run_lint(method)
         assert r.returncode == 0, f"art:// should be canonical\n{r.stderr}"
-    print("  T22 PASS — art://<uuid> accepted as canonical source")
+    print("  T22 PASS — art://<uuid> accepted as canonical source (resolves)")
 
 
 def test_uuid_collision_across_tiers():
@@ -452,6 +462,50 @@ def test_project_scoped_export_sidecar_project_id():
     print("  T24 PASS — project-scoped export sidecar requires project_id")
 
 
+def test_dangling_art_ref_fails():
+    """Per #98: art://<uuid> in sources_cited that doesn't resolve to any
+    existing artefact in the vault triggers `artefact-dangling-art-ref`."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-references-ghost.md").write_text(
+            _project_artefact_md(
+                "20260507-test-aaaa", "references-ghost", "20260507-test-aaaa",
+                sources=["art://nonexistent-ghost-uuid"],
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "artefact-dangling-art-ref" in r.stderr
+        assert "nonexistent-ghost-uuid" in r.stderr
+    print("  T25 PASS — dangling art:// reference fails")
+
+
+def test_flat_artefact_resolves_art_ref():
+    """art://<uuid> resolving to a FLAT (project-less) artefact is also valid."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Create a flat artefact + a project artefact that references it.
+        (vault / "artefacts" / "memo" / "art-flat-target.md").write_text(
+            "---\nid: art-flat-target\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+            "title: t\nproduced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+            "  sources_cited:\n    - https://x.test\n---\nbody",
+            encoding="utf-8",
+        )
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-references-flat.md").write_text(
+            _project_artefact_md(
+                "20260507-test-aaaa", "references-flat", "20260507-test-aaaa",
+                sources=["art://flat-target"],
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"flat-target should resolve\n{r.stderr}"
+    print("  T26 PASS — art://<uuid> resolves to flat artefact")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -478,4 +532,6 @@ if __name__ == "__main__":
     test_art_canonical_source_accepted()
     test_uuid_collision_across_tiers()
     test_project_scoped_export_sidecar_project_id()
+    test_dangling_art_ref_fails()
+    test_flat_artefact_resolves_art_ref()
     print("All lint-provenance tests passed.")
