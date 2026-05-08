@@ -34,6 +34,9 @@ Tests:
   T15 — F5 hash-boundary: appending a new decision to kb/decisions.md does
         NOT change the text_hash of the previously-last decision (closes
         pr-challenger MEDIUM finding on PR #144).
+  T16 — slice-4 suppression: suppressed via-uuids are filtered out of the
+        decisions list before pair-building (F1 of slice 4: suppression must
+        be binding on the next scan).
 """
 
 from __future__ import annotations
@@ -685,6 +688,49 @@ def test_decision_append_does_not_invalidate_prior_hashes():
     print("  T15 PASS — appending a decision doesn't invalidate prior hashes (F5 hash-boundary)")
 
 
+def test_suppressed_decision_skipped_in_routing():
+    """T16: a decision whose via-uuid lives in kb-drift-suppress.json with
+    `suppressed_at` set is REMOVED from the decisions list before pair-
+    building. Verifies slice 4's contract that suppression is binding on
+    the next scan (F1 of slice 4)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Two decisions sharing scope; only one is suppressed.
+        suppressed_via = "abcdef00-1111-2222-3333-444444444444"
+        active_via = "12345678-1111-2222-3333-444444444444"
+        write_decision(vault, title="Suppressed decision", scope="Acme",
+                       via_uuid=suppressed_via)
+        write_decision(vault, title="Active decision", scope="Acme",
+                       via_uuid=active_via)
+        # Memory matching the shared scope.
+        write_memory(vault, "granola_note", "m1", tags=["acme"])
+
+        # Mark the first via as suppressed.
+        suppress_path = vault / ".harvest" / "kb-drift-suppress.json"
+        suppress_path.parent.mkdir(parents=True, exist_ok=True)
+        suppress_path.write_text(
+            json.dumps({
+                "decisions": {
+                    f"art-{suppressed_via}": {
+                        "dismissals": 3,
+                        "suppressed_at": "2026-05-08T10:00:00Z",
+                        "reasons": ["false positive"],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        r = run_drift_scan(method, "--all", "--skip-llm")
+        assert r.returncode == 0, r.stderr
+        # Exactly 1 surviving decision (the active one).
+        assert "loaded 2 scoped+anchored decision(s)" in r.stderr, r.stderr
+        assert "suppression: 1 decision(s) skipped" in r.stderr, r.stderr
+        # Pair count is 1 (one memory × one active decision).
+        assert "phase 1: 1 (memory, decision)" in r.stderr, r.stderr
+    print("  T16 PASS — suppressed decisions are skipped in routing (slice 4)")
+
+
 if __name__ == "__main__":
     print("Running test_kb_drift_scan_acceptance.py...")
     test_empty_pool_emits_nothing()
@@ -702,4 +748,5 @@ if __name__ == "__main__":
     test_max_llm_calls_is_hard_cap()
     test_partial_quota_mid_iteration()
     test_decision_append_does_not_invalidate_prior_hashes()
+    test_suppressed_decision_skipped_in_routing()
     print("All kb-drift-scan tests passed.")

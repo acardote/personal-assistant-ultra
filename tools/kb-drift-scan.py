@@ -140,6 +140,44 @@ def decisions_path(content_root: Path) -> Path:
     return content_root / "kb" / "decisions.md"
 
 
+def suppress_state_path(content_root: Path) -> Path:
+    return content_root / ".harvest" / "kb-drift-suppress.json"
+
+
+def load_suppressed_via_uuids(content_root: Path) -> set[str]:
+    """Read `<vault>/.harvest/kb-drift-suppress.json` and return the set of
+    via-uuids whose `suppressed_at` is set. Decisions in this set are skipped
+    during routing — slice 4 (#140) of #135. Schema mirrors what kb-process
+    drift-dismiss writes; absent / malformed file = empty set (open by
+    default, F4 fail-safe direction)."""
+    p = suppress_state_path(content_root)
+    if not p.is_file():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        print(
+            f"[kb-drift-scan] WARN: kb-drift-suppress.json malformed; "
+            f"treating as empty (open by default).",
+            file=sys.stderr,
+        )
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    decisions = data.get("decisions") or {}
+    if not isinstance(decisions, dict):
+        return set()
+    out: set[str] = set()
+    for key, entry in decisions.items():
+        if not isinstance(key, str) or not key.startswith("art-"):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("suppressed_at"):
+            out.add(key[len("art-"):])
+    return out
+
+
 # ---------------------------------------------------------------------
 # Normalization (shared with kb-scan's NFKD strategy for unicode names)
 # ---------------------------------------------------------------------
@@ -648,6 +686,23 @@ def main(argv=None) -> int:
 
     decisions = load_decisions(content_root)
     print(f"[kb-drift-scan] loaded {len(decisions)} scoped+anchored decision(s)", file=sys.stderr)
+
+    # Slice 4 (#140): skip suppressed decisions BEFORE pair-building. A
+    # decision is suppressed when its dismissal count crosses the threshold
+    # configured in kb-drift-config.json (default 3). The next dismissal
+    # past threshold sets `suppressed_at`; kb-process drift-reenable clears it.
+    suppressed = load_suppressed_via_uuids(content_root)
+    if suppressed:
+        before = len(decisions)
+        decisions = [d for d in decisions if d.art_id not in suppressed]
+        skipped = before - len(decisions)
+        print(
+            f"[kb-drift-scan] suppression: {skipped} decision(s) skipped "
+            f"(art-uuids: {sorted(suppressed)[:5]}{'...' if len(suppressed) > 5 else ''}). "
+            f"Re-enable with `kb-process drift-reenable art-<uuid>`.",
+            file=sys.stderr,
+        )
+
     if not decisions:
         print("[kb-drift-scan] no decisions in scope; updating watermark and exiting clean", file=sys.stderr)
         if not args.skip_llm:

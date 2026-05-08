@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -51,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -694,6 +696,210 @@ def record_dismissal(
     tmp.replace(p)
 
 
+# ---------------------------------------------------------------------
+# Suppression (slice 4 of #135)
+# ---------------------------------------------------------------------
+#
+# State files:
+#   `<content_root>/.harvest/kb-drift-suppress.json`
+#       { "decisions": { "art-<via>": {
+#             "dismissals": <int>,
+#             "suppressed_at": "<iso>" | null,
+#             "reasons": [<latest-N strings>],
+#         } } }
+#   `<content_root>/.harvest/kb-drift-config.json`
+#       { "drift_dismissal_threshold": <int> }   (default 3)
+#
+# Design: STICKY. Suppression persists until the user runs
+# `kb-process drift-reenable <art-<via>>`. F3 trade-off considered:
+#   - Sticky (chosen): predictable; protects against re-flooding when the
+#     decision body is touched for typo fixes / tooling updates that don't
+#     change drift semantics. The user has explicit control.
+#   - Auto-clear-on-edit (rejected): would re-flood after every typo fix
+#     unless we hash the "semantic" body (a research project of its own).
+#
+# Concurrency (F2): all read-modify-write goes through a blocking
+# `fcntl.flock` on a sidecar `.lock` file. Two concurrent drift-dismiss
+# invocations on the same decision serialize and both updates land —
+# no lost-write race.
+
+DEFAULT_DRIFT_DISMISSAL_THRESHOLD = 3
+SUPPRESS_REASON_LOG_CAP = 10  # keep most-recent N reasons per decision
+
+
+def suppress_state_path(content_root: Path) -> Path:
+    return content_root / ".harvest" / "kb-drift-suppress.json"
+
+
+def drift_config_path(content_root: Path) -> Path:
+    return content_root / ".harvest" / "kb-drift-config.json"
+
+
+def load_drift_config(content_root: Path) -> dict:
+    """Load `<vault>/.harvest/kb-drift-config.json`. Returns a dict with
+    `drift_dismissal_threshold` always populated:
+      - file missing                 → use default (no warning)
+      - JSON malformed               → WARN + use default
+      - root not a dict              → WARN + use default
+      - threshold absent / null      → use default (no warning)
+      - threshold non-int / ≤ 0      → WARN + use default
+    Closes F4: a half-written config never silently disables suppression.
+    """
+    out = {"drift_dismissal_threshold": DEFAULT_DRIFT_DISMISSAL_THRESHOLD}
+    p = drift_config_path(content_root)
+    if not p.is_file():
+        return out
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"[kb-process] WARN: kb-drift-config.json malformed ({exc}); "
+            f"using default threshold={DEFAULT_DRIFT_DISMISSAL_THRESHOLD}",
+            file=sys.stderr,
+        )
+        return out
+    if not isinstance(data, dict):
+        print(
+            "[kb-process] WARN: kb-drift-config.json root is not a JSON object; "
+            f"using default threshold={DEFAULT_DRIFT_DISMISSAL_THRESHOLD}",
+            file=sys.stderr,
+        )
+        return out
+    raw = data.get("drift_dismissal_threshold")
+    if raw is None:
+        return out
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        print(
+            f"[kb-process] WARN: kb-drift-config.json `drift_dismissal_threshold`={raw!r} "
+            f"is not a positive int; using default {DEFAULT_DRIFT_DISMISSAL_THRESHOLD}",
+            file=sys.stderr,
+        )
+        return out
+    out["drift_dismissal_threshold"] = raw
+    return out
+
+
+@contextmanager
+def _suppress_lock(content_root: Path):
+    """Blocking exclusive flock on a sidecar lock file. Concurrent
+    drift-dismiss / drift-reenable invocations serialize through this so
+    the read-modify-write of kb-drift-suppress.json is atomic (F2 closer)."""
+    lock_path = suppress_state_path(content_root).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def _read_suppress_state(content_root: Path) -> dict:
+    p = suppress_state_path(content_root)
+    if not p.is_file():
+        return {"decisions": {}}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"decisions": {}}
+    if not isinstance(data, dict):
+        return {"decisions": {}}
+    if not isinstance(data.get("decisions"), dict):
+        data["decisions"] = {}
+    return data
+
+
+def _write_suppress_state(content_root: Path, payload: dict) -> None:
+    """Atomic tmp+rename write — paired with the surrounding flock."""
+    p = suppress_state_path(content_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(p)
+
+
+def update_suppression_after_dismissal(
+    content_root: Path,
+    *, via_uuid: str, reason: str | None,
+) -> tuple[int, bool]:
+    """Increment the dismissal count for `art-<via_uuid>` and set
+    `suppressed_at` if the count reached the configured threshold. Idempotent
+    when called more than once for the same effective dismissal — the per-
+    art-id de-dup happens inside `record_dismissal` (slice 3).
+
+    Returns (new_count, became_suppressed_now)."""
+    cfg_data = load_drift_config(content_root)
+    threshold = cfg_data["drift_dismissal_threshold"]
+    key = f"art-{via_uuid}"
+    became = False
+    with _suppress_lock(content_root):
+        state = _read_suppress_state(content_root)
+        entry = state["decisions"].get(key) or {}
+        count = int(entry.get("dismissals") or 0) + 1
+        reasons = list(entry.get("reasons") or [])
+        if reason:
+            reasons.append(reason)
+        # Cap reason history so this file doesn't grow without bound.
+        reasons = reasons[-SUPPRESS_REASON_LOG_CAP:]
+        suppressed_at = entry.get("suppressed_at")
+        if count >= threshold and not suppressed_at:
+            suppressed_at = now_iso()
+            became = True
+        state["decisions"][key] = {
+            "dismissals": count,
+            "suppressed_at": suppressed_at,
+            "reasons": reasons,
+        }
+        _write_suppress_state(content_root, state)
+    return count, became
+
+
+def reenable_decision(content_root: Path, *, art_id: str) -> tuple[bool, dict | None]:
+    """Reset the suppression entry for `art_id` (must be `art-<via_uuid>`).
+    Returns (existed, prior_entry). If existed=False, no state change."""
+    with _suppress_lock(content_root):
+        state = _read_suppress_state(content_root)
+        prior = state["decisions"].pop(art_id, None)
+        if prior is None:
+            return False, None
+        _write_suppress_state(content_root, state)
+        return True, prior
+
+
+def cmd_drift_reenable(args, cfg) -> int:
+    art_id = args.decision_art_id
+    if not art_id.startswith("art-"):
+        print(
+            f"[kb-process] decision id must start with 'art-' "
+            f"(got {art_id!r}). Use the via-uuid prefixed with 'art-'.",
+            file=sys.stderr,
+        )
+        return 1
+    via_part = art_id[len("art-"):]
+    if not ART_VIA_RE.match(via_part):
+        print(
+            f"[kb-process] {art_id}: malformed via-uuid (must be ASCII "
+            f"word-chars + hyphens, 1-128 chars).",
+            file=sys.stderr,
+        )
+        return 1
+    existed, prior = reenable_decision(cfg.content_root, art_id=art_id)
+    if not existed:
+        print(
+            f"[kb-process] {art_id} not found in kb-drift-suppress.json; nothing to clear.",
+            file=sys.stderr,
+        )
+        return 0
+    print(
+        f"[kb-process] cleared suppression for {art_id} "
+        f"(was: dismissals={prior.get('dismissals')}, "
+        f"suppressed_at={prior.get('suppressed_at')}). Next kb-drift-scan "
+        f"will re-evaluate this decision."
+    )
+    return 0
+
+
 def cmd_drift_dismiss(args, cfg) -> int:
     art_id = args.art_id
     memo_path = memo_dir(cfg.content_root, "unprocessed") / f"{art_id}.md"
@@ -745,6 +951,18 @@ def cmd_drift_dismiss(args, cfg) -> int:
             cfg.content_root, via_uuid=via_uuid, art_id=art_id,
             reason=args.reason,
         )
+        # Slice 4: bump per-decision suppression counter; cross threshold
+        # → set suppressed_at so the next kb-drift-scan skips this decision.
+        count, became_suppressed = update_suppression_after_dismissal(
+            cfg.content_root, via_uuid=via_uuid, reason=args.reason,
+        )
+        if became_suppressed:
+            print(
+                f"[kb-process] art-{via_uuid} reached the dismissal threshold "
+                f"(count={count}); kb-drift-scan will now skip this decision. "
+                f"Re-enable with `kb-process drift-reenable art-{via_uuid}`.",
+                file=sys.stderr,
+            )
 
     print(f"[kb-process] dismissed drift candidate {art_id}; archived to .rejected/")
     return 0
@@ -888,6 +1106,14 @@ def main(argv=None) -> int:
     p_drift_dismiss.add_argument("art_id")
     p_drift_dismiss.add_argument("--reason", help="optional reason text recorded in a sidecar")
     p_drift_dismiss.set_defaults(func=cmd_drift_dismiss)
+
+    p_drift_reenable = sub.add_parser(
+        "drift-reenable",
+        help="clear the suppression entry for a decision so kb-drift-scan re-evaluates it",
+    )
+    p_drift_reenable.add_argument("decision_art_id",
+                                   help="art-<via-uuid> of the decision (matches `affects_decision: art://<via>`)")
+    p_drift_reenable.set_defaults(func=cmd_drift_reenable)
 
     args = p.parse_args(argv)
     cfg = load_config(require_explicit_content_root=True)
