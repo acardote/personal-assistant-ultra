@@ -9,23 +9,35 @@ Walks `<vault>/artefacts/memo/.unprocessed/`. The user-approval gate lives
 in the assistant's chat conversation; this tool is the file-operations
 primitive. Subcommands:
 
-  list   — print unprocessed memos (one per line: art-id kind referent)
-  show   — print a memo's full body
-  apply  — extract the proposed diff, append to the right kb file with
-           inline `<!-- produced_by -->` carrying the CURRENT session_id
-           (NOT the routine session that emitted the memo — F3 closer
-           on #121). Move memo to `.processed/`. Run lint-provenance.
-  reject — move memo to `.rejected/` without applying.
+  list           — print unprocessed memos (drift candidates marked [DRIFT])
+  show           — print a memo's full body
+  apply          — extract the proposed diff, append to the right kb file
+                   with inline `<!-- produced_by -->` carrying the CURRENT
+                   session_id (NOT the routine session that emitted the
+                   memo — F3 closer on #121). Move memo to `.processed/`.
+                   Run lint-provenance. **Refuses on drift candidates** —
+                   the user must use drift-apply for those.
+  reject         — move memo to `.rejected/` without applying.
+  drift-apply    — append a `### <iso-date> — ...` amendment under the
+                   decision named in `affects_decision: art://<via-uuid>`
+                   (slice 3 of #135). Resolves the via-uuid against the
+                   current `kb/decisions.md` at apply time (F5: a stale
+                   reference is refused, not silently appended). Otherwise
+                   matches `apply`'s atomic write→lint→move ordering.
+  drift-dismiss  — archive the drift memo to `.rejected/` and record a
+                   dismissal entry under `<vault>/.harvest/drift-dismissals/
+                   <via-uuid>.json` so slice 4's suppression mechanism can
+                   read the per-decision dismissal count.
 
 Atomic ordering: every state-changing subcommand maintains the invariant
 **kb content ⟺ memo in `.processed/`** (F5 closer):
-  apply: WRITE kb → LINT → MOVE memo. Lint failure rolls back the kb write
-         and leaves memo in .unprocessed/ — no kb dirty + memo elsewhere.
-  reject: MOVE memo to .rejected/ in one rename (no kb write).
+  apply / drift-apply: WRITE kb → LINT → MOVE memo. Lint failure rolls
+         back the kb write and leaves memo in .unprocessed/.
+  reject / drift-dismiss: MOVE memo to .rejected/ in one rename (no kb write).
 
-Idempotency: apply checks if the memo's id already appears in the target
-kb file's existing `<!-- produced_by ... art-<uuid> ... -->` comments. If
-yes, refuses with a clear error (F4 closer).
+Idempotency: apply / drift-apply check if the memo's id already appears in
+the target kb file's existing `<!-- produced_by ... via=art-<uuid> ... -->`
+comments. If yes, refuse (F4 closer for apply, F3 closer for drift-apply).
 """
 
 from __future__ import annotations
@@ -92,6 +104,21 @@ def parse_memo_frontmatter(memo_path: Path) -> tuple[dict, str]:
         raise ValueError(f"{memo_path.name}: frontmatter is not a YAML map")
     body = text[end + 4:].lstrip("\n")
     return fm, body
+
+
+def is_drift_candidate(fm: dict) -> bool:
+    """True iff frontmatter sets `drift_candidate: true` (case-insensitive,
+    optional surrounding quotes — matches the slice-1 lint's `_drift_truthy`).
+    Drift candidates require a separate handler; `apply` refuses on them."""
+    v = fm.get("drift_candidate")
+    # YAML scalar `true` parses to Python `True` via PyYAML safe_load (used here),
+    # whereas the lint's hand-rolled walker keeps it as the string "true". Both
+    # forms must be accepted.
+    if isinstance(v, bool):
+        return v is True
+    if isinstance(v, str):
+        return v.strip().strip('"').strip("'").lower() in ("true", "yes")
+    return False
 
 
 def detect_memo_kind(fm: dict) -> str:
@@ -268,6 +295,24 @@ def cmd_apply(args, cfg) -> int:
 
     try:
         fm, body = parse_memo_frontmatter(memo_path)
+    except ValueError as exc:
+        print(f"[kb-process] {exc}", file=sys.stderr)
+        return 1
+
+    # Drift candidates carry their own slice-3 handler (drift-apply): the
+    # amendment shape is `### <date> — ...` under an existing decision, not
+    # a fresh `## <heading>`. Refusing here avoids accidentally applying
+    # the diff-block (which doesn't exist on drift memos) as a new entry.
+    if is_drift_candidate(fm):
+        print(
+            f"[kb-process] {memo_path.name} is a drift candidate. "
+            f"Use `kb-process drift-apply {art_id}` (per slice 3 of #135) "
+            f"or `kb-process drift-dismiss {art_id}`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
         kind = detect_memo_kind(fm)
     except ValueError as exc:
         print(f"[kb-process] {exc}", file=sys.stderr)
@@ -340,6 +385,372 @@ def cmd_apply(args, cfg) -> int:
 
 
 # ---------------------------------------------------------------------
+# Drift-apply (slice 3 of #135)
+# ---------------------------------------------------------------------
+
+
+# Drift-candidate schema constants. Mirror the slice-1 lint floors so a
+# drift memo placed in `.unprocessed/` (which the lint-provenance walker
+# doesn't visit, per #137) gets the same shape enforcement at consume time.
+DRIFT_CONFIDENCE_VALUES = {"high", "medium", "low"}
+# ASCII-only + length cap: \w in Python defaults to unicode, which would
+# admit `évil` / `中文` / homoglyphs as valid via-uuids — fine for ad-hoc
+# strings, NOT fine when the value flows into filesystem paths
+# (record_dismissal writes `<vault>/.harvest/drift-dismissals/<via>.json`)
+# or substring searches inside kb. Pin to ASCII identifier chars + bounded.
+ART_VIA_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+def parse_via_uuid_from_affects(art_id: str, affects: object) -> tuple[str | None, str]:
+    """Validate `affects_decision` and return (via_uuid, error_message).
+
+    Either `via_uuid` is set (valid) and error is "", or `via_uuid` is None
+    and error explains why. Shared between drift-apply (which writes a kb
+    amendment under the matching section) and drift-dismiss (which writes
+    a `.harvest/drift-dismissals/<via_uuid>.json` file). Both paths flow
+    via_uuid into untrusted positions, so both need the same gate."""
+    if not (isinstance(affects, str) and affects.startswith("art://")):
+        return None, (
+            f"{art_id}: affects_decision missing or not in art:// shape"
+        )
+    candidate = affects[len("art://"):].strip()
+    if not candidate:
+        return None, f"{art_id}: affects_decision has empty uuid"
+    if not ART_VIA_RE.match(candidate):
+        return None, (
+            f"{art_id}: affects_decision={affects!r} has malformed via-uuid "
+            f"(must be ASCII word-chars + hyphens, 1-128 chars)"
+        )
+    return candidate, ""
+
+
+class DuplicateViaUUIDError(Exception):
+    """Raised when more than one ## section in kb/decisions.md carries the same
+    `via=art-<uuid>` marker — a corrupted-kb invariant violation that drift-apply
+    refuses to write past (manual paste error or a rename that copy-pasted
+    instead of moved)."""
+
+    def __init__(self, via_uuid: str, titles: list[str]):
+        self.via_uuid = via_uuid
+        self.titles = titles
+        super().__init__(
+            f"via=art-{via_uuid} matches {len(titles)} decisions: "
+            f"{titles!r}. kb invariant: each via-uuid must resolve to exactly "
+            f"one decision section."
+        )
+
+
+def find_decision_section_by_via(text: str, via_uuid: str) -> Optional[tuple[int, int, str]]:
+    """Locate the `## <title>` H2 section in `kb/decisions.md` whose body
+    contains `via=art-<via_uuid>`. Return `(start_offset, end_offset, title)`
+    or None when the via-uuid no longer resolves (F5: stale reference at
+    apply time).
+
+    Raises DuplicateViaUUIDError when more than one section carries the same
+    marker — refusing to silently pick the first match (a paste error in kb
+    would otherwise lead to a silent amendment of the wrong decision)."""
+    sections = re.split(r"(?=^## )", text, flags=re.MULTILINE)
+    offset = 0
+    needle = f"via=art-{via_uuid}"
+    matches: list[tuple[int, int, str]] = []
+    for sec in sections:
+        next_offset = offset + len(sec)
+        if not sec.startswith("## "):
+            offset = next_offset
+            continue
+        if needle in sec:
+            first_nl = sec.find("\n")
+            title = sec[3:first_nl].strip() if first_nl > 0 else sec[3:].strip()
+            matches.append((offset, next_offset, title))
+        offset = next_offset
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise DuplicateViaUUIDError(via_uuid, [t for _, _, t in matches])
+    return matches[0]
+
+
+def render_drift_amendment(
+    *,
+    memory_id: str,
+    memory_source_kind: str,
+    drift_claim: str,
+    drift_confidence: str,
+    via_uuid: str,
+    memo_id: str,
+    decision_title: str,
+    session_id: str,
+) -> str:
+    """Render the `### <iso-date> — ...` amendment block per editorial-rules
+    diff-shape rule. Comment carries the user's interactive session_id (F4
+    closer); `via=` references the drift memo so reproducibility holds."""
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    one_line = f"drift amendment from mem-{memory_id[:12] if memory_id else 'unknown'}"
+    sources = [f"mem://{memory_id}", f"art://{via_uuid}"] if memory_id else [f"art://{via_uuid}"]
+    sources_str = ", ".join(sources)
+    return (
+        f"\n### {today} — {one_line}\n"
+        f"<!-- produced_by: session={session_id}, "
+        f"query=\"kb-process drift-apply: amendment to '{decision_title}'\", "
+        f"at={now_iso()}, "
+        f"sources=[{sources_str}], "
+        f"via={memo_id} -->\n"
+        f"- **Source memory:** mem://{memory_id} ({memory_source_kind})\n"
+        f"- **Confidence:** {drift_confidence}\n\n"
+        f"{drift_claim.strip()}\n"
+    )
+
+
+def cmd_drift_apply(args, cfg) -> int:
+    art_id = args.art_id
+    memo_path = memo_dir(cfg.content_root, "unprocessed") / f"{art_id}.md"
+    if not memo_path.is_file():
+        print(f"[kb-process] memo {art_id} not found in .unprocessed/", file=sys.stderr)
+        return 1
+
+    try:
+        fm, _body = parse_memo_frontmatter(memo_path)
+    except ValueError as exc:
+        print(f"[kb-process] {exc}", file=sys.stderr)
+        return 1
+
+    if not is_drift_candidate(fm):
+        print(
+            f"[kb-process] {art_id} is not a drift candidate. Use `kb-process apply` instead.",
+            file=sys.stderr,
+        )
+        return 1
+
+    via_uuid, err = parse_via_uuid_from_affects(art_id, fm.get("affects_decision"))
+    if via_uuid is None:
+        print(f"[kb-process] {err}", file=sys.stderr)
+        return 1
+
+    drift_claim = str(fm.get("drift_claim", "")).strip()
+    if not drift_claim:
+        print(f"[kb-process] {art_id}: drift_claim is empty", file=sys.stderr)
+        return 1
+    if "\n" in drift_claim:
+        # Drift claims are single-sentence — multi-line strings would corrupt
+        # the rendered amendment body and inject content past the produced_by
+        # comment boundary.
+        print(
+            f"[kb-process] {art_id}: drift_claim must be a single line "
+            f"(got {len(drift_claim.splitlines())} lines)",
+            file=sys.stderr,
+        )
+        return 1
+    drift_confidence = str(fm.get("drift_confidence", "")).strip().lower()
+    if drift_confidence not in DRIFT_CONFIDENCE_VALUES:
+        print(
+            f"[kb-process] {art_id}: drift_confidence={drift_confidence!r} "
+            f"must be one of {sorted(DRIFT_CONFIDENCE_VALUES)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Surface the source memory id for the amendment body. The drift-scan
+    # producer puts it in produced_by.sources_cited as `mem://<id>`.
+    pb_data = fm.get("produced_by") or {}
+    sources = pb_data.get("sources_cited") or []
+    memory_id = ""
+    memory_source_kind = ""
+    if isinstance(sources, list):
+        for s in sources:
+            if isinstance(s, str) and s.startswith("mem://"):
+                memory_id = s[len("mem://"):]
+                # source_kind isn't structured in the memo; leave blank for now.
+                # A future slice could embed it explicitly in produced_by.
+                break
+
+    decisions_path = cfg.content_root / "kb" / "decisions.md"
+    if not decisions_path.is_file():
+        print(f"[kb-process] kb/decisions.md not found", file=sys.stderr)
+        return 1
+    pre_state = decisions_path.read_text(encoding="utf-8")
+
+    # F3 (idempotency): if the memo's via-marker already lives in decisions.md,
+    # the amendment was already applied. Refuse — replay-after-crash mustn't
+    # duplicate amendments.
+    if memo_already_applied(pre_state, art_id):
+        print(
+            f"[kb-process] memo {art_id} already applied to kb/decisions.md "
+            f"(via={art_id} marker present). Refusing duplicate write.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # F5 (resolution-at-apply-time): the drift memo points at a decision
+    # via-uuid that may no longer match any kb decision (renamed, deleted,
+    # or its produced_by comment edited). Refuse rather than:
+    #   - silently no-op (loses the user's intent),
+    #   - appending a new heading (corrupts kb structure),
+    #   - or writing an orphan amendment.
+    try:
+        bounds = find_decision_section_by_via(pre_state, via_uuid)
+    except DuplicateViaUUIDError as exc:
+        print(
+            f"[kb-process] {art_id}: kb invariant violated — {exc}. "
+            f"Refusing to amend; resolve the duplicate via-uuid in "
+            f"kb/decisions.md before retrying.",
+            file=sys.stderr,
+        )
+        return 1
+    if bounds is None:
+        print(
+            f"[kb-process] affects_decision art://{via_uuid} no longer resolves "
+            f"to any decision in kb/decisions.md (renamed or deleted between "
+            f"emission and apply). Refusing to write. Either restore the "
+            f"decision or `drift-dismiss {art_id}`.",
+            file=sys.stderr,
+        )
+        return 1
+    section_start, section_end, decision_title = bounds
+
+    interactive_session = session_id_from_env()
+    amendment = render_drift_amendment(
+        memory_id=memory_id,
+        memory_source_kind=memory_source_kind,
+        drift_claim=drift_claim,
+        drift_confidence=drift_confidence,
+        via_uuid=via_uuid,
+        memo_id=art_id,
+        decision_title=decision_title,
+        session_id=interactive_session,
+    )
+
+    # Inject the amendment at the END of the target section (just before the
+    # next ## heading or EOF). Strip trailing whitespace from the section to
+    # keep paragraph spacing tight, then re-append the amendment.
+    section_text = pre_state[section_start:section_end].rstrip("\n")
+    new_section_text = section_text + amendment
+    new_state = pre_state[:section_start] + new_section_text + pre_state[section_end:]
+
+    # Atomic ordering: write → lint → move/rollback (matches cmd_apply).
+    decisions_path.write_text(new_state, encoding="utf-8")
+
+    rc, stderr = run_lint(cfg.method_root)
+    if rc != 0:
+        decisions_path.write_text(pre_state, encoding="utf-8")
+        print("[kb-process] lint-provenance refused after drift-apply; rolled back kb write.", file=sys.stderr)
+        print(stderr, file=sys.stderr)
+        return 1
+
+    processed_dir = memo_dir(cfg.content_root, "processed")
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    final_memo = processed_dir / memo_path.name
+    memo_path.replace(final_memo)
+
+    print(
+        f"[kb-process] drift-applied {art_id} → amendment under "
+        f"`## {decision_title}` in decisions.md; archived to .processed/"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Drift-dismiss + dismissal counter
+# ---------------------------------------------------------------------
+
+
+def dismissal_dir(content_root: Path) -> Path:
+    return content_root / ".harvest" / "drift-dismissals"
+
+
+def record_dismissal(
+    content_root: Path,
+    *, via_uuid: str, art_id: str, reason: str | None,
+) -> None:
+    """Append a dismissal entry to `<vault>/.harvest/drift-dismissals/<via>.json`.
+    Slice 4's suppression mechanism reads this — count of dismissals per
+    decision feeds the per-decision threshold logic.
+
+    Atomic write: tmp + rename so a concurrent reader never sees a partially-
+    written file."""
+    target_dir = dismissal_dir(content_root)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    p = target_dir / f"{via_uuid}.json"
+    entries: list[dict] = []
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                existing = data.get("dismissals")
+                if isinstance(existing, list):
+                    entries = list(existing)
+        except (json.JSONDecodeError, OSError):
+            entries = []
+    # Idempotency: don't double-count a dismissal already recorded for this art_id.
+    if any(isinstance(e, dict) and e.get("art_id") == art_id for e in entries):
+        return
+    entries.append({
+        "art_id": art_id,
+        "dismissed_at": now_iso(),
+        "reason": reason or "",
+    })
+    payload = {"via_uuid": via_uuid, "dismissals": entries}
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(p)
+
+
+def cmd_drift_dismiss(args, cfg) -> int:
+    art_id = args.art_id
+    memo_path = memo_dir(cfg.content_root, "unprocessed") / f"{art_id}.md"
+    if not memo_path.is_file():
+        print(f"[kb-process] memo {art_id} not found in .unprocessed/", file=sys.stderr)
+        return 1
+
+    try:
+        fm, _body = parse_memo_frontmatter(memo_path)
+    except ValueError as exc:
+        print(f"[kb-process] {exc}", file=sys.stderr)
+        return 1
+
+    if not is_drift_candidate(fm):
+        print(
+            f"[kb-process] {art_id} is not a drift candidate. Use `kb-process reject` instead.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Route through the same shape gate as drift-apply: via_uuid flows into
+    # `.harvest/drift-dismissals/<via_uuid>.json`, so a malformed value would
+    # escape the dismissal directory. Refusing here is preferable to silently
+    # dropping the dismissal count (slice 4's suppression depends on it).
+    aff = fm.get("affects_decision")
+    via_uuid: str | None
+    if aff is None:
+        via_uuid = None
+    else:
+        via_uuid, err = parse_via_uuid_from_affects(art_id, aff)
+        if via_uuid is None:
+            print(f"[kb-process] {err}", file=sys.stderr)
+            return 1
+
+    rejected_dir = memo_dir(cfg.content_root, "rejected")
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+    final_path = rejected_dir / memo_path.name
+    memo_path.replace(final_path)
+
+    if args.reason:
+        reason_path = final_path.with_suffix(".reason.txt")
+        reason_path.write_text(
+            f"dismissed_at: {now_iso()}\nreason: {args.reason}\n",
+            encoding="utf-8",
+        )
+
+    if via_uuid:
+        record_dismissal(
+            cfg.content_root, via_uuid=via_uuid, art_id=art_id,
+            reason=args.reason,
+        )
+
+    print(f"[kb-process] dismissed drift candidate {art_id}; archived to .rejected/")
+    return 0
+
+
+# ---------------------------------------------------------------------
 # Reject
 # ---------------------------------------------------------------------
 
@@ -389,8 +800,12 @@ def cmd_list(args, cfg) -> int:
         for p in memos:
             try:
                 fm, _ = parse_memo_frontmatter(p)
-                kind = detect_memo_kind(fm)
-                referent = detect_memo_referent(fm)
+                if is_drift_candidate(fm):
+                    kind = "drift"
+                    referent = str(fm.get("affects_decision", ""))
+                else:
+                    kind = detect_memo_kind(fm)
+                    referent = detect_memo_referent(fm)
             except ValueError:
                 kind, referent = "?", "?"
             out.append({"art_id": p.stem, "kind": kind, "referent": referent})
@@ -405,11 +820,17 @@ def cmd_list(args, cfg) -> int:
     for p in memos:
         try:
             fm, _ = parse_memo_frontmatter(p)
-            kind = detect_memo_kind(fm)
-            referent = detect_memo_referent(fm)
+            if is_drift_candidate(fm):
+                # Drift candidates carry their own [DRIFT] tag; the referent
+                # is the affected decision so reviewers can group at-a-glance.
+                tag = "DRIFT"
+                referent = str(fm.get("affects_decision", "(no affects_decision)"))
+            else:
+                tag = detect_memo_kind(fm)
+                referent = detect_memo_referent(fm)
         except ValueError as exc:
-            kind, referent = "MALFORMED", str(exc)
-        print(f"  {p.stem:<{width}}  [{kind}]  {referent}")
+            tag, referent = "MALFORMED", str(exc)
+        print(f"  {p.stem:<{width}}  [{tag}]  {referent}")
     return 0
 
 
@@ -452,6 +873,21 @@ def main(argv=None) -> int:
     p_reject.add_argument("art_id")
     p_reject.add_argument("--reason", help="optional reason text recorded in a sidecar")
     p_reject.set_defaults(func=cmd_reject)
+
+    p_drift_apply = sub.add_parser(
+        "drift-apply",
+        help="apply a drift candidate as a `### <date> — ...` amendment under the affected decision",
+    )
+    p_drift_apply.add_argument("art_id")
+    p_drift_apply.set_defaults(func=cmd_drift_apply)
+
+    p_drift_dismiss = sub.add_parser(
+        "drift-dismiss",
+        help="archive a drift candidate to .rejected/ + record dismissal count",
+    )
+    p_drift_dismiss.add_argument("art_id")
+    p_drift_dismiss.add_argument("--reason", help="optional reason text recorded in a sidecar")
+    p_drift_dismiss.set_defaults(func=cmd_drift_dismiss)
 
     args = p.parse_args(argv)
     cfg = load_config(require_explicit_content_root=True)
