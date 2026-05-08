@@ -324,24 +324,16 @@ Each harvest run appends a section to `<content_root>/.harvest/daily/YYYY-MM-DD.
 - gmeet: 1 new
 - transcripts: 0
 - kb candidates: 2 pending review
-- kb drift candidates: 1 pending review
 - Errors: none
 
 ### 14:32 — on-demand harvest (you asked: "harvest since lunch")
 - slack: 4 new (1 thread you flagged with :pencil:)
 - granola: 1 new
 - kb candidates: 0 pending review
-- kb drift candidates: 0 pending review
 - Errors: none
 ```
 
-The file is append-only. Multiple runs in one day each get a timestamped section with a run-type marker (scheduled / on-demand) and a per-source count.
-
-- `kb candidates: N pending review` (per #116 slice 5) reports the count of all files in `<content_root>/artefacts/memo/.unprocessed/` after the kb-scan step. Always present (zero-state included). If N > 0 in any recent run, run `/personal-assistant kb-process`.
-- `kb drift candidates: M pending review` (per #135 slice 5) reports the count of drift-candidate memos specifically — produced by `tools/kb-drift-scan.py` after kb-scan. Counted via `kb-process list --count-drift`, which uses `frontmatter.get("drift_candidate") is True` semantics (NOT field-presence — F4 closer) so memos with `drift_candidate: false` aren't miscounted. Always present. M is a strict subset of N (`drift_candidate: true` memos appear in both lines).
-- If kb-drift-scan reports `skipped_for_quota=N` in stderr, the routine also appends `- kb drift: scan quota exhausted, N pairs unscanned (next run resumes)` (F3 closer) so the digest doesn't read green when drift detection didn't fully complete.
-
-Errors get their own line so silent-failure (F2 from #6) doesn't slip past — if an MCP is unreachable, surface it here AND in the routine's exit code.
+The file is append-only. Multiple runs in one day each get a timestamped section with a run-type marker (scheduled / on-demand) and a per-source count. The `kb candidates: N pending review` line (per #116 slice 5) reports the count of files in `<content_root>/artefacts/memo/.unprocessed/` after the kb-scan step; the line is always present (zero-state included) for scannability. If N > 0 in any recent run, that's the trigger to run `/personal-assistant kb-process`. Errors get their own line so silent-failure (F2 from #6) doesn't slip past — if an MCP is unreachable, surface it here AND in the routine's exit code.
 
 ### Cold-start (first run)
 
