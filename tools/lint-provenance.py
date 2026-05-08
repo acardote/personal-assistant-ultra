@@ -423,12 +423,20 @@ def _parse_simple_yaml(text: str) -> dict | None:
     return out
 
 
-def check_artefact_md(path: Path, *, expected_project_id: str | None = None) -> list[Violation]:
+def check_artefact_md(
+    path: Path,
+    *,
+    expected_project_id: str | None,
+    known_artefact_uuids: set[str],
+) -> list[Violation]:
     """Markdown artefact: must have YAML frontmatter with required produced_by.
 
     `expected_project_id` is set when the artefact lives under
     `<content_root>/projects/<slug>/artefacts/...` — frontmatter `project_id`
-    must equal `<slug>`. Flat artefacts pass `None` and skip the check."""
+    must equal `<slug>`. Flat artefacts pass `None` and skip the check.
+
+    `known_artefact_uuids` is plumbed to the produced_by validator so that
+    `art://<uuid>` references in sources_cited can be checked for resolution."""
     out: list[Violation] = []
     text = path.read_text(encoding="utf-8")
     fm = parse_yaml_frontmatter(text)
@@ -487,12 +495,23 @@ def check_artefact_md(path: Path, *, expected_project_id: str | None = None) -> 
             message="produced_by must be a YAML map",
         ))
         return out
-    out.extend(_validate_produced_by_dict(path, pb))
+    out.extend(_validate_produced_by_dict(path, pb, known_artefact_uuids=known_artefact_uuids))
     return out
 
 
-def _validate_produced_by_dict(path: Path, pb: dict) -> list[Violation]:
-    """Shared validator for produced_by dicts (Markdown frontmatter + sidecar JSON)."""
+def _validate_produced_by_dict(
+    path: Path,
+    pb: dict,
+    *,
+    known_artefact_uuids: set[str] | None = None,
+) -> list[Violation]:
+    """Shared validator for produced_by dicts (Markdown frontmatter + sidecar JSON).
+
+    `known_artefact_uuids` is the set of all art-uuids found across the vault
+    (project tier + flat tier). When passed, `art://<uuid>` references in
+    sources_cited are checked for resolution — dangling refs fail the lint
+    (per #98). When None (e.g., per-file invocation outside the vault walk),
+    the dangling-check is skipped."""
     out: list[Violation] = []
     pb_missing = REQUIRED_PRODUCED_BY_KEYS - pb.keys()
     if pb_missing:
@@ -522,10 +541,32 @@ def _validate_produced_by_dict(path: Path, pb: dict) -> list[Violation]:
                         f"(need kb#heading | mem://<id> | art://<id> | https://...)"
                     ),
                 ))
+                continue
+            # Dangling-art-ref check (#98): art://<uuid> must resolve to a
+            # known artefact in the vault. Skip when no index passed.
+            if isinstance(src, str) and src.startswith("art://") and known_artefact_uuids is not None:
+                ref_uuid = src[len("art://"):]
+                if ref_uuid not in known_artefact_uuids:
+                    out.append(Violation(
+                        path=path,
+                        line=1,
+                        kind="artefact-dangling-art-ref",
+                        message=(
+                            f"sources_cited entry {src!r} points at no existing "
+                            f"artefact in the vault (project tier ∪ flat tier). "
+                            f"Either create art-{ref_uuid}.<ext> in artefacts/<kind>/ "
+                            f"or remove this entry from sources_cited."
+                        ),
+                    ))
     return out
 
 
-def check_artefact_export(path: Path, *, expected_project_id: str | None = None) -> list[Violation]:
+def check_artefact_export(
+    path: Path,
+    *,
+    expected_project_id: str | None,
+    known_artefact_uuids: set[str],
+) -> list[Violation]:
     """Non-text artefact: must have sibling `<id>.provenance.json` with produced_by."""
     sidecar = path.with_suffix(".provenance.json")
     if not sidecar.is_file():
@@ -572,11 +613,16 @@ def check_artefact_export(path: Path, *, expected_project_id: str | None = None)
                     f"directory {expected_project_id!r}"
                 ),
             ))
-    out.extend(_validate_produced_by_dict(sidecar, data))
+    out.extend(_validate_produced_by_dict(sidecar, data, known_artefact_uuids=known_artefact_uuids))
     return out
 
 
-def _walk_artefact_tree(art_dir: Path, *, expected_project_id: str | None) -> list[Violation]:
+def _walk_artefact_tree(
+    art_dir: Path,
+    *,
+    expected_project_id: str | None,
+    known_artefact_uuids: set[str],
+) -> list[Violation]:
     """Walk artefacts/<kind>/art-* and dispatch each file to the right checker.
     Returns also a dict-of-uuid-to-paths via the sentinel uuid_index parameter
     to enable cross-tier duplicate detection at the caller level."""
@@ -598,9 +644,17 @@ def _walk_artefact_tree(art_dir: Path, *, expected_project_id: str | None) -> li
             if name.endswith(".provenance.json"):
                 continue
             if kind == "export":
-                out.extend(check_artefact_export(path, expected_project_id=expected_project_id))
+                out.extend(check_artefact_export(
+                    path,
+                    expected_project_id=expected_project_id,
+                    known_artefact_uuids=known_artefact_uuids,
+                ))
             elif name.endswith(".md"):
-                out.extend(check_artefact_md(path, expected_project_id=expected_project_id))
+                out.extend(check_artefact_md(
+                    path,
+                    expected_project_id=expected_project_id,
+                    known_artefact_uuids=known_artefact_uuids,
+                ))
     return out
 
 
@@ -632,30 +686,40 @@ def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
 def check_vault_artefacts(content_root: Path) -> list[Violation]:
     out: list[Violation] = []
 
-    # Flat tier
     flat_root = content_root / "artefacts"
-    out.extend(_walk_artefact_tree(flat_root, expected_project_id=None))
-
-    # Project tier
     projects_root = content_root / "projects"
+
+    # Pass 1 (per #98): build the all-uuids index BEFORE per-artefact walks
+    # so dangling-art-ref checks can resolve against the full vault.
+    flat_uuids = _collect_artefact_uuids(flat_root)
     project_uuid_indices: dict[str, dict[str, list[Path]]] = {}
     if projects_root.is_dir():
         for proj_dir in sorted(projects_root.iterdir()):
-            if not proj_dir.is_dir():
+            if not proj_dir.is_dir() or proj_dir.name.startswith("."):
                 continue
-            slug = proj_dir.name
-            if slug.startswith("."):
-                continue  # .template/ etc.
-            art_root = proj_dir / "artefacts"
-            out.extend(_walk_artefact_tree(art_root, expected_project_id=slug))
-            project_uuid_indices[slug] = _collect_artefact_uuids(art_root)
+            project_uuid_indices[proj_dir.name] = _collect_artefact_uuids(proj_dir / "artefacts")
 
-    # Cross-tier duplicate-uuid invariant (Amendment 1).
-    flat_uuids = _collect_artefact_uuids(flat_root)
     all_uuids: dict[str, list[Path]] = {k: list(v) for k, v in flat_uuids.items()}
     for slug_index in project_uuid_indices.values():
         for uid, paths in slug_index.items():
             all_uuids.setdefault(uid, []).extend(paths)
+    known_artefact_uuids: set[str] = set(all_uuids.keys())
+
+    # Pass 2: per-artefact walks (with the index plumbed for art:// resolution).
+    out.extend(_walk_artefact_tree(
+        flat_root, expected_project_id=None, known_artefact_uuids=known_artefact_uuids,
+    ))
+    if projects_root.is_dir():
+        for proj_dir in sorted(projects_root.iterdir()):
+            if not proj_dir.is_dir() or proj_dir.name.startswith("."):
+                continue
+            out.extend(_walk_artefact_tree(
+                proj_dir / "artefacts",
+                expected_project_id=proj_dir.name,
+                known_artefact_uuids=known_artefact_uuids,
+            ))
+
+    # Cross-tier duplicate-uuid invariant (Amendment 1).
     for uid, paths in all_uuids.items():
         if len(paths) > 1:
             out.append(Violation(
