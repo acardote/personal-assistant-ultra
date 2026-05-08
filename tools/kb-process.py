@@ -393,7 +393,35 @@ def cmd_apply(args, cfg) -> int:
 # drift memo placed in `.unprocessed/` (which the lint-provenance walker
 # doesn't visit, per #137) gets the same shape enforcement at consume time.
 DRIFT_CONFIDENCE_VALUES = {"high", "medium", "low"}
-ART_VIA_RE = re.compile(r"^[\w\-]+$")
+# ASCII-only + length cap: \w in Python defaults to unicode, which would
+# admit `évil` / `中文` / homoglyphs as valid via-uuids — fine for ad-hoc
+# strings, NOT fine when the value flows into filesystem paths
+# (record_dismissal writes `<vault>/.harvest/drift-dismissals/<via>.json`)
+# or substring searches inside kb. Pin to ASCII identifier chars + bounded.
+ART_VIA_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+def parse_via_uuid_from_affects(art_id: str, affects: object) -> tuple[str | None, str]:
+    """Validate `affects_decision` and return (via_uuid, error_message).
+
+    Either `via_uuid` is set (valid) and error is "", or `via_uuid` is None
+    and error explains why. Shared between drift-apply (which writes a kb
+    amendment under the matching section) and drift-dismiss (which writes
+    a `.harvest/drift-dismissals/<via_uuid>.json` file). Both paths flow
+    via_uuid into untrusted positions, so both need the same gate."""
+    if not (isinstance(affects, str) and affects.startswith("art://")):
+        return None, (
+            f"{art_id}: affects_decision missing or not in art:// shape"
+        )
+    candidate = affects[len("art://"):].strip()
+    if not candidate:
+        return None, f"{art_id}: affects_decision has empty uuid"
+    if not ART_VIA_RE.match(candidate):
+        return None, (
+            f"{art_id}: affects_decision={affects!r} has malformed via-uuid "
+            f"(must be ASCII word-chars + hyphens, 1-128 chars)"
+        )
+    return candidate, ""
 
 
 class DuplicateViaUUIDError(Exception):
@@ -493,25 +521,9 @@ def cmd_drift_apply(args, cfg) -> int:
         )
         return 1
 
-    aff = fm.get("affects_decision", "")
-    if not (isinstance(aff, str) and aff.startswith("art://")):
-        print(f"[kb-process] {art_id}: affects_decision missing or not in art:// shape", file=sys.stderr)
-        return 1
-    via_uuid = aff[len("art://"):].strip()
-    if not via_uuid:
-        print(f"[kb-process] {art_id}: affects_decision has empty uuid", file=sys.stderr)
-        return 1
-    # Schema floor: via_uuid must be word-chars + hyphens only. Without this
-    # check, a memo with `affects_decision: art://../../etc` could leak path-
-    # traversal-shaped strings through `record_dismissal`'s filename or the
-    # `via=art-<uuid>` substring search. The slice-1 lint enforces this at
-    # walk time, but `.unprocessed/` isn't walked — we re-enforce here.
-    if not ART_VIA_RE.match(via_uuid):
-        print(
-            f"[kb-process] {art_id}: affects_decision={aff!r} has malformed "
-            f"via-uuid (must be word-chars + hyphens only).",
-            file=sys.stderr,
-        )
+    via_uuid, err = parse_via_uuid_from_affects(art_id, fm.get("affects_decision"))
+    if via_uuid is None:
+        print(f"[kb-process] {err}", file=sys.stderr)
         return 1
 
     drift_claim = str(fm.get("drift_claim", "")).strip()
@@ -702,10 +714,19 @@ def cmd_drift_dismiss(args, cfg) -> int:
         )
         return 1
 
-    aff = fm.get("affects_decision", "")
-    via_uuid = ""
-    if isinstance(aff, str) and aff.startswith("art://"):
-        via_uuid = aff[len("art://"):].strip()
+    # Route through the same shape gate as drift-apply: via_uuid flows into
+    # `.harvest/drift-dismissals/<via_uuid>.json`, so a malformed value would
+    # escape the dismissal directory. Refusing here is preferable to silently
+    # dropping the dismissal count (slice 4's suppression depends on it).
+    aff = fm.get("affects_decision")
+    via_uuid: str | None
+    if aff is None:
+        via_uuid = None
+    else:
+        via_uuid, err = parse_via_uuid_from_affects(art_id, aff)
+        if via_uuid is None:
+            print(f"[kb-process] {err}", file=sys.stderr)
+            return 1
 
     rejected_dir = memo_dir(cfg.content_root, "rejected")
     rejected_dir.mkdir(parents=True, exist_ok=True)

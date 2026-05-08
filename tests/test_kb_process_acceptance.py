@@ -39,6 +39,10 @@ Tests:
   T28 — drift-apply refuses memo with invalid drift_confidence value.
   T29 — drift-apply refuses (with clear error) when two decisions share the
         same via-uuid in kb/decisions.md instead of silently picking the first.
+  T30 — drift-dismiss applies the SAME shape gate as drift-apply (via_uuid
+        flows into the dismissal-record filename, so path-traversal-shaped
+        values must be refused before fopen).
+  T31 — ART_VIA_RE rejects unicode word chars (homoglyph defense).
 """
 
 from __future__ import annotations
@@ -827,6 +831,65 @@ def test_drift_apply_refuses_invalid_confidence():
     print("  T28 PASS — drift-apply refuses invalid drift_confidence")
 
 
+def test_drift_dismiss_refuses_malformed_via_uuid():
+    """T30: drift-dismiss writes `<via_uuid>.json`. The same shape gate
+    drift-apply applies must run here too — otherwise a memo with
+    `affects_decision: art://../../etc` placed in .unprocessed/ and
+    dismissed would escape the dismissal directory."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        _hand_write_drift_memo(
+            vault, art_id="art-d104",
+            fm_extra={
+                "affects_decision": "art://../../etc",
+                "drift_claim": "claim",
+                "drift_confidence": "high",
+            },
+        )
+        r = run_proc(method, "drift-dismiss", "art-d104", expect_rc=1)
+        assert "malformed via-uuid" in r.stderr or "malformed" in r.stderr, r.stderr
+        # Memo NOT moved — refusing before mutation, so user can correct.
+        assert (vault / "artefacts" / "memo" / ".unprocessed" / "art-d104.md").is_file()
+        # No dismissal directory created.
+        assert not (vault / ".harvest" / "drift-dismissals").exists() or \
+               not list((vault / ".harvest" / "drift-dismissals").iterdir())
+    print("  T30 PASS — drift-dismiss applies same shape gate as drift-apply")
+
+
+def test_via_uuid_rejects_unicode_chars():
+    """T31: ASCII-only ART_VIA_RE rejects unicode `\\w` matches (`évil`,
+    `中文`, homoglyphs). Without this gate, two visually-indistinguishable
+    via-uuids (`abc` ASCII vs `аbc` Cyrillic) could collide silently in
+    kb references — defense-in-depth alongside the path-traversal gate."""
+    # Direct unit-test on the helper rather than a full subprocess run —
+    # cheap and exercises the boundary precisely.
+    from importlib.util import spec_from_file_location, module_from_spec
+    spec = spec_from_file_location("kb_proc_t", PROJ / "tools" / "kb-process.py")
+    m = module_from_spec(spec)
+    sys.modules["kb_proc_t"] = m
+    spec.loader.exec_module(m)
+    bad_inputs = [
+        "art://évil",                       # accented latin
+        "art://中文",                        # CJK
+        "art://abc​",                   # zero-width space
+        "art://" + "x" * 200,                # length cap (max 128)
+        "art://",                            # empty
+        "art://../../etc",                   # path traversal classic
+        "art://has space",                   # whitespace
+    ]
+    for bad in bad_inputs:
+        via, err = m.parse_via_uuid_from_affects("art-test", bad)
+        assert via is None, f"{bad!r} should be rejected; got {via!r}"
+        assert err, f"{bad!r}: error message empty"
+    # And valid shapes pass:
+    for ok in ("art://abc-123", "art://aaaaaaaa-1111-2222-3333-444444444444",
+               "art://a", "art://A_B-c"):
+        via, err = m.parse_via_uuid_from_affects("art-test", ok)
+        assert via is not None, f"{ok!r}: rejected ({err})"
+    sys.modules.pop("kb_proc_t", None)
+    print("  T31 PASS — ART_VIA_RE rejects unicode/path-traversal/oversize via-uuids")
+
+
 def test_drift_apply_refuses_duplicate_via_uuid():
     """T29: kb invariant — each via-uuid resolves to exactly ONE decision.
     A copy-paste error or rename-via-copy can produce two ## sections with
@@ -877,4 +940,6 @@ if __name__ == "__main__":
     test_drift_apply_refuses_multiline_drift_claim()
     test_drift_apply_refuses_invalid_confidence()
     test_drift_apply_refuses_duplicate_via_uuid()
+    test_drift_dismiss_refuses_malformed_via_uuid()
+    test_via_uuid_rejects_unicode_chars()
     print("All kb-process tests passed.")
