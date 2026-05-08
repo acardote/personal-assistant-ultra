@@ -389,14 +389,42 @@ def cmd_apply(args, cfg) -> int:
 # ---------------------------------------------------------------------
 
 
+# Drift-candidate schema constants. Mirror the slice-1 lint floors so a
+# drift memo placed in `.unprocessed/` (which the lint-provenance walker
+# doesn't visit, per #137) gets the same shape enforcement at consume time.
+DRIFT_CONFIDENCE_VALUES = {"high", "medium", "low"}
+ART_VIA_RE = re.compile(r"^[\w\-]+$")
+
+
+class DuplicateViaUUIDError(Exception):
+    """Raised when more than one ## section in kb/decisions.md carries the same
+    `via=art-<uuid>` marker — a corrupted-kb invariant violation that drift-apply
+    refuses to write past (manual paste error or a rename that copy-pasted
+    instead of moved)."""
+
+    def __init__(self, via_uuid: str, titles: list[str]):
+        self.via_uuid = via_uuid
+        self.titles = titles
+        super().__init__(
+            f"via=art-{via_uuid} matches {len(titles)} decisions: "
+            f"{titles!r}. kb invariant: each via-uuid must resolve to exactly "
+            f"one decision section."
+        )
+
+
 def find_decision_section_by_via(text: str, via_uuid: str) -> Optional[tuple[int, int, str]]:
     """Locate the `## <title>` H2 section in `kb/decisions.md` whose body
     contains `via=art-<via_uuid>`. Return `(start_offset, end_offset, title)`
     or None when the via-uuid no longer resolves (F5: stale reference at
-    apply time)."""
+    apply time).
+
+    Raises DuplicateViaUUIDError when more than one section carries the same
+    marker — refusing to silently pick the first match (a paste error in kb
+    would otherwise lead to a silent amendment of the wrong decision)."""
     sections = re.split(r"(?=^## )", text, flags=re.MULTILINE)
     offset = 0
     needle = f"via=art-{via_uuid}"
+    matches: list[tuple[int, int, str]] = []
     for sec in sections:
         next_offset = offset + len(sec)
         if not sec.startswith("## "):
@@ -405,9 +433,13 @@ def find_decision_section_by_via(text: str, via_uuid: str) -> Optional[tuple[int
         if needle in sec:
             first_nl = sec.find("\n")
             title = sec[3:first_nl].strip() if first_nl > 0 else sec[3:].strip()
-            return (offset, next_offset, title)
+            matches.append((offset, next_offset, title))
         offset = next_offset
-    return None
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise DuplicateViaUUIDError(via_uuid, [t for _, _, t in matches])
+    return matches[0]
 
 
 def render_drift_amendment(
@@ -469,12 +501,41 @@ def cmd_drift_apply(args, cfg) -> int:
     if not via_uuid:
         print(f"[kb-process] {art_id}: affects_decision has empty uuid", file=sys.stderr)
         return 1
+    # Schema floor: via_uuid must be word-chars + hyphens only. Without this
+    # check, a memo with `affects_decision: art://../../etc` could leak path-
+    # traversal-shaped strings through `record_dismissal`'s filename or the
+    # `via=art-<uuid>` substring search. The slice-1 lint enforces this at
+    # walk time, but `.unprocessed/` isn't walked — we re-enforce here.
+    if not ART_VIA_RE.match(via_uuid):
+        print(
+            f"[kb-process] {art_id}: affects_decision={aff!r} has malformed "
+            f"via-uuid (must be word-chars + hyphens only).",
+            file=sys.stderr,
+        )
+        return 1
 
     drift_claim = str(fm.get("drift_claim", "")).strip()
     if not drift_claim:
         print(f"[kb-process] {art_id}: drift_claim is empty", file=sys.stderr)
         return 1
-    drift_confidence = str(fm.get("drift_confidence", "")).strip()
+    if "\n" in drift_claim:
+        # Drift claims are single-sentence — multi-line strings would corrupt
+        # the rendered amendment body and inject content past the produced_by
+        # comment boundary.
+        print(
+            f"[kb-process] {art_id}: drift_claim must be a single line "
+            f"(got {len(drift_claim.splitlines())} lines)",
+            file=sys.stderr,
+        )
+        return 1
+    drift_confidence = str(fm.get("drift_confidence", "")).strip().lower()
+    if drift_confidence not in DRIFT_CONFIDENCE_VALUES:
+        print(
+            f"[kb-process] {art_id}: drift_confidence={drift_confidence!r} "
+            f"must be one of {sorted(DRIFT_CONFIDENCE_VALUES)}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Surface the source memory id for the amendment body. The drift-scan
     # producer puts it in produced_by.sources_cited as `mem://<id>`.
@@ -513,7 +574,16 @@ def cmd_drift_apply(args, cfg) -> int:
     #   - silently no-op (loses the user's intent),
     #   - appending a new heading (corrupts kb structure),
     #   - or writing an orphan amendment.
-    bounds = find_decision_section_by_via(pre_state, via_uuid)
+    try:
+        bounds = find_decision_section_by_via(pre_state, via_uuid)
+    except DuplicateViaUUIDError as exc:
+        print(
+            f"[kb-process] {art_id}: kb invariant violated — {exc}. "
+            f"Refusing to amend; resolve the duplicate via-uuid in "
+            f"kb/decisions.md before retrying.",
+            file=sys.stderr,
+        )
+        return 1
     if bounds is None:
         print(
             f"[kb-process] affects_decision art://{via_uuid} no longer resolves "

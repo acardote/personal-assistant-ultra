@@ -34,6 +34,11 @@ Tests:
   T23 — drift-apply is idempotent: replay on the same memo refuses (F3).
   T24 — drift-dismiss archives the memo + writes the per-decision dismissal entry.
   T25 — drift-dismiss --reason writes the sidecar reason file.
+  T26 — drift-apply refuses memo with malformed via-uuid (path-traversal-shaped).
+  T27 — drift-apply refuses memo with multi-line drift_claim (corrupts amendment).
+  T28 — drift-apply refuses memo with invalid drift_confidence value.
+  T29 — drift-apply refuses (with clear error) when two decisions share the
+        same via-uuid in kb/decisions.md instead of silently picking the first.
 """
 
 from __future__ import annotations
@@ -724,6 +729,123 @@ def test_drift_dismiss_no_double_count_on_replay():
     print("  T25 PASS — drift-dismiss doesn't double-count replay")
 
 
+def _hand_write_drift_memo(vault: Path, *, art_id: str, fm_extra: dict) -> Path:
+    """Write a drift memo with hand-controlled frontmatter (so tests can probe
+    malformed shapes that `write_drift_memo` would normalize away)."""
+    base = {
+        "id": art_id, "kind": "memo", "created_at": "2026-05-08T10:00:00Z",
+        "title": "'Drift: t'",  # quoted: colon would otherwise re-parse as mapping
+        "drift_candidate": True,
+    }
+    base.update(fm_extra)
+    fm_lines = ["---"]
+    for k, v in base.items():
+        if isinstance(v, bool):
+            fm_lines.append(f"{k}: {'true' if v else 'false'}")
+        else:
+            fm_lines.append(f"{k}: {v}")
+    fm_lines.append("produced_by:")
+    fm_lines.append("  session_id: deadbeef")
+    fm_lines.append("  query: t")
+    fm_lines.append("  model: m")
+    fm_lines.append("  sources_cited:")
+    fm_lines.append("    - mem://test")
+    fm_lines.append("---")
+    fm_lines.append("body")
+    path = vault / "artefacts" / "memo" / ".unprocessed" / f"{art_id}.md"
+    path.write_text("\n".join(fm_lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_drift_apply_refuses_malformed_via_uuid():
+    """T26: a memo with `affects_decision: art://../../etc` must be refused
+    BEFORE it touches kb. Closes the schema-floor gap on the .unprocessed/
+    consume path (lint-provenance walker doesn't visit .unprocessed/, so the
+    schema floor must be re-enforced at consume time)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        _hand_write_drift_memo(
+            vault, art_id="art-d100",
+            fm_extra={
+                "affects_decision": "art://../../etc",
+                "drift_claim": "claim",
+                "drift_confidence": "high",
+            },
+        )
+        r = run_proc(method, "drift-apply", "art-d100", expect_rc=1)
+        assert "malformed via-uuid" in r.stderr or "malformed" in r.stderr, r.stderr
+        # kb untouched.
+        assert "###" not in (vault / "kb" / "decisions.md").read_text(encoding="utf-8")
+    print("  T26 PASS — drift-apply refuses malformed via-uuid (path-traversal-shaped)")
+
+
+def test_drift_apply_refuses_multiline_drift_claim():
+    """T27: a multi-line drift_claim would inject content past the produced_by
+    comment boundary in the rendered amendment, corrupting the kb file."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "11111111-aaaa-bbbb-cccc-dddddddddddd"
+        seed_decision(vault, title="d", scope="x", via_uuid=via_uuid)
+        # YAML literal block scalar `|` produces a real multi-line string.
+        path = vault / "artefacts" / "memo" / ".unprocessed" / "art-d101.md"
+        path.write_text(
+            "---\nid: art-d101\nkind: memo\ncreated_at: 2026-05-08T10:00:00Z\n"
+            "title: 'Drift: t'\ndrift_candidate: true\n"
+            f"affects_decision: art://{via_uuid}\n"
+            "drift_claim: |\n  line one\n  line two\n"
+            "drift_confidence: high\n"
+            "produced_by:\n  session_id: deadbeef\n  query: t\n  model: m\n"
+            f"  sources_cited:\n    - mem://test\n    - art://{via_uuid}\n---\nbody",
+            encoding="utf-8",
+        )
+        r = run_proc(method, "drift-apply", "art-d101", expect_rc=1)
+        assert "single line" in r.stderr or "multi" in r.stderr.lower(), r.stderr
+        # kb untouched.
+        assert "###" not in (vault / "kb" / "decisions.md").read_text(encoding="utf-8")
+    print("  T27 PASS — drift-apply refuses multi-line drift_claim")
+
+
+def test_drift_apply_refuses_invalid_confidence():
+    """T28: drift_confidence outside {high, medium, low} fails — slice-5
+    guardrails will filter on confidence, so invalid values must surface
+    here, not silently pass through to a later filter."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "22222222-aaaa-bbbb-cccc-dddddddddddd"
+        seed_decision(vault, title="d", scope="x", via_uuid=via_uuid)
+        _hand_write_drift_memo(
+            vault, art_id="art-d102",
+            fm_extra={
+                "affects_decision": f"art://{via_uuid}",
+                "drift_claim": "claim",
+                "drift_confidence": "extreme",
+            },
+        )
+        r = run_proc(method, "drift-apply", "art-d102", expect_rc=1)
+        assert "drift_confidence" in r.stderr, r.stderr
+        assert "high" in r.stderr and "medium" in r.stderr and "low" in r.stderr
+    print("  T28 PASS — drift-apply refuses invalid drift_confidence")
+
+
+def test_drift_apply_refuses_duplicate_via_uuid():
+    """T29: kb invariant — each via-uuid resolves to exactly ONE decision.
+    A copy-paste error or rename-via-copy can produce two ## sections with
+    the same via= marker. drift-apply must refuse rather than silently pick
+    the first match (which could amend the wrong decision)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "33333333-aaaa-bbbb-cccc-dddddddddddd"
+        # Seed TWO sections with the same via-uuid.
+        seed_decision(vault, title="First", scope="X", via_uuid=via_uuid)
+        seed_decision(vault, title="Second copy-paste", scope="X", via_uuid=via_uuid)
+        write_drift_memo(vault, art_id="art-d103", via_uuid=via_uuid)
+        r = run_proc(method, "drift-apply", "art-d103", expect_rc=1)
+        assert "invariant" in r.stderr.lower() or "duplicate" in r.stderr.lower() or "matches 2" in r.stderr, r.stderr
+        # kb untouched (no amendment under either heading).
+        assert "###" not in (vault / "kb" / "decisions.md").read_text(encoding="utf-8")
+    print("  T29 PASS — drift-apply refuses duplicate via-uuid (kb invariant)")
+
+
 if __name__ == "__main__":
     print("Running test_kb_process_acceptance.py...")
     test_list_empty()
@@ -751,4 +873,8 @@ if __name__ == "__main__":
     test_drift_apply_idempotent()
     test_drift_dismiss_records_dismissal_entry()
     test_drift_dismiss_no_double_count_on_replay()
+    test_drift_apply_refuses_malformed_via_uuid()
+    test_drift_apply_refuses_multiline_drift_claim()
+    test_drift_apply_refuses_invalid_confidence()
+    test_drift_apply_refuses_duplicate_via_uuid()
     print("All kb-process tests passed.")
