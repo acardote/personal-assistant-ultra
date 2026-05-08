@@ -20,6 +20,7 @@ The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root.
 | `harvest` | follow harvest orchestration in SKILL.md (uses MCP tools, can't go through Bash alone) |
 | `live-writeback` | `tools/live-writeback.py <flags>` |
 | `project` | nested router (see "Subcommand: project" below) — dispatches to `tools/project.py <subcmd>` |
+| `kb-process` | nested router (see "Subcommand: kb-process" below) — dispatches to `tools/kb-process.py <subcmd>` |
 
 ## Per-subcommand notes
 
@@ -62,10 +63,36 @@ Parse the SECOND whitespace-separated token of `$ARGUMENTS` as the project subco
 
 **On unknown `<project-subcmd>`**: print the valid project subcommand list and stop. Do NOT activate the skill or infer intent.
 
+### `kb-process`
+
+KB candidate-memo consumer (per parent [#116](https://github.com/acardote/personal-assistant-ultra/issues/116), child [#121](https://github.com/acardote/personal-assistant-ultra/issues/121)) — interactively walks the unprocessed memos that `tools/kb-scan.py` (slice 2 / #119) emitted and applies approved diffs to the right kb file under the standard diff-and-approve gate.
+
+Parse the SECOND whitespace-separated token of `$ARGUMENTS` as the kb-process subcommand:
+
+| kb-process subcommand | Dispatch | Notes |
+|---|---|---|
+| `list [--json]` | `tools/kb-process.py list [<flag>]` | Prints `art-id [kind] referent` rows for `<vault>/artefacts/memo/.unprocessed/`. |
+| `show <art-id>` | `tools/kb-process.py show <art-id>` | Prints a memo body (the proposed diff lives inside). |
+| `apply <art-id>` | `tools/kb-process.py apply <art-id>` | Appends the diff to the right kb file with inline `<!-- produced_by: session=<current> ... via=<art-id> -->`. Runs lint-provenance — refuses + rolls back on failure. Moves memo to `.processed/`. |
+| `reject <art-id> [--reason TEXT]` | `tools/kb-process.py reject <art-id> [--reason TEXT]` | Moves memo to `.rejected/` without touching kb. |
+
+**Walk pattern (the assistant's job)**: after the user runs `/personal-assistant kb-process`, the assistant calls `kb-process list` to see candidates, then for each:
+1. Call `kb-process show <art-id>` and surface the memo body to the user.
+2. Ask the user "approve / skip (review later) / reject?".
+3. On approve → `kb-process apply <art-id>` (current `PA_SESSION_ID` is automatically used as the inline session_id).
+4. On skip → leave in `.unprocessed/` for the next run.
+5. On reject → `kb-process reject <art-id>` (optionally with `--reason`).
+
+After all candidates processed, run `tools/live-commit-push.sh <content_root> "kb: <summary of approved candidates>"` to land the kb edits.
+
+**Glossary candidates**: `kb-process apply` refuses these — glossary uses PR-only provenance against the method repo. Surface the proposed diff to the user and tell them to open a PR manually.
+
+**On unknown `<kb-process-subcmd>`**: print the valid list and stop.
+
 ## Empty / unknown response template
 
 When `$ARGUMENTS` is empty or unknown, respond with EXACTLY this shape (substituting the literal subcommand list):
 
-> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`, `project`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
+> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`, `project`, `kb-process`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
 
 No skill activation, no clarifying question, no inference.
