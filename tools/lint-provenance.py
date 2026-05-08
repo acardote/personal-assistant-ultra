@@ -91,6 +91,10 @@ REQUIRED_PRODUCED_BY_KEYS = {"session_id", "query", "model", "sources_cited"}
 
 VALID_KINDS = {"analysis", "plan", "draft", "report", "export", "memo"}
 
+# Project slug shape per ADR-0003 Amendment 1: <YYYYMMDD>-<short-name>-<4hex>.
+# Short-name must start AND end alphanumeric (matches tools/project.py).
+PROJECT_SLUG_RE = re.compile(r"^\d{8}-[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?-[0-9a-f]{4}$")
+
 
 class Violation:
     __slots__ = ("path", "line", "kind", "message")
@@ -683,11 +687,46 @@ def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
     return index
 
 
+def check_project_slugs(projects_root: Path) -> list[Violation]:
+    """Per #99: every directory in `<content_root>/projects/` (excluding
+    dot-prefixed dirs which are scaffolding by convention — `.template/`
+    today, future `.archive/` etc.) must match the slug convention from
+    ADR-0003 Amendment 1: `<YYYYMMDD>-<short-name>-<4hex>`.
+
+    Hand-rolled slugs subvert the cross-machine collision defense (the
+    4hex suffix). Use `tools/project.py new` to generate conforming slugs."""
+    out: list[Violation] = []
+    if not projects_root.is_dir():
+        return out
+    for child in sorted(projects_root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if not PROJECT_SLUG_RE.match(child.name):
+            out.append(Violation(
+                path=child,
+                line=None,
+                kind="project-slug-malformed",
+                message=(
+                    f"project directory {child.name!r} doesn't match the "
+                    f"slug convention `<YYYYMMDD>-<short-name>-<4hex>` per "
+                    f"ADR-0003 Amendment 1. Use `tools/project.py new "
+                    f"<short-name> '<intent>'` to generate conforming slugs "
+                    f"for new projects. For an existing folder where the slug "
+                    f"is load-bearing in external references (slack permalinks, "
+                    f"shared docs), either rename + update the references, or "
+                    f"prepend the dot-prefix to opt out of the lint."
+                ),
+            ))
+    return out
+
+
 def check_vault_artefacts(content_root: Path) -> list[Violation]:
     out: list[Violation] = []
 
     flat_root = content_root / "artefacts"
     projects_root = content_root / "projects"
+
+    out.extend(check_project_slugs(projects_root))
 
     # Pass 1 (per #98): build the all-uuids index BEFORE per-artefact walks
     # so dangling-art-ref checks can resolve against the full vault.

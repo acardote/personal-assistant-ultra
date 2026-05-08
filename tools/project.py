@@ -41,10 +41,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config
 
-SLUG_RE = re.compile(r"^\d{8}-[a-z0-9-]+-[0-9a-f]{4}$")
 # Short-name must start AND end alphanumeric, hyphens only between them — no
 # `-foo`, `foo-`, `--foo--`, etc. (S2 from PR #93 review).
 SHORT_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$")
+# Authoritative slug shape lives in tools/lint-provenance.py:PROJECT_SLUG_RE.
+# Don't duplicate here — the lint is the enforcement surface (per #99).
 ART_FILENAME_RE = re.compile(r"^art-(?P<uuid>[\w-]+)\.")
 STATE_TTL_HOURS = 4
 
