@@ -1,0 +1,64 @@
+# Personal-assistant-ultra release policy (machine-readable)
+#
+# Mirrors the textual policy in RELEASE.md. The two documents are
+# cross-checked by .github/workflows/release-policy.yml on every push
+# and PR — drift between them fails the build.
+#
+# Surface entries point at files (or directories) that are part of a
+# release. Edits to any of them belong to the next release per
+# RELEASE.md's bump rules.
+
+release_policy:
+  name: personal-assistant-ultra
+  default_branch: main
+  version_pattern: "vMAJOR.MINOR.PATCH"
+  rc_pattern: "vMAJOR.MINOR.PATCH-rc.N"
+  latest_tag: latest
+
+surfaces:
+  skill:
+    path: .claude/skills/personal-assistant/SKILL.md
+    notes: "The skill body the user invokes. Activation contract + work-execution procedure live here."
+
+  slash_commands:
+    path: .claude/commands/personal-assistant.md
+    notes: "Operator-task router (metrics / freshness-check / harvest / live-writeback / project)."
+
+  tools:
+    path: tools/
+    notes: "Python toolchain — harvest, compress, route, assemble-kb, lint-provenance, project, bootstrap, etc."
+
+  templates:
+    path: templates/
+    notes: "Routine prompts (harvest, watchdog) and launchd plists."
+
+  method_kb:
+    path: kb/glossary.md
+    notes: "Canonical project glossary — shipped to every user of the skill."
+
+  kb_templates:
+    path: kb-templates/
+    notes: "Scaffolding KB files the user copies into their vault."
+
+  method_docs:
+    path: docs/
+    notes: "ADRs, editorial rules, setup, MCP setup, schemas. Reference material."
+
+  workflows:
+    paths:
+      - .github/workflows/bruno-close-gate.yml
+      - .github/workflows/lint-docs.yml
+      - .github/workflows/lint-provenance.yml
+      - .github/workflows/release-policy.yml
+    notes: "Repo CI — Bruno close gate + doc/provenance lints + release-policy cross-check."
+
+  config_example:
+    path: .assistant.local.json.example
+    notes: "Per-checkout config template — gitignored real version points at the user's vault."
+
+  release_artefacts:
+    paths:
+      - RELEASE.md
+      - release-policy.yaml
+      - scripts/check-release-policy.py
+    notes: "Self-describing: the release policy ships with the release."

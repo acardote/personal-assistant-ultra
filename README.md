@@ -1,5 +1,8 @@
 # personal-assistant-ultra
 
+> **Status**: `v0.3.0` reconciled (PA projects + agent-output capture); tag push pending [#113](https://github.com/acardote/personal-assistant-ultra/issues/113). `v0.4.0` not yet in flight.
+> `latest` will track the most recent immutable release tag — see [`RELEASE.md`](RELEASE.md) for the policy.
+
 A Claude Code skill that gives Claude a long-term, three-layer memory architecture (raw archive → editorially compressed memory objects → always-in-context knowledge base) over your accumulated working context (Slack, Gmail, Granola, Google Meet, transcripts, docs).
 
 Architecture follows Leo Sei's ["Your AI Assistant Has Amnesia"](https://compoundandcare.substack.com/p/your-ai-assistant-has-amnesia-heres). Project discipline follows the [Bruno Method](https://www.olympum.com/bruno-method/SPEC.md).
