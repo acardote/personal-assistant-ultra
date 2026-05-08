@@ -512,14 +512,27 @@ def check_artefact_md(
     return out
 
 
-def _drift_truthy(v) -> bool:
-    """Treat YAML scalar 'true'/'yes' (case-insensitive, optional surrounding
-    quotes) as truthy. Everything else — including 'false', empty, missing —
-    leaves drift validation a no-op."""
-    if not isinstance(v, str):
-        return False
-    s = v.strip().strip('"').strip("'").lower()
-    return s in ("true", "yes")
+def _drift_flag_state(fm: dict) -> tuple[str, object]:
+    """Classify the `drift_candidate` field into one of four states:
+
+      - 'absent'    — key missing entirely; skip validation (F1).
+      - 'false'     — explicit `false` (any case, optional quotes); skip.
+      - 'true'      — explicit `true` (any case, optional quotes); validate.
+      - 'malformed' — present but parseable as neither (empty value, typo,
+                      nested-map artifact). Emit `drift-candidate-malformed`
+                      so a half-written flag doesn't silently fail-open.
+
+    Returns (state, raw_value)."""
+    if "drift_candidate" not in fm:
+        return ("absent", None)
+    v = fm["drift_candidate"]
+    if isinstance(v, str):
+        s = v.strip().strip('"').strip("'").lower()
+        if s == "true":
+            return ("true", v)
+        if s == "false":
+            return ("false", v)
+    return ("malformed", v)
 
 
 def _validate_drift_fields(
@@ -530,11 +543,20 @@ def _validate_drift_fields(
 ) -> list[Violation]:
     """Drift-candidate memo schema (slice 1 of parent #135).
 
-    Activation: only when `drift_candidate: true` is set on the frontmatter.
-    Falsy / absent flag short-circuits — no errors raised against fields that
-    weren't intended as drift fields. This is the F1 backward-compat invariant.
+    Activation: only when `drift_candidate: true` is set on a `kind=memo`
+    artefact. Absent / `false` flag short-circuits — no errors raised against
+    fields that weren't intended as drift fields (F1 backward-compat).
 
-    When active, validates:
+    Edge cases:
+      - `drift_candidate:` with empty value, or any non-bool string, fails
+        with `drift-candidate-malformed`. Without this gate, a typo'd flag
+        silently disables validation — fail-open that defeats F1's purpose.
+      - `drift_candidate: true` on a non-memo `kind` fails with
+        `drift-on-non-memo`. Same fail-open class: the spec scopes drift
+        candidates to memos; allowing it elsewhere lets validation be
+        silently bypassed by writing the wrong `kind`.
+
+    When active (state='true' AND kind=memo), validates:
       - `affects_decision`, `drift_claim`, `drift_confidence` all present
         (`drift-missing-required`).
       - `affects_decision` is in `art://<id>` shape (`drift-affects-malformed`)
@@ -547,7 +569,33 @@ def _validate_drift_fields(
         on this value, so invalid entries must surface here, not at digest time.
     """
     out: list[Violation] = []
-    if not _drift_truthy(fm.get("drift_candidate")):
+    state, raw = _drift_flag_state(fm)
+    if state in ("absent", "false"):
+        return out
+    if state == "malformed":
+        out.append(Violation(
+            path=path,
+            line=1,
+            kind="drift-candidate-malformed",
+            message=(
+                f"drift_candidate must be exactly 'true' or 'false' "
+                f"(got {raw!r}); empty values or typos silently disable "
+                f"drift validation — fail-open"
+            ),
+        ))
+        return out
+
+    kind = fm.get("kind")
+    if kind != "memo":
+        out.append(Violation(
+            path=path,
+            line=1,
+            kind="drift-on-non-memo",
+            message=(
+                f"drift_candidate: true is only valid on kind=memo "
+                f"(got kind={kind!r}); see #137 — drift-candidate schema scope"
+            ),
+        ))
         return out
 
     missing: list[str] = []

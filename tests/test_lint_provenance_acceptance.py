@@ -43,6 +43,9 @@ Tests:
   T35 — drift_candidate: true with shape-malformed affects_decision fails distinctly (F3).
   T36 — drift_confidence outside {high, medium, low} fails.
   T37 — drift_candidate: false with no other drift fields passes (flag-gated, F1).
+  T38 — empty drift_candidate value fails (closes fail-open from review).
+  T39 — non-bool drift_candidate value fails distinctly.
+  T40 — drift_candidate: true on non-memo kind fails (kind=memo scope).
 """
 
 from __future__ import annotations
@@ -751,9 +754,12 @@ def test_drift_affects_malformed_distinct_from_missing():
         assert "drift-affects-malformed" in r.stderr, (
             f"expected drift-affects-malformed (distinct from missing)\n{r.stderr}"
         )
-        # And the error code is NOT drift-missing-required — F3 specifically
-        # requires distinct codes for 'absent' vs 'present-but-malformed'.
-        assert "drift-missing-required" not in r.stderr or "drift-affects-malformed" in r.stderr
+        # F3: when affects_decision is PRESENT but malformed, drift-missing-required
+        # must NOT be emitted for that field — operators need distinct codes.
+        # (drift-missing-required is reserved for genuine absence.)
+        assert "drift-missing-required" not in r.stderr, (
+            f"F3 violated: malformed affects_decision must not produce 'missing' code\n{r.stderr}"
+        )
     print("  T35 PASS — malformed affects_decision distinct from missing (F3)")
 
 
@@ -795,6 +801,60 @@ def test_drift_candidate_false_no_other_fields_passes():
     print("  T37 PASS — drift_candidate: false skips drift validation")
 
 
+def test_drift_candidate_empty_value_fails_open_protection():
+    """T38: `drift_candidate:` (empty value) must fail loudly, not silently
+    disable validation. Without this guard the lint is fail-open: a typo or
+    half-written flag passes through with all required fields unchecked."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Hand-write the YAML so the empty-value parse path is exercised.
+        (vault / "artefacts" / "memo" / "art-empty-flag.md").write_text(
+            "---\nid: art-empty-flag\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+            "title: t\ndrift_candidate:\naffects_decision: garbage-not-checked\n"
+            "produced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+            "  sources_cited:\n    - https://x.test\n---\nbody",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1, f"empty drift_candidate should fail\n{r.stderr}"
+        assert "drift-candidate-malformed" in r.stderr, f"expected explicit code\n{r.stderr}"
+    print("  T38 PASS — empty drift_candidate value fails (no fail-open)")
+
+
+def test_drift_candidate_malformed_value_fails():
+    """T39: `drift_candidate: maybe` (or any non-bool string) fails with
+    `drift-candidate-malformed`. Same fail-open class as T38."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-typo-flag.md").write_text(
+            _drift_memo_md("typo-flag", drift_candidate="maybe"),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "drift-candidate-malformed" in r.stderr
+    print("  T39 PASS — non-bool drift_candidate value fails")
+
+
+def test_drift_candidate_on_non_memo_fails():
+    """T40: drift_candidate: true on `kind: analysis` (or any non-memo)
+    fails with `drift-on-non-memo`. Spec scopes drift candidates to memos;
+    silently allowing it elsewhere lets validation be bypassed via wrong kind."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Hand-write because _drift_memo_md hardcodes kind: memo.
+        (vault / "artefacts" / "analysis" / "art-wrong-kind.md").write_text(
+            "---\nid: art-wrong-kind\nkind: analysis\ncreated_at: 2026-06-01T10:00:00Z\n"
+            "title: t\ndrift_candidate: true\nproduced_by:\n  session_id: aaaaaaaa\n"
+            "  query: x\n  model: m\n  sources_cited:\n    - https://x.test\n---\nbody",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "drift-on-non-memo" in r.stderr
+    print("  T40 PASS — drift_candidate: true on non-memo fails")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -834,4 +894,7 @@ if __name__ == "__main__":
     test_drift_affects_malformed_distinct_from_missing()
     test_drift_confidence_invalid_value_fails()
     test_drift_candidate_false_no_other_fields_passes()
+    test_drift_candidate_empty_value_fails_open_protection()
+    test_drift_candidate_malformed_value_fails()
+    test_drift_candidate_on_non_memo_fails()
     print("All lint-provenance tests passed.")
