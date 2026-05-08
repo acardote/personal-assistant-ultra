@@ -110,20 +110,26 @@ Three outcomes:
 
 If the project's context is loaded into your working memory, you have the full project body + recent artefacts available for the rest of this turn. Resume budget is intentionally uncapped (per ADR-0003 Amendment 1) — partial loads yield lossy continuation.
 
-### Pre-flight: kb-candidate count (per [#116](https://github.com/acardote/personal-assistant-ultra/issues/116))
+### Pre-flight: kb-candidate count (per [#116](https://github.com/acardote/personal-assistant-ultra/issues/116) / drift-aware extension per [#142](https://github.com/acardote/personal-assistant-ultra/issues/142))
 
 After the project-active check, count unprocessed KB-candidate memos by running (from method-repo root):
 
 ```
-tools/kb-process.py list --count
+tools/kb-process.py list --count-summary
 ```
 
-The tool reads `<content_root>` from `.assistant.local.json` (no manual substitution needed) and prints just the integer on stdout — `0` if no candidates pending or the directory doesn't exist.
+The tool reads `<content_root>` from `.assistant.local.json` (no manual substitution needed) and prints two integers on stdout: `K J` where K = total unprocessed memos and J = drift subset (the count of memos with `drift_candidate: true`). `0 0` if the directory is empty or missing. Atomic single walk — F2 closer of slice 6 of #135: avoids the race window opened by calling `--count` and `--count-drift` as two separate subprocesses.
 
-- **N == 0**: do NOT mention. Silent on every activation when there's nothing to review.
-- **N > 0**: surface a single line to the user verbatim: *"N kb-candidate memo(s) pending review. Run `/personal-assistant kb-process` to walk them, or ignore for now."* Do NOT auto-launch kb-process — the user controls when to engage. Do NOT preview the candidates at activation; the single line is enough.
+Surface rules (each case mutually exclusive):
 
-This is a passive nudge for harvest-emitted candidates (slice 5 / #125) that need the user's diff-and-approve gate. Without this surface, candidates accumulate in `.unprocessed/` indefinitely until the user remembers to look — defeating the visibility-loop purpose of #116.
+- **K == 0**: do NOT mention. Silent on every activation when there's nothing to review.
+- **K > 0 AND J == 0**: surface a single line to the user verbatim: *"K kb-candidate memo(s) pending review. Run `/personal-assistant kb-process` to walk them, or ignore for now."*
+- **K > 0 AND J > 0 AND J < K** (mixed): surface verbatim: *"K kb-candidate memo(s) pending review (J as drift). Run `/personal-assistant kb-process` to walk them, or ignore for now."*
+- **K > 0 AND J == K** (all drift): surface verbatim: *"K kb-candidate memo(s) pending review (all drift). Run `/personal-assistant kb-process` to walk them, or ignore for now."* — the `(all drift)` phrasing is the F3 closer of #142: avoids the awkward `(K as drift)` redundancy when the subset equals the total.
+
+Do NOT auto-launch kb-process — the user controls when to engage. Do NOT preview the candidates at activation; the single line is enough.
+
+This is a passive nudge for harvest-emitted candidates (slice 5 / #125) and drift-detector-emitted candidates (slice 5 / #141) that need the user's diff-and-approve gate. Without this surface, candidates accumulate in `.unprocessed/` indefinitely until the user remembers to look — defeating the visibility-loop purpose of #116 and #135.
 
 ## Editorial discipline
 

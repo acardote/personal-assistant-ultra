@@ -1084,6 +1084,26 @@ def cmd_reject(args, cfg) -> int:
 def cmd_list(args, cfg) -> int:
     memos = list_memos(cfg.content_root, "unprocessed")
 
+    if args.count_summary:
+        # Atomic two-count emit (F2 closer of slice 6 / #142): activation
+        # pre-flight needs both `total` and `drift` counts. Calling
+        # `--count` and `--count-drift` as separate subprocesses opens a
+        # race window where the vault could mutate between the two reads,
+        # producing inconsistent surface numbers (e.g., drift > total). One
+        # call, one walk, one snapshot — no race.
+        total = 0
+        drift = 0
+        for p in memos:
+            total += 1
+            try:
+                fm, _ = parse_memo_frontmatter(p)
+                if is_drift_candidate(fm):
+                    drift += 1
+            except ValueError:
+                continue
+        print(f"{total} {drift}")
+        return 0
+
     if args.count_drift:
         # F4 of slice 5 (#141): the digest count of drift candidates MUST use
         # `frontmatter.get("drift_candidate") is True`-style semantics so a
@@ -1177,6 +1197,8 @@ def main(argv=None) -> int:
                         help="print the count of all unprocessed memos (drift + non-drift) on stdout")
     p_list.add_argument("--count-drift", action="store_true",
                         help="print the count of drift-candidate memos only (frontmatter drift_candidate: true)")
+    p_list.add_argument("--count-summary", action="store_true",
+                        help="print `<total> <drift>` (two ints, space-separated) atomically in one walk — used by SKILL.md activation pre-flight (F2: avoids race between two subprocess calls)")
     p_list.set_defaults(func=cmd_list)
 
     p_show = sub.add_parser("show", help="print a memo's body")

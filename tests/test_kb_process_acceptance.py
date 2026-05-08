@@ -59,6 +59,9 @@ Tests:
         update_suppression_after_dismissal — defensive coercion to 0.
   T41 — list --count-drift counts ONLY memos with `drift_candidate: true`
         (F4 of slice 5: must NOT count `drift_candidate: false` or absent).
+  T42 — list --count-summary prints `<total> <drift>` atomically; F2 of
+        slice 6: single-walk emit avoids race between two subprocess calls.
+  T43 — list --count-summary boundary cases: 0/0, K>0 J==0, K==J, K>J.
 """
 
 from __future__ import annotations
@@ -1183,6 +1186,68 @@ def test_list_count_drift_filters_correctly():
     print("  T41 PASS — list --count-drift filters by drift_candidate is True (F4)")
 
 
+def test_list_count_summary_emits_two_ints():
+    """T42: --count-summary prints `<total> <drift>` atomically. Used by
+    SKILL.md activation pre-flight — F2 closer of slice 6 (#142): a single
+    walk avoids the race between two subprocess calls (`--count` then
+    `--count-drift`) where the vault could mutate between them."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # 0 / 0
+        r = run_proc(method, "list", "--count-summary")
+        assert r.stdout.strip() == "0 0", r.stdout
+        # 2 drift, 1 non-drift
+        write_drift_memo(vault, art_id="art-d601",
+                         via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        write_drift_memo(vault, art_id="art-d602",
+                         via_uuid="bbbbbbbb-1111-2222-3333-444444444444")
+        write_candidate_memo(
+            vault, art_id="art-c601", kind="org", referent="Acme",
+            sources=["mem://m1", "mem://m2"],
+            proposed_diff="```diff\n+ ## Acme\n+ - test\n```",
+        )
+        r = run_proc(method, "list", "--count-summary")
+        assert r.stdout.strip() == "3 2", f"expected '3 2', got {r.stdout!r}"
+    print("  T42 PASS — list --count-summary emits `<total> <drift>` atomically (F2)")
+
+
+def test_count_summary_boundary_cases():
+    """T43: cover the surface-rule boundaries the activation pre-flight
+    branches on:
+      - 0/0 (silent case)
+      - K>0 J==0 (kb-only existing single line)
+      - K>0 J==K (all drift — F3 closer phrasing)
+      - K>0 J<K (mixed)
+    The CLI just emits numbers; SKILL.md branches on them. We probe the
+    numeric outputs here so SKILL.md's branching is anchored to data."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # 0/0
+        r = run_proc(method, "list", "--count-summary")
+        assert r.stdout.strip() == "0 0"
+
+        # K==1, J==0 (single non-drift)
+        write_candidate_memo(
+            vault, art_id="art-c701", kind="org", referent="Acme",
+            sources=["mem://m1", "mem://m2"],
+            proposed_diff="```diff\n+ ## Acme\n+ - test\n```",
+        )
+        r = run_proc(method, "list", "--count-summary")
+        assert r.stdout.strip() == "1 0", r.stdout
+
+        # K==2, J==1 (mixed)
+        write_drift_memo(vault, art_id="art-d701",
+                         via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        r = run_proc(method, "list", "--count-summary")
+        assert r.stdout.strip() == "2 1", r.stdout
+
+        # K==J: clear non-drift, leave only drift
+        (vault / "artefacts" / "memo" / ".unprocessed" / "art-c701.md").unlink()
+        r = run_proc(method, "list", "--count-summary")
+        assert r.stdout.strip() == "1 1", r.stdout
+    print("  T43 PASS — count-summary boundary cases (0/0, K>0 J==0, K==J, K>J)")
+
+
 def test_dismissal_state_with_malformed_int_doesnt_crash():
     """T40 (defensive coercion): a manual edit that lands a string in
     `dismissals` (e.g., user typed `"three"` while inspecting the file)
@@ -1256,4 +1321,6 @@ if __name__ == "__main__":
     test_drift_reenable_missing_entry_returns_nonzero()
     test_dismissal_state_with_malformed_int_doesnt_crash()
     test_list_count_drift_filters_correctly()
+    test_list_count_summary_emits_two_ints()
+    test_count_summary_boundary_cases()
     print("All kb-process tests passed.")
