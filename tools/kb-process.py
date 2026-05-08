@@ -111,7 +111,16 @@ def parse_memo_frontmatter(memo_path: Path) -> tuple[dict, str]:
 def is_drift_candidate(fm: dict) -> bool:
     """True iff frontmatter sets `drift_candidate: true` (case-insensitive,
     optional surrounding quotes — matches the slice-1 lint's `_drift_truthy`).
-    Drift candidates require a separate handler; `apply` refuses on them."""
+    Drift candidates require a separate handler; `apply` refuses on them.
+
+    Accepted truthy shapes (intentionally narrow per F4 of slice 5 / #141):
+      - YAML bool `true` → Python `True` (PyYAML safe_load output).
+      - String `"true"` / `"yes"` (case-insensitive, stripped quotes).
+
+    Numeric `1` is NOT accepted — PyYAML never parses `true` as `int`, and
+    the conservative-count framing of F4 says only obvious-true should count
+    toward the digest's drift-candidate total. A `drift_candidate: 1` in
+    the wild is a producer bug worth refusing to count silently."""
     v = fm.get("drift_candidate")
     # YAML scalar `true` parses to Python `True` via PyYAML safe_load (used here),
     # whereas the lint's hand-rolled walker keeps it as the string "true". Both

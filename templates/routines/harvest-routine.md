@@ -221,13 +221,17 @@ Drift detection is **always against landed kb decisions, NEVER against un-applie
 
 `PA_SESSION_ID` is shared with kb-scan; emitted drift memos carry that session as their `produced_by.session_id`. When the user later approves a drift candidate via `/personal-assistant kb-process drift-apply`, the inline kb amendment carries the user's interactive session_id (per slice 3 / F4 closer).
 
-If kb-drift-scan crashes mid-run, do NOT retry — log to the digest's "errors:" line and continue. Watermark advances only on clean exit.
+**Distinguish three exit conditions** — they call for distinct digest treatment:
+
+- **rc ≠ 0 (CRASH)**: tool aborted mid-run. Append `- Errors: kb-drift-scan crashed (<rc>): <last stderr line>` to the digest. Do NOT append the drift-count or quota lines below (a count of `.unprocessed/` after a crashed run is misleading — the scan didn't finish). Watermark advances only on clean exit, so the next run resumes from the same point.
+- **rc = 0 with `skipped_for_quota=N > 0` in the summary stderr line** (NOT a crash — clean exit, cap fired): append BOTH the drift-count line AND the quota-exhaustion line. This is the F3 closer of #141: a green digest must NOT hide that detection didn't fully cover the pair pool.
+- **rc = 0 with `skipped_for_quota=0`**: clean run. Append the drift-count line only.
+
+In the daily digest entry, on a clean run (rc=0), after the `kb candidates` line, add: `- kb drift candidates: M pending review` where **M = `cd $METHOD && tools/kb-process.py list --count-drift`**. Per F4 of #141, the count MUST use the `kb-process list --count-drift` helper rather than a bash glob; the helper checks `frontmatter.get("drift_candidate") is True` so memos with `drift_candidate: false` (or no drift field) are NOT counted.
+
+When `skipped_for_quota=N > 0` (still rc=0, per the matrix above), append `- kb drift: scan quota exhausted, N pairs unscanned (next run resumes)` immediately after the drift-count line.
 
 Expected steady-state: 0-5 drift candidates per daily run (most pairs are cached or judged not-drifted). Cold-start fills the cache incrementally over multiple fires (subject to the default `--max-llm-calls=100` cap).
-
-In the daily digest entry, after the `kb candidates` line, add: `- kb drift candidates: M pending review` where **M = `cd $METHOD && tools/kb-process.py list --count-drift`**. Per F4 of #141, the count MUST use the `kb-process list --count-drift` helper rather than a bash glob; the helper checks `frontmatter.get("drift_candidate") is True` so memos with `drift_candidate: false` (or no drift field) are NOT counted. The line is always present (zero-state included).
-
-If `kb-drift-scan` ran but reported `skipped_for_quota=N > 0` (visible in stderr), additionally append `- kb drift: scan quota exhausted, N pairs unscanned (next run resumes)` so the digest doesn't read green when drift detection didn't fully complete (F3 closer of #141).
 
 After all sources complete (including the live write-back catch-up + kb-scan + kb-drift-scan), from $VAULT:
 
