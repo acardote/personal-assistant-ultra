@@ -88,12 +88,16 @@ Out of scope of this policy. Currently single-author; no PR protection on `main`
 
 ## Initial state
 
-The first three releases are tagged retrospectively at the merge commits that closed each parent's Move 5 reconciliation:
+**`v0.3.0` is the first tagged release.** The release-policy machinery (this document, `release-policy.yaml`, `scripts/check-release-policy.py`, `.github/workflows/release-policy.yml`) ships in the v0.3.0 tree itself, so it's the earliest commit where running `scripts/check-release-policy.py` against the tagged tree exits cleanly.
 
-| Tag | Parent | Notes |
+Pre-policy history (annotation only — not tags):
+
+| Milestone | Parent | Notes |
 |---|---|---|
-| `v0.1.0` | [#1](https://github.com/acardote/personal-assistant-ultra/issues/1) | Three-layer memory architecture + harvest pipeline + freshness check + slash command surface. The first state where a user can clone, configure a vault, and run the full read-side flow. |
-| `v0.2.0` | [#76](https://github.com/acardote/personal-assistant-ultra/issues/76) | Agent-output capture: ADR-0003 taxonomy, KB editorial rules, work-execution procedure in SKILL.md, lint-provenance with CI enforcement. The system can now produce knowledge + artefacts with verifiable back-references. |
-| `v0.3.0` | [#88](https://github.com/acardote/personal-assistant-ultra/issues/88) | PA projects: ADR-0003 Amendment 1, vault `projects/` tier, `tools/project.py` (8 subcommands), project-aware Phase 3 routing, lint extension for `art://`+`project_id`, archival sweep, cross-machine resume verification. Multi-session work containers with start/resume mechanics. |
+| Three-layer memory + harvest + slash command | [#1](https://github.com/acardote/personal-assistant-ultra/issues/1) | The first state where a user could clone, configure a vault, and run the full read-side flow. Predates the policy machinery; not tagged. |
+| Agent-output capture | [#76](https://github.com/acardote/personal-assistant-ultra/issues/76) | ADR-0003 taxonomy, KB editorial rules, work-execution procedure, lint-provenance with CI. Predates the policy machinery; not tagged. |
+| PA projects (v0.3.0 tag) | [#88](https://github.com/acardote/personal-assistant-ultra/issues/88) | ADR-0003 Amendment 1, vault `projects/` tier, `tools/project.py`, project-aware Phase 3 routing, archival sweep, cross-machine resume verification. **First tagged release.** |
 
-`latest` initially points at `v0.3.0`. Follow-up patch-level work (`#87`, `#98`, `#99`) closed after the v0.3 baseline; the next tag will be either `v0.3.1` (if cut as a hotfix) or roll into `v0.4.0` (if folded into the next MINOR's release notes).
+If you need to reference a pre-v0.3 commit, use `git log` against the parent issue's reconciliation comment for the corresponding merge SHA. We don't retro-tag because the policy says a tag's tree must include the policy bundle, and pre-v0.3 trees don't.
+
+`latest` will initially point at `v0.3.0` once [#113](https://github.com/acardote/personal-assistant-ultra/issues/113) fires. Follow-up patch-level work (`#87`, `#98`, `#99`) closed after the v0.3 baseline; the next tag will be either `v0.3.1` (if cut as a hotfix) or roll into `v0.4.0` (if folded into the next MINOR's release notes).

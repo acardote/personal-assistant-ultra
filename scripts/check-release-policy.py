@@ -22,6 +22,24 @@ import os
 import sys
 
 
+_SURFACES_HEADING_RE = "## Surfaces in scope"
+
+
+def _extract_surfaces_section(md_text: str) -> str:
+    """Return the body of the `## Surfaces in scope` section of RELEASE.md
+    (between that heading and the next `## ` heading). Empty string if the
+    heading isn't found — the validator will then fail check 2 deterministically
+    on every surface, which is the correct signal."""
+    start = md_text.find(_SURFACES_HEADING_RE)
+    if start == -1:
+        return ""
+    body_start = start + len(_SURFACES_HEADING_RE)
+    next_heading = md_text.find("\n## ", body_start)
+    if next_heading == -1:
+        return md_text[body_start:]
+    return md_text[body_start:next_heading]
+
+
 def main() -> int:
     import yaml  # provided via PEP-723 dependencies above
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +67,13 @@ def main() -> int:
     with open(md_path) as f:
         md_text = f.read()
 
+    # Scope check-2 substring matching to the "## Surfaces in scope" section.
+    # The full document mentions surface keys (`tools`, `docs`, `templates`,
+    # `workflows`) as ordinary prose, so the bare-word fallback was producing
+    # false negatives — drift in YAML wouldn't fail because the key happened
+    # to appear elsewhere in RELEASE.md (per pr-challenger C2 on #114).
+    md_surfaces_section = _extract_surfaces_section(md_text)
+
     fail = False
 
     # Check 1: every path listed in surfaces exists on disk.
@@ -68,23 +93,28 @@ def main() -> int:
                 print(f"FAIL: surface '{surface_key}' references {p!r} which does not exist", file=sys.stderr)
                 fail = True
 
-    # Check 2: every surface key is mentioned somewhere in RELEASE.md
-    # (loose match — we want to catch "added a surface to YAML, forgot to mention in RELEASE.md").
-    md_lower = md_text.lower()
+    # Check 2: every surface key is mentioned in RELEASE.md's "Surfaces in
+    # scope" section (NOT anywhere in the document — common-English words
+    # like "tools", "templates", "docs" appear in prose throughout, which
+    # would mask real drift). Per pr-challenger C2 on #114.
+    section_lower = md_surfaces_section.lower()
     for surface_key in data["surfaces"]:
         # Tolerate underscores vs spaces (method_docs vs "method docs").
         variants = {surface_key.lower(), surface_key.lower().replace("_", " "), surface_key.lower().replace("_", "-")}
-        # Also accept any of the surface's actual paths appearing in RELEASE.md.
         s = data["surfaces"][surface_key]
         paths = []
         if "path" in s:
             paths.append(s["path"])
         if "paths" in s:
             paths.extend(s["paths"])
-        path_in_md = any(p in md_text for p in paths)
-        key_in_md = any(v in md_lower for v in variants)
-        if not (path_in_md or key_in_md):
-            print(f"FAIL: surface '{surface_key}' (paths={paths}) is not mentioned in RELEASE.md", file=sys.stderr)
+        path_in_section = any(p in md_surfaces_section for p in paths)
+        key_in_section = any(v in section_lower for v in variants)
+        if not (path_in_section or key_in_section):
+            print(
+                f"FAIL: surface '{surface_key}' (paths={paths}) is not mentioned "
+                f"in RELEASE.md's '## Surfaces in scope' section",
+                file=sys.stderr,
+            )
             fail = True
 
     # Check 3: every workflow file under .github/workflows/ either appears

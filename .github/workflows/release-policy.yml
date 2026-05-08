@@ -24,11 +24,13 @@ on:
       - ".github/workflows/release-policy.yml"
       - ".github/workflows/**"
       - ".claude/skills/**"
+      - ".claude/commands/**"
       - "tools/**"
       - "templates/**"
       - "kb/**"
       - "kb-templates/**"
       - "docs/**"
+      - ".assistant.local.json.example"
 
 permissions:
   contents: read
