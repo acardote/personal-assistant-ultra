@@ -34,6 +34,8 @@ Tests:
   T26 — flat artefact citing art://<flat-uuid> resolves cleanly.
   T27 — self-referential art://<own-uuid> passes (semantic: derived_from etc.).
   T28 — flat artefact resolves art://<project-tier-uuid>.
+  T29 — project directory with hand-rolled slug fails (#99).
+  T30 — .template/ and other dot-prefixed directories are exempt from slug check.
 """
 
 from __future__ import annotations
@@ -549,6 +551,52 @@ def test_flat_resolves_project_uuid():
     print("  T28 PASS — flat artefact resolves art://<project-uuid>")
 
 
+def test_malformed_project_slug_fails():
+    """Per #99: hand-rolled project directory names that don't match
+    `<YYYYMMDD>-<short-name>-<4hex>` are refused."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "projects").mkdir()
+        # Hand-rolled slug — no date prefix, no 4hex suffix.
+        bad = vault / "projects" / "test"
+        bad.mkdir()
+        (bad / "project.md").write_text(
+            "---\nid: test\ntitle: t\nstatus: active\n"
+            "started_at: 2026-05-08\nlast_active: 2026-05-08\n---\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "project-slug-malformed" in r.stderr
+        assert "'test'" in r.stderr
+    print("  T29 PASS — malformed project slug fails")
+
+
+def test_dot_prefixed_dirs_exempt_from_slug_check():
+    """`.template/` and other dot-prefixed directories under projects/ are
+    intentional exemptions (they hold scaffolding, not real projects)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "projects").mkdir()
+        # Create a .template dir that should NOT trigger the slug check.
+        template = vault / "projects" / ".template"
+        template.mkdir()
+        (template / "project.md").write_text(
+            "---\nid: <slug>\ntitle: <short>\n---\n", encoding="utf-8",
+        )
+        # Also a real conforming slug, to confirm the lint still walks others.
+        real = vault / "projects" / "20260507-real-aaaa"
+        real.mkdir()
+        (real / "project.md").write_text(
+            "---\nid: 20260507-real-aaaa\ntitle: r\nstatus: active\n"
+            "started_at: 2026-05-07\nlast_active: 2026-05-07\n---\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"clean .template + real slug should pass\n{r.stderr}"
+    print("  T30 PASS — dot-prefixed dirs exempt from slug check")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -579,4 +627,6 @@ if __name__ == "__main__":
     test_flat_artefact_resolves_art_ref()
     test_self_reference_passes()
     test_flat_resolves_project_uuid()
+    test_malformed_project_slug_fails()
+    test_dot_prefixed_dirs_exempt_from_slug_check()
     print("All lint-provenance tests passed.")
