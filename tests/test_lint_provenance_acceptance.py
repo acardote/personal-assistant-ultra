@@ -553,23 +553,33 @@ def test_flat_resolves_project_uuid():
 
 def test_malformed_project_slug_fails():
     """Per #99: hand-rolled project directory names that don't match
-    `<YYYYMMDD>-<short-name>-<4hex>` are refused."""
-    with tempfile.TemporaryDirectory() as td:
-        method, vault = make_fixture(Path(td))
-        (vault / "projects").mkdir()
-        # Hand-rolled slug — no date prefix, no 4hex suffix.
-        bad = vault / "projects" / "test"
-        bad.mkdir()
-        (bad / "project.md").write_text(
-            "---\nid: test\ntitle: t\nstatus: active\n"
-            "started_at: 2026-05-08\nlast_active: 2026-05-08\n---\n",
-            encoding="utf-8",
-        )
-        r = run_lint(method)
-        assert r.returncode == 1
-        assert "project-slug-malformed" in r.stderr
-        assert "'test'" in r.stderr
-    print("  T29 PASS — malformed project slug fails")
+    `<YYYYMMDD>-<short-name>-<4hex>` are refused. Several malformed shapes
+    locked in to defend against future regex regressions."""
+    bad_slugs = [
+        "test",                       # no date, no hex
+        "20260507-aaaa",              # missing short-name
+        "20260507---aaaa",            # empty short-name (just hyphens)
+        "20260507-Foo-aaaa",          # uppercase short-name
+        "20260507-foo-bar",           # bad hex (not 4 lowercase hex)
+        "20260507-foo-AAAA",          # uppercase hex
+        "2026-05-07-foo-aaaa",        # date with hyphens not YYYYMMDD
+    ]
+    for bad_name in bad_slugs:
+        with tempfile.TemporaryDirectory() as td:
+            method, vault = make_fixture(Path(td))
+            (vault / "projects").mkdir()
+            bad = vault / "projects" / bad_name
+            bad.mkdir()
+            (bad / "project.md").write_text(
+                f"---\nid: {bad_name}\ntitle: t\nstatus: active\n"
+                f"started_at: 2026-05-08\nlast_active: 2026-05-08\n---\n",
+                encoding="utf-8",
+            )
+            r = run_lint(method)
+            assert r.returncode == 1, f"slug {bad_name!r} should fail; got rc={r.returncode}"
+            assert "project-slug-malformed" in r.stderr, f"slug {bad_name!r}: {r.stderr}"
+            assert repr(bad_name) in r.stderr or bad_name in r.stderr
+    print("  T29 PASS — 7 malformed slug shapes all rejected")
 
 
 def test_dot_prefixed_dirs_exempt_from_slug_check():

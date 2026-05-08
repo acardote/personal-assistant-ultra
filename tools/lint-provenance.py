@@ -689,9 +689,12 @@ def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
 
 def check_project_slugs(projects_root: Path) -> list[Violation]:
     """Per #99: every directory in `<content_root>/projects/` (excluding
-    dot-prefixed dirs like .template) must match the slug convention from
-    ADR-0003 Amendment 1: `<YYYYMMDD>-<short-name>-<4hex>`. Hand-rolled
-    slugs that subvert the cross-machine collision defense fail."""
+    dot-prefixed dirs which are scaffolding by convention — `.template/`
+    today, future `.archive/` etc.) must match the slug convention from
+    ADR-0003 Amendment 1: `<YYYYMMDD>-<short-name>-<4hex>`.
+
+    Hand-rolled slugs subvert the cross-machine collision defense (the
+    4hex suffix). Use `tools/project.py new` to generate conforming slugs."""
     out: list[Violation] = []
     if not projects_root.is_dir():
         return out
@@ -707,8 +710,11 @@ def check_project_slugs(projects_root: Path) -> list[Violation]:
                     f"project directory {child.name!r} doesn't match the "
                     f"slug convention `<YYYYMMDD>-<short-name>-<4hex>` per "
                     f"ADR-0003 Amendment 1. Use `tools/project.py new "
-                    f"<short-name> '<intent>'` to generate a conforming slug, "
-                    f"or rename the existing folder if it was hand-rolled."
+                    f"<short-name> '<intent>'` to generate conforming slugs "
+                    f"for new projects. For an existing folder where the slug "
+                    f"is load-bearing in external references (slack permalinks, "
+                    f"shared docs), either rename + update the references, or "
+                    f"prepend the dot-prefix to opt out of the lint."
                 ),
             ))
     return out
