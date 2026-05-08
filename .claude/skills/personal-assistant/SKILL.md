@@ -308,15 +308,17 @@ Each harvest run appends a section to `<content_root>/.harvest/daily/YYYY-MM-DD.
 - gmail: 2 new (query: label:important)
 - gmeet: 1 new
 - transcripts: 0
+- kb candidates: 2 pending review
 - Errors: none
 
 ### 14:32 — on-demand harvest (you asked: "harvest since lunch")
 - slack: 4 new (1 thread you flagged with :pencil:)
 - granola: 1 new
+- kb candidates: 0 pending review
 - Errors: none
 ```
 
-The file is append-only. Multiple runs in one day each get a timestamped section with a run-type marker (scheduled / on-demand) and a per-source count. Errors get their own line so silent-failure (F2 from #6) doesn't slip past — if an MCP is unreachable, surface it here AND in the routine's exit code.
+The file is append-only. Multiple runs in one day each get a timestamped section with a run-type marker (scheduled / on-demand) and a per-source count. The `kb candidates: N pending review` line (per #116 slice 5) reports the count of files in `<content_root>/artefacts/memo/.unprocessed/` after the kb-scan step; the line is always present (zero-state included) for scannability. If N > 0 in any recent run, that's the trigger to run `/personal-assistant kb-process`. Errors get their own line so silent-failure (F2 from #6) doesn't slip past — if an MCP is unreachable, surface it here AND in the routine's exit code.
 
 ### Cold-start (first run)
 

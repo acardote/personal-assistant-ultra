@@ -90,6 +90,13 @@ Identify the workspace paths. Use `find` constrained to known workspace roots, N
   fi
   export METHOD VAULT
 
+  # Mint a session id for this routine run (per #116 slice 5). Tools that
+  # emit metrics events or kind=memo artefacts (kb-scan) use this so the
+  # routine's outputs share one session_id. The user's interactive
+  # session_id is what later carries through to kb edits when candidates
+  # are approved via kb-process — that's the F3 closer from #121.
+  export PA_SESSION_ID=$(openssl rand -hex 4)
+
 If either resolution fails, exit immediately — do NOT continue with empty paths. The fail-fast is essential: a silent fallback to cwd would write a runaway `.assistant.local.json` and produce a successful-looking run with zero real output.
 
 Write a per-checkout config so the method-repo tools resolve content paths against the vault:
@@ -198,7 +205,17 @@ If a source is unreachable (MCP auth expired, tool not available), log to the di
 
 **Live write-back catch-up (per #74)**: after the per-source harvest completes, run `tools/live-writeback.py` to absorb any artifacts the per-query path missed (machine off when a live finding was captured, skill exited ungracefully, push-collisions that didn't recover). Expected: typically 0-3 deferred artifacts per day in steady state; counts in the dozens during the rollout window.
 
-After all sources complete (including the live write-back catch-up), from $VAULT:
+**KB candidate scan (per #116 / #119)**: after the live write-back, run `cd $METHOD && tools/kb-scan.py` (no flags — incremental-since-watermark is the default) to walk new memory objects since the last scan watermark and emit candidate KB updates as `kind=memo` artefacts under `$VAULT/artefacts/memo/.unprocessed/`. Per ADR-0003 F2 (autonomous-producer carve-out), this step MAY emit memos but MUST NOT write to `$VAULT/kb/*` directly — those candidates land in the user's next interactive `/personal-assistant kb-process` session for the diff-and-approve flow.
+
+`PA_SESSION_ID` is set earlier in this prompt; kb-scan reads it for the memo's `produced_by.session_id`. When the user later approves a candidate via `kb-process apply`, the inline kb provenance comment carries the user's interactive session_id, NOT this routine session (per #121's F3 closer).
+
+If kb-scan crashes mid-run, do NOT retry — log to the digest's "errors:" line and continue with the git-commit step. The watermark is only advanced on clean exit, so the next run will retry from the same point.
+
+Expected steady-state: 0-3 candidates per daily run. Bootstrap (full memory pool) is invoked manually via `/personal-assistant kb-backfill`, NOT from this routine.
+
+In the daily digest entry, after the per-source counts, add: `- kb candidates: N pending review` where N = count of files matching `$VAULT/artefacts/memo/.unprocessed/art-*.md` after the kb-scan step. The line is always present (omit no zero-state — the consistency makes the digest scannable).
+
+After all sources complete (including the live write-back catch-up + kb-scan), from $VAULT:
 
   git add -A
   git commit -m "harvest $(date -u +%Y-%m-%d) (routine)"
