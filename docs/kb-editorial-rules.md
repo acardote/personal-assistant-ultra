@@ -138,6 +138,18 @@ For decisions that apply broadly (e.g., a company-wide policy), use the operatin
 
 The drift detector (per parent [#135](https://github.com/acardote/personal-assistant-ultra/issues/135)) routes newly-harvested memory against decisions sharing the same Scope as the memory's tags or extracted referent. Without Scope, drift detection degrades to noisy topic-overlap inference.
 
+### Drift suppression — knobs
+
+When a drift candidate against decision `art-<via>` has been dismissed `--threshold` times (default 3), `kb-process drift-dismiss` flips `suppressed_at` for that decision in `<vault>/.harvest/kb-drift-suppress.json`, and `kb-drift-scan` skips it on the next run. Sticky design: only `kb-process drift-reenable art-<via>` (or `drift-apply` of an amendment, which contradicts past dismissals and clears suppression automatically) re-opens the decision for re-evaluation.
+
+Configurable via `<vault>/.harvest/kb-drift-config.json`:
+
+```json
+{ "drift_dismissal_threshold": 3 }
+```
+
+Missing or malformed config falls back to the default 3 with a stderr warning. Inspect `<vault>/.harvest/kb-drift-suppress.json` directly to see currently-suppressed decisions and the most-recent N dismissal reasons per decision.
+
 `tools/kb-scan.py`'s decision-extraction prompt emits `referent` in its YAML output today, but the renderer drops it (the bug [#132](https://github.com/acardote/personal-assistant-ultra/issues/132) tracks). Once #132 lands, kb-scan-emitted candidates will carry Scope by construction. Until then, candidates land without Scope and need backfill (as happened to the 54 entries from #116's bootstrap). Existing seed entries (pre-#133) without Scope are grandfathered — `tools/lint-provenance.py` does NOT yet enforce Scope as required (a stricter gate to add later if needed).
 
 ## Provenance (per ADR-0003)

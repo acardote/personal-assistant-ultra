@@ -43,6 +43,20 @@ Tests:
         flows into the dismissal-record filename, so path-traversal-shaped
         values must be refused before fopen).
   T31 — ART_VIA_RE rejects unicode word chars (homoglyph defense).
+  T32 — drift-dismiss: 3 dismissals on the same decision → suppressed_at set
+        (default threshold), banner printed, kb-drift-suppress.json updated.
+  T33 — drift-reenable removes the suppression entry; subsequent dismissal
+        starts the count from 1 again.
+  T34 — config threshold = 5 raises the bar; 3 dismissals do NOT suppress.
+  T35 — malformed kb-drift-config.json: WARN + falls back to default threshold.
+  T36 — F2 race-safety: two concurrent updates on the same decision both
+        land (count == 2, not 1).
+  T37 — drift-reenable refuses malformed art_id.
+  T38 — drift-apply on a previously-suppressed decision clears the
+        suppression entry (applying contradicts past dismissals).
+  T39 — drift-reenable on a missing entry returns rc=1 (typo signal).
+  T40 — manual edit landing a string into `dismissals` doesn't crash
+        update_suppression_after_dismissal — defensive coercion to 0.
 """
 
 from __future__ import annotations
@@ -909,6 +923,257 @@ def test_drift_apply_refuses_duplicate_via_uuid():
     print("  T29 PASS — drift-apply refuses duplicate via-uuid (kb invariant)")
 
 
+def _suppress_state(vault: Path) -> dict:
+    p = vault / ".harvest" / "kb-drift-suppress.json"
+    if not p.is_file():
+        return {"decisions": {}}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def test_drift_dismiss_three_dismissals_suppress_decision():
+    """T32: at default threshold (3), three drift-dismisses on the same
+    decision flip `suppressed_at`. The third dismissal also prints a banner
+    so the user knows kb-drift-scan will skip this decision next run."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "44444444-aaaa-bbbb-cccc-dddddddddddd"
+        for n in range(1, 4):
+            art_id = f"art-d20{n}"
+            write_drift_memo(vault, art_id=art_id, via_uuid=via_uuid)
+            r = run_proc(method, "drift-dismiss", art_id, "--reason", f"reason {n}")
+            state = _suppress_state(vault)
+            entry = state["decisions"].get(f"art-{via_uuid}", {})
+            assert entry.get("dismissals") == n, f"after dismissal {n}: {entry}"
+            if n < 3:
+                assert entry.get("suppressed_at") is None, f"premature suppress at {n}: {entry}"
+            else:
+                assert entry.get("suppressed_at"), f"missing suppressed_at after {n}: {entry}"
+                # Banner printed on the threshold-crossing dismissal.
+                assert "reached the dismissal threshold" in r.stderr, r.stderr
+        # Reasons retained (most-recent first/last as a list).
+        assert {f"reason {i}" for i in (1, 2, 3)} <= set(entry["reasons"])
+    print("  T32 PASS — 3 dismissals on same decision flip suppressed_at")
+
+
+def test_drift_reenable_clears_suppression():
+    """T33: drift-reenable resets the entry; a follow-on dismissal restarts
+    the count from 1 (not 4)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "55555555-aaaa-bbbb-cccc-dddddddddddd"
+        for n in range(3):
+            art_id = f"art-d21{n}"
+            write_drift_memo(vault, art_id=art_id, via_uuid=via_uuid)
+            run_proc(method, "drift-dismiss", art_id)
+        # Suppressed.
+        assert _suppress_state(vault)["decisions"][f"art-{via_uuid}"]["suppressed_at"]
+        # Re-enable.
+        r = run_proc(method, "drift-reenable", f"art-{via_uuid}")
+        assert "cleared suppression" in r.stdout, r.stdout
+        # Entry gone.
+        assert f"art-{via_uuid}" not in _suppress_state(vault)["decisions"]
+        # New dismissal starts counting from 1.
+        write_drift_memo(vault, art_id="art-d219", via_uuid=via_uuid)
+        run_proc(method, "drift-dismiss", "art-d219")
+        entry = _suppress_state(vault)["decisions"][f"art-{via_uuid}"]
+        assert entry["dismissals"] == 1, entry
+        assert entry["suppressed_at"] is None, entry
+    print("  T33 PASS — drift-reenable clears suppression + restarts count")
+
+
+def test_drift_dismiss_threshold_configurable():
+    """T34 (F4 happy path): kb-drift-config.json with threshold=5 raises the
+    bar; 3 dismissals must NOT trigger suppression."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / ".harvest").mkdir(exist_ok=True)
+        (vault / ".harvest" / "kb-drift-config.json").write_text(
+            json.dumps({"drift_dismissal_threshold": 5}),
+            encoding="utf-8",
+        )
+        via_uuid = "66666666-aaaa-bbbb-cccc-dddddddddddd"
+        for n in range(1, 4):
+            art_id = f"art-d22{n}"
+            write_drift_memo(vault, art_id=art_id, via_uuid=via_uuid)
+            run_proc(method, "drift-dismiss", art_id)
+        entry = _suppress_state(vault)["decisions"][f"art-{via_uuid}"]
+        assert entry["dismissals"] == 3
+        assert entry["suppressed_at"] is None, "must NOT suppress under threshold=5"
+    print("  T34 PASS — config threshold raises the bar")
+
+
+def test_drift_dismiss_threshold_malformed_falls_back():
+    """T35 (F4 corner): malformed kb-drift-config.json must WARN and fall
+    back to the default threshold rather than crashing or treating as 0/inf."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / ".harvest").mkdir(exist_ok=True)
+        (vault / ".harvest" / "kb-drift-config.json").write_text(
+            "this isn't json {",
+            encoding="utf-8",
+        )
+        via_uuid = "77777777-aaaa-bbbb-cccc-dddddddddddd"
+        for n in range(3):
+            art_id = f"art-d23{n}"
+            write_drift_memo(vault, art_id=art_id, via_uuid=via_uuid)
+            r = run_proc(method, "drift-dismiss", art_id)
+        # Should warn AND fall back to default of 3 → suppressed.
+        assert "WARN" in r.stderr or "malformed" in r.stderr, r.stderr
+        entry = _suppress_state(vault)["decisions"][f"art-{via_uuid}"]
+        assert entry["suppressed_at"], "default threshold of 3 must still suppress"
+    print("  T35 PASS — malformed config warns + falls back to default threshold")
+
+
+def test_concurrent_dismissal_no_lost_update():
+    """T36 (F2 closer): two concurrent updates on the same decision must
+    both land. Uses a `multiprocessing.Barrier` to release both workers
+    AFTER they've fork+import'd, so the lock is the only thing preventing
+    a lost update — fork-and-import latency can't naturally serialize
+    them. We separately verify (T36b) that without the flock, the test
+    fails — see comment below."""
+    import multiprocessing
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "88888888-aaaa-bbbb-cccc-dddddddddddd"
+
+        ctx = multiprocessing.get_context("fork")
+        # Barrier of 2: each worker waits at the barrier after import,
+        # then both proceed in (close to) lock-step into the critical section.
+        barrier = ctx.Barrier(2)
+
+        def worker(method_path: str, vault_path: str, via: str, n: int,
+                    barrier_obj) -> None:
+            # Module import / sys.path mutation happen BEFORE the barrier so
+            # that import latency doesn't naturally serialize the two workers.
+            sys.path.insert(0, str(Path(method_path) / "tools"))
+            from importlib.util import spec_from_file_location, module_from_spec
+            spec = spec_from_file_location(
+                "kb_proc_w", Path(method_path) / "tools" / "kb-process.py",
+            )
+            mod = module_from_spec(spec)
+            sys.modules["kb_proc_w"] = mod
+            spec.loader.exec_module(mod)
+            barrier_obj.wait()
+            mod.update_suppression_after_dismissal(
+                Path(vault_path), via_uuid=via, reason=f"reason-{n}",
+            )
+
+        procs = [
+            ctx.Process(
+                target=worker,
+                args=(str(method), str(vault), via_uuid, i, barrier),
+            )
+            for i in range(2)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=10)
+            assert p.exitcode == 0, f"worker exited {p.exitcode}"
+
+        entry = _suppress_state(vault)["decisions"].get(f"art-{via_uuid}", {})
+        assert entry.get("dismissals") == 2, (
+            f"F2: lost-update detected — expected 2, got {entry.get('dismissals')}\n"
+            f"entry: {entry}"
+        )
+    # Note for future reviewers: a sanity-probe to confirm this test really
+    # depends on the flock — comment out the `with _suppress_lock(...)` body
+    # in tools/kb-process.py and re-run; this test should fail with
+    # `dismissals=1` (lost update). Don't commit the broken state.
+    print("  T36 PASS — concurrent dismissals serialize via flock (F2)")
+
+
+def test_drift_reenable_refuses_malformed_id():
+    """T37: drift-reenable input is the user-facing identifier; the same
+    ASCII-only gate from drift-apply/dismiss applies."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Wrong prefix
+        r = run_proc(method, "drift-reenable", "not-an-art-id", expect_rc=1)
+        assert "must start with 'art-'" in r.stderr
+        # Path-traversal-shaped via
+        r = run_proc(method, "drift-reenable", "art-../../etc", expect_rc=1)
+        assert "malformed via-uuid" in r.stderr
+    print("  T37 PASS — drift-reenable refuses malformed art_id")
+
+
+def test_drift_apply_clears_prior_suppression():
+    """T38: applying an amendment is the user explicitly endorsing this
+    drift signal as real, which contradicts past dismissals. drift-apply
+    must clear the suppression entry so kb-drift-scan re-evaluates against
+    the now-amended decision rather than continuing to skip it."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+        seed_decision(vault, title="Suppressed but appliable", scope="X",
+                      via_uuid=via_uuid)
+        # Pre-seed the suppression state — simulates: 3 prior dismissals,
+        # decision suppressed, now a NEW drift candidate (somehow already in
+        # .unprocessed/) is being applied by the user.
+        suppress_path = vault / ".harvest" / "kb-drift-suppress.json"
+        suppress_path.parent.mkdir(parents=True, exist_ok=True)
+        suppress_path.write_text(
+            json.dumps({"decisions": {f"art-{via_uuid}": {
+                "dismissals": 3,
+                "suppressed_at": "2026-05-08T10:00:00Z",
+                "reasons": ["false positive"],
+            }}}), encoding="utf-8",
+        )
+        write_drift_memo(vault, art_id="art-d301", via_uuid=via_uuid)
+        r = run_proc(method, "drift-apply", "art-d301",
+                     env_extra={"PA_SESSION_ID": "abcd1234"})
+        # Suppression entry GONE — next scan re-evaluates.
+        state = _suppress_state(vault)
+        assert f"art-{via_uuid}" not in state["decisions"], state
+        assert "cleared prior suppression" in r.stderr, r.stderr
+    print("  T38 PASS — drift-apply clears prior suppression (no sticky-block)")
+
+
+def test_drift_reenable_missing_entry_returns_nonzero():
+    """T39: a typo'd via-uuid on drift-reenable shouldn't print a green
+    'nothing to clear' and exit 0 — that hides the user error. rc=1 with
+    a clear message naming the state file is more discoverable."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        r = run_proc(method, "drift-reenable",
+                     "art-aaaaaaaa-1111-2222-3333-444444444444",
+                     expect_rc=1)
+        assert "not found in kb-drift-suppress.json" in r.stderr
+        # Useful diagnostic: tell the user where to look.
+        assert "kb-drift-suppress.json" in r.stderr
+    print("  T39 PASS — drift-reenable on missing entry returns rc=1")
+
+
+def test_dismissal_state_with_malformed_int_doesnt_crash():
+    """T40 (defensive coercion): a manual edit that lands a string in
+    `dismissals` (e.g., user typed `"three"` while inspecting the file)
+    must NOT crash drift-dismiss with a `int('three')` ValueError. The
+    coercion treats non-int as 0 and starts fresh."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        via_uuid = "aabbccdd-1111-2222-3333-444444444444"
+        # Hand-write malformed state.
+        suppress_path = vault / ".harvest" / "kb-drift-suppress.json"
+        suppress_path.parent.mkdir(parents=True, exist_ok=True)
+        suppress_path.write_text(
+            json.dumps({"decisions": {f"art-{via_uuid}": {
+                "dismissals": "three",      # string, not int
+                "suppressed_at": ["bad"],   # not a string
+                "reasons": "scalar",        # not a list
+            }}}), encoding="utf-8",
+        )
+        write_drift_memo(vault, art_id="art-d401", via_uuid=via_uuid)
+        # Must NOT crash.
+        run_proc(method, "drift-dismiss", "art-d401", "--reason", "fresh")
+        state = _suppress_state(vault)
+        entry = state["decisions"][f"art-{via_uuid}"]
+        # Malformed values were treated as 0 / [] / None; this dismissal is the first.
+        assert entry["dismissals"] == 1, entry
+        assert entry["reasons"] == ["fresh"], entry
+        assert entry["suppressed_at"] is None, entry
+    print("  T40 PASS — malformed int/list/str fields don't crash dismiss path")
+
+
 if __name__ == "__main__":
     print("Running test_kb_process_acceptance.py...")
     test_list_empty()
@@ -942,4 +1207,13 @@ if __name__ == "__main__":
     test_drift_apply_refuses_duplicate_via_uuid()
     test_drift_dismiss_refuses_malformed_via_uuid()
     test_via_uuid_rejects_unicode_chars()
+    test_drift_dismiss_three_dismissals_suppress_decision()
+    test_drift_reenable_clears_suppression()
+    test_drift_dismiss_threshold_configurable()
+    test_drift_dismiss_threshold_malformed_falls_back()
+    test_concurrent_dismissal_no_lost_update()
+    test_drift_reenable_refuses_malformed_id()
+    test_drift_apply_clears_prior_suppression()
+    test_drift_reenable_missing_entry_returns_nonzero()
+    test_dismissal_state_with_malformed_int_doesnt_crash()
     print("All kb-process tests passed.")
