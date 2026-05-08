@@ -19,6 +19,17 @@ For non-trivial work, run the moves in order. Skipping moves produces unsound wo
 - A claim about deployed code that hasn't been resolved against serving state is a confabulation. Refuse to merge.
 - **Closing a parent without re-validating its assumption ledger is a confabulation.** All children closed is necessary, not sufficient. Per SPEC §4.2, a parent closes only when every child is reconciled AND the assumption ledger has been re-validated. For each `A<N>` in the parent's ledger: either file a child to validate it, or post an explicit `## Accept-A<N>: <reason>` comment with reasoning the parent's stakeholders would defend. **Default action when an A<N> is open: file the validating child. Acceptance is the exception, not the path of least resistance.**
 
+## Release discipline (per [`RELEASE.md`](RELEASE.md))
+
+Whenever a parent closes that touched any release-scope surface (per the surfaces list in `release-policy.yaml` — `tools/`, `templates/`, `kb-templates/`, `docs/`, `.claude/skills/`, `.claude/commands/`, `kb/glossary.md`, `.github/workflows/`, `.assistant.local.json.example`), check whether a release tag is needed:
+
+1. Run `git log --oneline $(git describe --tags --abbrev=0)..HEAD` and inspect commits that touch release-scope surfaces.
+2. If those commits constitute a coherent shipping unit (a closed parent or a coordinated set of follow-ups), classify the bump per `RELEASE.md`'s table (MAJOR / MINOR / PATCH).
+3. Surface the recommendation to the user with the proposed version, one-line rationale, and the publish flow link to `RELEASE.md`. Do not tag without explicit user confirmation — tags + force-pushed `latest` have shared-state consequences.
+4. If the user confirms, execute publish-flow steps 4–7 in order: tag + push, force-update `latest`, update `README.md` status line, sanity-check from a fresh clone (or note the sanity-check as deferred if heavyweight).
+
+**Refusal mode**: a closed parent whose changes touch release-scope surfaces and is followed by no release-readiness check is a release-discipline gap (precedent: `v0.3.0` → `v0.4.0` window held two unreleased parents — `#116` and `#135` — for weeks because no parent-close ever prompted a tag check).
+
 ## Anti-patterns (SPEC §11)
 
 These phrases indicate type errors and stop the build:

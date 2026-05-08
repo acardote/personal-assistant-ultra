@@ -1,7 +1,7 @@
 # personal-assistant-ultra
 
-> **Status**: `v0.3.0` shipped (PA projects + agent-output capture). `v0.4.0` not yet in flight.
-> `latest` tracks the most recent immutable release tag — currently `v0.3.0`. See [`RELEASE.md`](RELEASE.md) for the policy.
+> **Status**: `v0.4.0` shipped (kb-scan/kb-process pipeline per #116 + drift detection per #135). `v0.5.0` not yet in flight.
+> `latest` tracks the most recent immutable release tag — currently `v0.4.0`. See [`RELEASE.md`](RELEASE.md) for the policy.
 
 A Claude Code skill that gives Claude a long-term, three-layer memory architecture (raw archive → editorially compressed memory objects → always-in-context knowledge base) over your accumulated working context (Slack, Gmail, Granola, Google Meet, transcripts, docs).
 
