@@ -23,6 +23,8 @@
 #       remain unpushed. Working tree is clean (rebase aborted on conflict).
 #   4 — provenance lint refused (per #85); nothing committed. Fix the
 #       malformed entry and retry.
+#   5 — content_root arg disagrees with .assistant.local.json's configured
+#       vault path (per #87); refuses to lint the wrong tree silently.
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
@@ -36,6 +38,36 @@ COMMIT_MSG="$2"
 if [[ ! -d "$CONTENT_ROOT/.git" ]]; then
     echo "[live-commit-push] $CONTENT_ROOT is not a git repo" >&2
     exit 1
+fi
+
+# Per #87: the lint resolves the vault via .assistant.local.json, NOT via
+# our $CONTENT_ROOT arg. If the two disagree, the lint scans the wrong tree
+# and the gate silently misses. Refuse loudly. Single-vault usage by design;
+# multi-vault would need a separate config story.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+METHOD_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+CONFIGURED_ROOT=$(python3 -c "
+import json, os, sys
+p = os.path.join('$METHOD_ROOT', '.assistant.local.json')
+if not os.path.isfile(p):
+    sys.exit(0)
+try:
+    cr = json.load(open(p)).get('paths', {}).get('content_root')
+except Exception:
+    sys.exit(0)
+if cr:
+    print(os.path.realpath(os.path.expanduser(cr)))
+" 2>/dev/null || true)
+if [[ -n "$CONFIGURED_ROOT" ]]; then
+    ARG_REAL=$(python3 -c "import os, sys; print(os.path.realpath('$CONTENT_ROOT'))")
+    if [[ "$ARG_REAL" != "$CONFIGURED_ROOT" ]]; then
+        echo "[live-commit-push] content_root arg ($ARG_REAL) disagrees with" >&2
+        echo "  .assistant.local.json's configured vault ($CONFIGURED_ROOT)." >&2
+        echo "  The lint would scan the configured vault, not your arg —" >&2
+        echo "  refusing to commit with mismatched scope. Either point" >&2
+        echo "  .assistant.local.json at $ARG_REAL or pass the configured path." >&2
+        exit 5
+    fi
 fi
 
 cd "$CONTENT_ROOT"
