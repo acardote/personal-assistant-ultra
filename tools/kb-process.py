@@ -643,10 +643,23 @@ def cmd_drift_apply(args, cfg) -> int:
     final_memo = processed_dir / memo_path.name
     memo_path.replace(final_memo)
 
+    # Slice 4 interaction: applying an amendment is the user explicitly
+    # endorsing this drift signal as real, which contradicts past
+    # dismissals. Leaving the entry sticky would cause kb-drift-scan to
+    # keep skipping the (now-amended) decision against future memories.
+    # Reset so re-evaluation resumes against the new state.
+    cleared = clear_suppression_for_via(cfg.content_root, via_uuid=via_uuid)
+
     print(
         f"[kb-process] drift-applied {art_id} → amendment under "
         f"`## {decision_title}` in decisions.md; archived to .processed/"
     )
+    if cleared:
+        print(
+            f"[kb-process] cleared prior suppression for art-{via_uuid} "
+            f"(applying drift contradicts past dismissals).",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -783,7 +796,11 @@ def load_drift_config(content_root: Path) -> dict:
 def _suppress_lock(content_root: Path):
     """Blocking exclusive flock on a sidecar lock file. Concurrent
     drift-dismiss / drift-reenable invocations serialize through this so
-    the read-modify-write of kb-drift-suppress.json is atomic (F2 closer)."""
+    the read-modify-write of kb-drift-suppress.json is atomic (F2 closer).
+
+    Probed: removing this body and rerunning T36 in
+    `tests/test_kb_process_acceptance.py` produces a worker crash (rename
+    race on the .tmp file) — the test depends on this lock holding."""
     lock_path = suppress_state_path(content_root).with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "w")
@@ -819,6 +836,25 @@ def _write_suppress_state(content_root: Path, payload: dict) -> None:
     tmp.replace(p)
 
 
+def _coerce_int(v, default: int = 0) -> int:
+    """Defensive coercion: a non-int value (string, None, list, dict) in the
+    state file — manual edit, partial-write recovery, schema drift — must NOT
+    crash drift-dismiss. Treat anything but a plain int as the default.
+    Booleans are excluded (bool is subclass of int in Python)."""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    return default
+
+
+def _coerce_list_of_str(v) -> list[str]:
+    """Same defensive shape — non-list / list-of-non-strings collapses to []."""
+    if not isinstance(v, list):
+        return []
+    return [s for s in v if isinstance(s, str)]
+
+
 def update_suppression_after_dismissal(
     content_root: Path,
     *, via_uuid: str, reason: str | None,
@@ -828,21 +864,30 @@ def update_suppression_after_dismissal(
     when called more than once for the same effective dismissal — the per-
     art-id de-dup happens inside `record_dismissal` (slice 3).
 
-    Returns (new_count, became_suppressed_now)."""
+    Returns (new_count, became_suppressed_now).
+
+    Robustness: coerces every read from the state file defensively. A manual
+    edit landing a string `"three"` in `dismissals`, or a non-list `reasons`
+    field, would otherwise crash `int(...) + 1` and leave the user with a
+    stack trace. We treat non-int dismissals as 0 (start fresh)."""
     cfg_data = load_drift_config(content_root)
     threshold = cfg_data["drift_dismissal_threshold"]
     key = f"art-{via_uuid}"
     became = False
     with _suppress_lock(content_root):
         state = _read_suppress_state(content_root)
-        entry = state["decisions"].get(key) or {}
-        count = int(entry.get("dismissals") or 0) + 1
-        reasons = list(entry.get("reasons") or [])
+        entry = state["decisions"].get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        count = _coerce_int(entry.get("dismissals"), default=0) + 1
+        reasons = _coerce_list_of_str(entry.get("reasons"))
         if reason:
             reasons.append(reason)
         # Cap reason history so this file doesn't grow without bound.
         reasons = reasons[-SUPPRESS_REASON_LOG_CAP:]
         suppressed_at = entry.get("suppressed_at")
+        if not isinstance(suppressed_at, str) or not suppressed_at:
+            suppressed_at = None
         if count >= threshold and not suppressed_at:
             suppressed_at = now_iso()
             became = True
@@ -853,6 +898,25 @@ def update_suppression_after_dismissal(
         }
         _write_suppress_state(content_root, state)
     return count, became
+
+
+def clear_suppression_for_via(content_root: Path, *, via_uuid: str) -> bool:
+    """Remove `art-<via_uuid>` from the suppression map. Returns True if an
+    entry was removed, False if nothing to do.
+
+    Called by drift-apply (slice 3) when amending a decision: the user has
+    explicitly endorsed a drift signal as real, which contradicts past
+    dismissals — leaving the entry sticky would cause kb-drift-scan to keep
+    skipping the (now-amended) decision against future memories. Reset the
+    counter at apply time so re-evaluation resumes against the new state."""
+    key = f"art-{via_uuid}"
+    with _suppress_lock(content_root):
+        state = _read_suppress_state(content_root)
+        if key not in state["decisions"]:
+            return False
+        del state["decisions"][key]
+        _write_suppress_state(content_root, state)
+        return True
 
 
 def reenable_decision(content_root: Path, *, art_id: str) -> tuple[bool, dict | None]:
@@ -886,11 +950,17 @@ def cmd_drift_reenable(args, cfg) -> int:
         return 1
     existed, prior = reenable_decision(cfg.content_root, art_id=art_id)
     if not existed:
+        # Non-zero so a typo'd via-uuid surfaces (rather than the user
+        # thinking the reset succeeded silently). The message names the
+        # state file so the user can verify the intended target's id.
         print(
-            f"[kb-process] {art_id} not found in kb-drift-suppress.json; nothing to clear.",
+            f"[kb-process] {art_id} not found in kb-drift-suppress.json; "
+            f"nothing to clear. If you intended a different decision, "
+            f"check `<vault>/.harvest/kb-drift-suppress.json` for the "
+            f"`art-<via>` keys currently suppressed.",
             file=sys.stderr,
         )
-        return 0
+        return 1
     print(
         f"[kb-process] cleared suppression for {art_id} "
         f"(was: dismissals={prior.get('dismissals')}, "
