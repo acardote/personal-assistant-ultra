@@ -20,6 +20,9 @@ Tests:
   T12 — --max-llm-calls cap: aborts cleanly with skip count.
   T13 — glossary OFF by default.
   T14 — --enable-glossary opts in.
+  T15 — NFKD fold catches accented names (`Mendonça` → `mendonca`).
+  T16 — auto-derived owner exclude pulls tokens from kb/people.md heading.
+  T17 — atomic cache write: tmp + rename, no partial files left around.
 """
 
 from __future__ import annotations
@@ -183,15 +186,35 @@ def test_alias_aware_filter():
     print("  T5 PASS — alias-aware filter excludes")
 
 
-def test_self_exclude():
+def test_self_exclude_universal():
+    """Universal exclusions filter project-management vocabulary regardless
+    of vault. These apply to every vault, not just the one this code shipped
+    with."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
-        # `andre` and `nexar` would otherwise meet threshold but must be excluded.
-        write_memory(vault, "granola_note", "m1", tags=["andre", "nexar"])
-        write_memory(vault, "slack_thread", "m2", tags=["andre", "nexar"])
+        # `meeting` and `kickoff` are universal exclusions.
+        write_memory(vault, "granola_note", "m1", tags=["meeting", "kickoff"])
+        write_memory(vault, "slack_thread", "m2", tags=["meeting", "kickoff"])
         r = run_scan(method, "--all", "--skip-llm")
         assert "phase 1: 0 surviving" in r.stderr
-    print("  T6 PASS — self-exclude list filters andre + nexar")
+    print("  T6 PASS — universal exclusions filter project-management terms")
+
+
+def test_self_exclude_vault_config():
+    """Vault-specific exclusions load from .harvest/kb-scan-config.json so
+    the tool isn't hard-coded to one vault's vocabulary (per pr-challenger B2)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / ".harvest").mkdir(exist_ok=True)
+        (vault / ".harvest" / "kb-scan-config.json").write_text(
+            json.dumps({"self_exclude_tags": ["badas", "vsa"]}),
+            encoding="utf-8",
+        )
+        write_memory(vault, "granola_note", "m1", tags=["badas", "vsa"])
+        write_memory(vault, "slack_thread", "m2", tags=["badas", "vsa"])
+        r = run_scan(method, "--all", "--skip-llm")
+        assert "phase 1: 0 surviving" in r.stderr
+    print("  T6b PASS — vault-config exclusions load + filter")
 
 
 def test_watermark_incremental():
@@ -313,6 +336,66 @@ def test_glossary_off_by_default():
     print("  T13 PASS — glossary OFF by default")
 
 
+def test_nfkd_fold_for_accented_names():
+    """T15: tag `mendonca` should match heading `## Leonor Mendonça` because
+    NFKD folds the cedilla. F4 closer for unicode-bearing names."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Heading uses the accented form
+        (vault / "kb" / "people.md").write_text(
+            "# People\n\n## Leonor Mendonça\n- existing entry\n",
+            encoding="utf-8",
+        )
+        # Memory tags use the ASCII handle form
+        write_memory(vault, "granola_note", "m1", tags=["mendonca"])
+        write_memory(vault, "slack_thread", "m2", tags=["mendonca"])
+        r = run_scan(method, "--all", "--skip-llm")
+        assert "phase 1: 0 surviving" in r.stderr, f"NFKD should fold ç to c\n{r.stderr}"
+    print("  T15 PASS — NFKD fold catches accented heading match")
+
+
+def test_owner_excludes_auto_derived():
+    """T16: tokens of the first non-template heading in people.md / org.md
+    are auto-added to the runtime self-exclude. So if people.md has
+    `## Jane Doe`, tags `jane` and `doe` get excluded."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "kb" / "people.md").write_text(
+            "# People\n\n## Jane Doe\n- the user\n",
+            encoding="utf-8",
+        )
+        # Tag `jane` would otherwise be a candidate (≥2 sources).
+        write_memory(vault, "granola_note", "m1", tags=["jane"])
+        write_memory(vault, "slack_thread", "m2", tags=["jane"])
+        r = run_scan(method, "--all", "--skip-llm")
+        assert "phase 1: 0 surviving" in r.stderr, (
+            f"owner-derived self-exclude should drop `jane` token\n{r.stderr}"
+        )
+    print("  T16 PASS — owner exclude auto-derived from KB")
+
+
+def test_atomic_cache_write():
+    """T17: cache_write uses tmp + rename. After a successful write, only
+    the final file exists — no .tmp file left around."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        sys.path.insert(0, str(method / "tools"))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("kb_scan_t", method / "tools" / "kb-scan.py")
+        m = importlib.util.module_from_spec(spec)
+        sys.modules['kb_scan_t'] = m
+        spec.loader.exec_module(m)
+        m.cache_write(vault, "mem-x", "deadbeef", {"decisions": []})
+        cdir = vault / ".harvest" / "kb-scan-cache"
+        assert (cdir / "mem-x-deadbeef.json").is_file()
+        # No .tmp file left over
+        leftover = list(cdir.glob("*.tmp"))
+        assert not leftover, f"atomic write should leave no tmp files: {leftover}"
+        sys.path.remove(str(method / "tools"))
+        sys.modules.pop('kb_scan_t', None)
+    print("  T17 PASS — atomic cache write (no tmp residue)")
+
+
 if __name__ == "__main__":
     print("Running test_kb_scan_acceptance.py...")
     test_empty_pool()
@@ -320,11 +403,15 @@ if __name__ == "__main__":
     test_threshold_at_skip_llm()
     test_existing_heading_filter()
     test_alias_aware_filter()
-    test_self_exclude()
+    test_self_exclude_universal()
+    test_self_exclude_vault_config()
     test_watermark_incremental()
     test_all_overrides_watermark()
     test_cache_invalidates_on_body_change()
     test_emitted_memo_lints_clean()
     test_max_llm_calls_cap()
     test_glossary_off_by_default()
+    test_nfkd_fold_for_accented_names()
+    test_owner_excludes_auto_derived()
+    test_atomic_cache_write()
     print("All kb-scan tests passed.")

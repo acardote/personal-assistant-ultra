@@ -44,6 +44,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -220,8 +221,14 @@ TEMPLATE_HEADINGS = {
 
 
 def normalize(s: str) -> str:
-    """Lowercase, strip, drop non-alphanumeric chars (except spaces collapsed
-    to single space). Used for heading + tag matching."""
+    """Lowercase, NFKD-fold (so `ç` → `c`, `é` → `e`, etc.), drop non-alphanumeric
+    chars (except spaces collapsed to single space). Used for heading + tag
+    matching. NFKD fold ensures `Leonor Mendonça` and `Leonor Mendonca` both
+    normalize to `leonor mendonca` (F4 closer for unicode-bearing names)."""
+    # NFKD decomposes accented chars into base + combining mark; encoding to
+    # ASCII with errors="ignore" drops the marks.
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", errors="ignore").decode("ascii")
     s = s.lower().strip()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -285,26 +292,87 @@ def kb_referent_matches(tag: str, kb_set: set[str]) -> bool:
 # tags but are not person/org candidates, plus the user's own first-name
 # tag (kb-scan also reads people.md's existing headings to catch the
 # canonical form, but tagging often uses bare first names).
-SELF_EXCLUDE_TAGS_DEFAULT = {
-    "andre",  # vault owner first-name (André Cardote)
-    "nexar",  # operating org
-    # Project-language / topic-shape tags — NOT person/org candidates.
-    # Conservative list; the LLM synthesis prompt also filters via `skip`,
-    # so missing entries here just cost extra LLM calls, not bad emits.
+# Universal exclusions — generic project-management vocabulary that's NEVER
+# person/org-shaped regardless of which vault this tool runs against. Vault-
+# specific exclusions live in `<vault>/.harvest/kb-scan-config.json`; owner
+# tokens are auto-derived from the first non-template heading in
+# `<vault>/kb/people.md` + `<vault>/kb/org.md`.
+UNIVERSAL_EXCLUDE_TAGS: set[str] = {
+    # Project-management process vocabulary
     "meeting", "scheduling", "onboarding", "evaluation",
     "sales", "partnership", "partnerships", "product", "delivery",
-    "legal", "pilot", "edge-cases", "edge cases", "data-collection",
-    "data collection", "enterprise-growth", "enterprise growth",
-    "video-search", "signal-validation", "video-processing",
-    "gm-delivery", "sow", "kickoff", "integration", "commercial",
-    "co-marketing", "co marketing", "deck review", "staging", "revenue",
-    "pricing", "infrastructure", "launch", "insurance", "annotation",
-    "firmware", "mapping", "world model", "data platform", "off road data",
-    "av data", "driver monitoring", "ar glasses", "3d reconstruction",
-    "san francisco", "vru", "vsa", "bd", "dms", "oauth", "gcp", "gcs",
-    "aws", "nda", "gtm", "c staff", "product strategy", "bruno method",
-    "nap",  # internal acronym, not org
+    "legal", "pilot", "kickoff", "integration", "commercial",
+    "deck review", "staging", "revenue", "pricing", "infrastructure",
+    "launch", "annotation", "firmware", "mapping",
+    # Cloud / infra acronyms (universally not orgs)
+    "gcp", "gcs", "aws", "azure", "k8s", "docker", "ssh", "tls", "ssl",
+    "api", "sdk", "oauth", "dns", "http", "https", "url", "uri",
+    # Standard documents / transactions
+    "nda", "sow", "moa", "mou", "rfp", "rfq",
+    # Generic descriptors
+    "edge cases", "edge-cases", "data collection", "data-collection",
+    "enterprise growth", "enterprise-growth", "co marketing", "co-marketing",
+    "product strategy", "bruno method",
 }
+
+
+def load_vault_specific_excludes(content_root: Path) -> set[str]:
+    """Optional vault-specific exclusion list at
+    `<content_root>/.harvest/kb-scan-config.json`. Schema:
+        {"self_exclude_tags": ["term1", "term2", ...]}
+    Empty if file absent or malformed (logged with stderr warning)."""
+    p = content_root / ".harvest" / "kb-scan-config.json"
+    if not p.is_file():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[kb-scan] WARN: kb-scan-config.json malformed ({exc}); skipping", file=sys.stderr)
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    excludes = data.get("self_exclude_tags") or []
+    if not isinstance(excludes, list):
+        return set()
+    return {normalize(str(t)) for t in excludes if isinstance(t, str)}
+
+
+def derive_owner_excludes(content_root: Path) -> set[str]:
+    """Auto-derive owner-tag exclusions from the first non-template heading
+    in `<vault>/kb/people.md` + `<vault>/kb/org.md`. Tokenizes the heading
+    (e.g., `## acardote / André Cardote` → tokens `acardote`, `andre`,
+    `cardote`) so any of those tags fired by harvest get excluded.
+
+    F4 closer: prevents `andre` and `nexar` from being emitted as candidates
+    even if no vault-specific config file is present."""
+    excludes: set[str] = set()
+    for fname in ("people.md", "org.md"):
+        path = content_root / "kb" / fname
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            m = re.match(r"^##\s+(.+?)\s*$", line)
+            if not m:
+                continue
+            heading = m.group(1)
+            norm = normalize(heading)
+            if norm in {normalize(t) for t in TEMPLATE_HEADINGS}:
+                continue
+            if not norm:
+                continue
+            # Tokenize; add each token plus the full normalized heading.
+            excludes.add(norm)
+            for token in norm.split():
+                if len(token) >= 3:  # drop noise like single letters
+                    excludes.add(token)
+            break  # just the first non-template heading per file
+    return excludes
+
+
+def build_self_exclude(content_root: Path) -> set[str]:
+    """Compose the runtime self-exclude set: universal + vault-config + owner."""
+    return UNIVERSAL_EXCLUDE_TAGS | load_vault_specific_excludes(content_root) | derive_owner_excludes(content_root)
 
 
 # ---------------------------------------------------------------------
@@ -417,9 +485,13 @@ def cache_read(content_root: Path, memory_id: str, content_hash: str) -> Optiona
 
 
 def cache_write(content_root: Path, memory_id: str, content_hash: str, payload: dict) -> None:
+    """Atomic write: tmp + rename so a crash mid-write doesn't leave a partial
+    cache file (Phase 3 blocker per pr-challenger #120)."""
     cache_dir(content_root).mkdir(parents=True, exist_ok=True)
-    p = cache_dir(content_root) / f"{memory_id}-{content_hash}.json"
-    p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    final = cache_dir(content_root) / f"{memory_id}-{content_hash}.json"
+    tmp = final.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(final)
 
 
 # ---------------------------------------------------------------------
@@ -757,7 +829,12 @@ def main(argv=None) -> int:
         return 0
 
     people, orgs, decisions_kb, glossary = extract_kb_referents(content_root, method_root)
-    self_exclude = set(SELF_EXCLUDE_TAGS_DEFAULT)
+    self_exclude = build_self_exclude(content_root)
+    print(
+        f"[kb-scan] self-exclude set: {len(self_exclude)} entries "
+        f"(universal + vault-config + owner-derived)",
+        file=sys.stderr,
+    )
 
     # Phase 1: tag aggregation (deterministic, no LLM).
     surviving_tags = aggregate_tags(
@@ -765,14 +842,19 @@ def main(argv=None) -> int:
     )
     print(f"[kb-scan] phase 1: {len(surviving_tags)} surviving person/org tag candidates", file=sys.stderr)
 
-    # Phase 1b: glossary frequency (deterministic, no LLM).
-    person_tag_set = set(surviving_tags.keys())
-    org_tag_set = set(surviving_tags.keys())  # tag aggregation doesn't pre-classify; downstream LLM does
-    surviving_glossary = aggregate_glossary(
-        memories, glossary=glossary,
-        person_tags=person_tag_set, org_tags=org_tag_set,
-    )
-    print(f"[kb-scan] phase 1b: {len(surviving_glossary)} surviving glossary candidates", file=sys.stderr)
+    # Phase 1b: glossary frequency (deterministic, no LLM). Skip computation
+    # entirely when glossary emission is disabled — saves the noun-phrase
+    # walk over the full memory pool.
+    if args.enable_glossary:
+        surviving_tag_set = set(surviving_tags.keys())
+        surviving_glossary = aggregate_glossary(
+            memories, glossary=glossary,
+            person_tags=surviving_tag_set, org_tags=surviving_tag_set,
+        )
+        print(f"[kb-scan] phase 1b: {len(surviving_glossary)} surviving glossary candidates", file=sys.stderr)
+    else:
+        surviving_glossary = {}
+        print("[kb-scan] phase 1b: glossary detection skipped (--enable-glossary OFF)", file=sys.stderr)
 
     if args.skip_llm:
         print("[kb-scan] --skip-llm: stopping after phase 1 (no candidates emitted)", file=sys.stderr)
@@ -787,9 +869,10 @@ def main(argv=None) -> int:
     skipped_for_quota = 0
 
     # Phase 2: per-tag synthesis.
-    for tag, mos in surviving_tags.items():
+    surviving_items = list(surviving_tags.items())
+    for i, (tag, mos) in enumerate(surviving_items):
         if llm_calls >= args.max_llm_calls:
-            skipped_for_quota += len(surviving_tags)  # rough; logged below
+            skipped_for_quota += len(surviving_items) - i
             break
         sources_cited = [f"mem://{m.memory_id}" for m in mos]
         syn = synthesize_person_org(tag, mos)
@@ -815,10 +898,17 @@ def main(argv=None) -> int:
         emit_count += 1
 
     # Phase 3: per-memory decision extraction (cached).
+    # Order: read cache OR call LLM → emit memos for each decision → write
+    # cache LAST. If we crash between memo-emit and cache-write, next run
+    # re-LLMs (idempotent — emitted memos have unique uuids; duplicates cost
+    # the user a skip in kb-process but never lose data). The OLD order
+    # (cache-write before emit) was unsafe per pr-challenger #120 — cache
+    # claimed "already processed" while no memo existed.
     for mo in memories:
         if extract_decision_section(mo.body) is None:
             continue
         cached = cache_read(content_root, mo.memory_id, mo.content_hash)
+        wrote_via_llm = False
         if cached is not None:
             decisions_extracted = cached.get("decisions", [])
         else:
@@ -827,12 +917,8 @@ def main(argv=None) -> int:
                 continue
             decisions_extracted = extract_decisions(mo)
             llm_calls += 1
-            cache_write(content_root, mo.memory_id, mo.content_hash, {
-                "memory_id": mo.memory_id,
-                "content_hash": mo.content_hash,
-                "decisions": decisions_extracted,
-                "scanned_at": now_iso(),
-            })
+            wrote_via_llm = True
+
         for dec in decisions_extracted:
             if not isinstance(dec, dict):
                 continue
@@ -857,6 +943,17 @@ def main(argv=None) -> int:
                 new_path = out_dir / path.name
                 path.replace(new_path)
             emit_count += 1
+
+        # Cache write LAST — only after all memos for this memory have landed.
+        # Atomic write (tmp + rename) so a crash mid-write doesn't leave a
+        # partial cache file that future runs would treat as "already done".
+        if wrote_via_llm:
+            cache_write(content_root, mo.memory_id, mo.content_hash, {
+                "memory_id": mo.memory_id,
+                "content_hash": mo.content_hash,
+                "decisions": decisions_extracted,
+                "scanned_at": now_iso(),
+            })
 
     # Phase 4: glossary candidates (no LLM). Disabled by default — emit-on-flag.
     if not args.enable_glossary:
