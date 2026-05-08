@@ -32,6 +32,8 @@ Tests:
   T24 — project-scoped export sidecar must carry project_id too.
   T25 — dangling art:// reference fails (#98).
   T26 — flat artefact citing art://<flat-uuid> resolves cleanly.
+  T27 — self-referential art://<own-uuid> passes (semantic: derived_from etc.).
+  T28 — flat artefact resolves art://<project-tier-uuid>.
 """
 
 from __future__ import annotations
@@ -506,6 +508,47 @@ def test_flat_artefact_resolves_art_ref():
     print("  T26 PASS — art://<uuid> resolves to flat artefact")
 
 
+def test_self_reference_passes():
+    """An artefact citing its own art:// uuid should resolve cleanly — the
+    index includes self. derived_from / cycle patterns rely on this."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-cycle.md").write_text(
+            _project_artefact_md(
+                "20260507-test-aaaa", "cycle", "20260507-test-aaaa",
+                sources=["art://cycle"],
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"self-ref should resolve\n{r.stderr}"
+    print("  T27 PASS — self-referential art:// passes")
+
+
+def test_flat_resolves_project_uuid():
+    """Cross-tier resolution works in BOTH directions: a flat artefact citing
+    art://<project-tier-uuid> must resolve too."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Project artefact (target).
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-proj-target.md").write_text(
+            _project_artefact_md("20260507-test-aaaa", "proj-target", "20260507-test-aaaa"),
+            encoding="utf-8",
+        )
+        # Flat artefact (referencer).
+        (vault / "artefacts" / "memo" / "art-flat-ref.md").write_text(
+            "---\nid: art-flat-ref\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+            "title: t\nproduced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+            "  sources_cited:\n    - art://proj-target\n---\nbody",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"flat → project art:// should resolve\n{r.stderr}"
+    print("  T28 PASS — flat artefact resolves art://<project-uuid>")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -534,4 +577,6 @@ if __name__ == "__main__":
     test_project_scoped_export_sidecar_project_id()
     test_dangling_art_ref_fails()
     test_flat_artefact_resolves_art_ref()
+    test_self_reference_passes()
+    test_flat_resolves_project_uuid()
     print("All lint-provenance tests passed.")

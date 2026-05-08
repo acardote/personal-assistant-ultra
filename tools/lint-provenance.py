@@ -426,8 +426,8 @@ def _parse_simple_yaml(text: str) -> dict | None:
 def check_artefact_md(
     path: Path,
     *,
-    expected_project_id: str | None = None,
-    known_artefact_uuids: set[str] | None = None,
+    expected_project_id: str | None,
+    known_artefact_uuids: set[str],
 ) -> list[Violation]:
     """Markdown artefact: must have YAML frontmatter with required produced_by.
 
@@ -553,7 +553,9 @@ def _validate_produced_by_dict(
                         kind="artefact-dangling-art-ref",
                         message=(
                             f"sources_cited entry {src!r} points at no existing "
-                            f"artefact in the vault (project tier ∪ flat tier)"
+                            f"artefact in the vault (project tier ∪ flat tier). "
+                            f"Either create art-{ref_uuid}.<ext> in artefacts/<kind>/ "
+                            f"or remove this entry from sources_cited."
                         ),
                     ))
     return out
@@ -562,8 +564,8 @@ def _validate_produced_by_dict(
 def check_artefact_export(
     path: Path,
     *,
-    expected_project_id: str | None = None,
-    known_artefact_uuids: set[str] | None = None,
+    expected_project_id: str | None,
+    known_artefact_uuids: set[str],
 ) -> list[Violation]:
     """Non-text artefact: must have sibling `<id>.provenance.json` with produced_by."""
     sidecar = path.with_suffix(".provenance.json")
@@ -619,7 +621,7 @@ def _walk_artefact_tree(
     art_dir: Path,
     *,
     expected_project_id: str | None,
-    known_artefact_uuids: set[str] | None = None,
+    known_artefact_uuids: set[str],
 ) -> list[Violation]:
     """Walk artefacts/<kind>/art-* and dispatch each file to the right checker.
     Returns also a dict-of-uuid-to-paths via the sentinel uuid_index parameter
