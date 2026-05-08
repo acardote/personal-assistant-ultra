@@ -95,6 +95,14 @@ VALID_KINDS = {"analysis", "plan", "draft", "report", "export", "memo"}
 # Short-name must start AND end alphanumeric (matches tools/project.py).
 PROJECT_SLUG_RE = re.compile(r"^\d{8}-[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?-[0-9a-f]{4}$")
 
+# Drift-candidate memo schema (#137 / parent #135). When `drift_candidate: true`
+# is set on a memo's frontmatter, these three fields become required and validated.
+# When the flag is absent / falsy, all four fields are silently ignored (F1
+# backward-compat: existing memos must be unaffected).
+DRIFT_REQUIRED_WHEN_FLAG = ("affects_decision", "drift_claim", "drift_confidence")
+DRIFT_CONFIDENCE_VALUES = {"high", "medium", "low"}
+ART_REF_RE = re.compile(r"^art://[\w\-]+$")
+
 
 class Violation:
     __slots__ = ("path", "line", "kind", "message")
@@ -500,6 +508,104 @@ def check_artefact_md(
         ))
         return out
     out.extend(_validate_produced_by_dict(path, pb, known_artefact_uuids=known_artefact_uuids))
+    out.extend(_validate_drift_fields(path, fm, known_artefact_uuids=known_artefact_uuids))
+    return out
+
+
+def _drift_truthy(v) -> bool:
+    """Treat YAML scalar 'true'/'yes' (case-insensitive, optional surrounding
+    quotes) as truthy. Everything else — including 'false', empty, missing —
+    leaves drift validation a no-op."""
+    if not isinstance(v, str):
+        return False
+    s = v.strip().strip('"').strip("'").lower()
+    return s in ("true", "yes")
+
+
+def _validate_drift_fields(
+    path: Path,
+    fm: dict,
+    *,
+    known_artefact_uuids: set[str] | None,
+) -> list[Violation]:
+    """Drift-candidate memo schema (slice 1 of parent #135).
+
+    Activation: only when `drift_candidate: true` is set on the frontmatter.
+    Falsy / absent flag short-circuits — no errors raised against fields that
+    weren't intended as drift fields. This is the F1 backward-compat invariant.
+
+    When active, validates:
+      - `affects_decision`, `drift_claim`, `drift_confidence` all present
+        (`drift-missing-required`).
+      - `affects_decision` is in `art://<id>` shape (`drift-affects-malformed`)
+        — distinct error from absence so operators can tell 'add the field'
+        apart from 'fix the field' (F3).
+      - `affects_decision` resolves against the vault's all-uuids index
+        (`drift-affects-dangling`) — without resolution the downstream drift
+        detector would silently target nonexistent decisions (F2).
+      - `drift_confidence` ∈ {high, medium, low} — slice 5 guardrails filter
+        on this value, so invalid entries must surface here, not at digest time.
+    """
+    out: list[Violation] = []
+    if not _drift_truthy(fm.get("drift_candidate")):
+        return out
+
+    missing: list[str] = []
+    for k in DRIFT_REQUIRED_WHEN_FLAG:
+        v = fm.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            missing.append(k)
+    if missing:
+        out.append(Violation(
+            path=path,
+            line=1,
+            kind="drift-missing-required",
+            message=(
+                f"drift_candidate: true requires {list(DRIFT_REQUIRED_WHEN_FLAG)}; "
+                f"missing: {missing}"
+            ),
+        ))
+
+    aff = fm.get("affects_decision")
+    if isinstance(aff, str) and aff.strip():
+        aff_s = aff.strip().strip('"').strip("'")
+        if not ART_REF_RE.match(aff_s):
+            out.append(Violation(
+                path=path,
+                line=1,
+                kind="drift-affects-malformed",
+                message=(
+                    f"affects_decision must be art://<uuid> shape, got {aff_s!r}"
+                ),
+            ))
+        elif known_artefact_uuids is not None:
+            ref_uuid = aff_s[len("art://"):]
+            if ref_uuid not in known_artefact_uuids:
+                out.append(Violation(
+                    path=path,
+                    line=1,
+                    kind="drift-affects-dangling",
+                    message=(
+                        f"affects_decision={aff_s!r} doesn't resolve to any "
+                        f"vault artefact (project tier ∪ flat tier). The drift "
+                        f"target memo must exist before drift candidates land."
+                    ),
+                ))
+
+    conf = fm.get("drift_confidence")
+    if isinstance(conf, str) and conf.strip():
+        conf_s = conf.strip().strip('"').strip("'")
+        if conf_s not in DRIFT_CONFIDENCE_VALUES:
+            out.append(Violation(
+                path=path,
+                line=1,
+                kind="drift-confidence-invalid",
+                message=(
+                    f"drift_confidence must be one of "
+                    f"{sorted(DRIFT_CONFIDENCE_VALUES)} (got {conf_s!r})"
+                ),
+            ))
+
     return out
 
 

@@ -36,6 +36,13 @@ Tests:
   T28 — flat artefact resolves art://<project-tier-uuid>.
   T29 — project directory with hand-rolled slug fails (#99).
   T30 — .template/ and other dot-prefixed directories are exempt from slug check.
+  T31 — kind=memo with all 4 drift fields populated correctly passes (#137).
+  T32 — drift_candidate: true with missing required drift field fails distinctly.
+  T33 — kind=memo without any drift fields still passes (F1 backward-compat).
+  T34 — drift_candidate: true with unresolvable affects_decision fails (F2).
+  T35 — drift_candidate: true with shape-malformed affects_decision fails distinctly (F3).
+  T36 — drift_confidence outside {high, medium, low} fails.
+  T37 — drift_candidate: false with no other drift fields passes (flag-gated, F1).
 """
 
 from __future__ import annotations
@@ -607,6 +614,187 @@ def test_dot_prefixed_dirs_exempt_from_slug_check():
     print("  T30 PASS — dot-prefixed dirs exempt from slug check")
 
 
+def _drift_memo_md(art_uuid: str, *, drift_candidate: str | None = None,
+                   affects_decision: str | None = None,
+                   drift_claim: str | None = None,
+                   drift_confidence: str | None = None,
+                   sources: list[str] = None) -> str:
+    """Render a kind=memo artefact .md with optional drift fields.
+
+    Each `None` field is omitted entirely from frontmatter (not emitted as
+    empty string) — matches how a real producer would write the file."""
+    sources = sources or ["https://x.test"]
+    src_lines = "\n".join(f"    - {s}" for s in sources)
+    optional_lines = []
+    if drift_candidate is not None:
+        optional_lines.append(f"drift_candidate: {drift_candidate}")
+    if affects_decision is not None:
+        optional_lines.append(f"affects_decision: {affects_decision}")
+    if drift_claim is not None:
+        optional_lines.append(f"drift_claim: {drift_claim}")
+    if drift_confidence is not None:
+        optional_lines.append(f"drift_confidence: {drift_confidence}")
+    optional = ("\n" + "\n".join(optional_lines)) if optional_lines else ""
+    return (
+        f"---\nid: art-{art_uuid}\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+        f"title: drift candidate{optional}\nproduced_by:\n  session_id: aaaaaaaa\n"
+        f"  query: scan kb decisions for drift\n  model: claude-opus-4-7\n"
+        f"  sources_cited:\n{src_lines}\n---\nbody"
+    )
+
+
+def test_drift_candidate_well_formed_passes():
+    """T31: kind=memo with all 4 drift fields populated correctly passes."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Create the artefact that affects_decision will resolve to.
+        (vault / "artefacts" / "memo" / "art-source-decision.md").write_text(
+            _drift_memo_md("source-decision"), encoding="utf-8",
+        )
+        (vault / "artefacts" / "memo" / "art-drift-candidate.md").write_text(
+            _drift_memo_md(
+                "drift-candidate",
+                drift_candidate="true",
+                affects_decision="art://source-decision",
+                drift_claim="Decision X says Y, but recent memory N indicates Z.",
+                drift_confidence="high",
+                sources=["mem://mem-abc", "kb#decision-x"],
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"well-formed drift-candidate should pass\n{r.stderr}"
+    print("  T31 PASS — well-formed drift-candidate memo passes")
+
+
+def test_drift_candidate_missing_required_fails():
+    """T32: drift_candidate: true but missing one of the 3 required fields
+    fails with `drift-missing-required` (distinct error, not a generic one)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-source.md").write_text(
+            _drift_memo_md("source"), encoding="utf-8",
+        )
+        # Missing drift_claim entirely.
+        (vault / "artefacts" / "memo" / "art-incomplete.md").write_text(
+            _drift_memo_md(
+                "incomplete",
+                drift_candidate="true",
+                affects_decision="art://source",
+                drift_confidence="medium",
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "drift-missing-required" in r.stderr, f"expected drift-missing-required\n{r.stderr}"
+        assert "drift_claim" in r.stderr, f"expected named missing field\n{r.stderr}"
+    print("  T32 PASS — drift_candidate: true with missing field fails distinctly")
+
+
+def test_memo_without_drift_fields_passes_backward_compat():
+    """T33 (F1): kind=memo without any drift_* fields must pass — the validator
+    gates on `drift_candidate: true`, not on field-presence."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-regular.md").write_text(
+            _drift_memo_md("regular"), encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"regular memo (no drift fields) should pass\n{r.stderr}"
+    print("  T33 PASS — regular memo with no drift fields passes (F1)")
+
+
+def test_drift_affects_dangling_fails():
+    """T34 (F2): drift_candidate: true with affects_decision pointing at a
+    well-formed-but-unresolvable art:// reference fails with
+    `drift-affects-dangling`. Without this check, downstream drift detection
+    silently targets nonexistent decisions."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-ghost-target.md").write_text(
+            _drift_memo_md(
+                "ghost-target",
+                drift_candidate="true",
+                # well-formed UUID-like string, no such artefact exists in vault
+                affects_decision="art://00000000-0000-0000-0000-000000000000",
+                drift_claim="claim",
+                drift_confidence="low",
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "drift-affects-dangling" in r.stderr, f"expected drift-affects-dangling\n{r.stderr}"
+    print("  T34 PASS — unresolvable affects_decision fails with distinct error (F2)")
+
+
+def test_drift_affects_malformed_distinct_from_missing():
+    """T35 (F3): drift_candidate: true with affects_decision present but
+    not in art://<id> shape (e.g., raw string) fails with a DIFFERENT error
+    code from `drift-missing-required`. Operators triaging digest noise need
+    to tell 'fix the memo' apart from 'add the field'."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-malformed.md").write_text(
+            _drift_memo_md(
+                "malformed",
+                drift_candidate="true",
+                affects_decision="not-an-art-ref",  # missing art:// prefix
+                drift_claim="claim",
+                drift_confidence="high",
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "drift-affects-malformed" in r.stderr, (
+            f"expected drift-affects-malformed (distinct from missing)\n{r.stderr}"
+        )
+        # And the error code is NOT drift-missing-required — F3 specifically
+        # requires distinct codes for 'absent' vs 'present-but-malformed'.
+        assert "drift-missing-required" not in r.stderr or "drift-affects-malformed" in r.stderr
+    print("  T35 PASS — malformed affects_decision distinct from missing (F3)")
+
+
+def test_drift_confidence_invalid_value_fails():
+    """T36: drift_confidence outside {high, medium, low} fails — guardrails
+    in slice 5 filter by confidence, so invalid values must surface early."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-source.md").write_text(
+            _drift_memo_md("source"), encoding="utf-8",
+        )
+        (vault / "artefacts" / "memo" / "art-bad-conf.md").write_text(
+            _drift_memo_md(
+                "bad-conf",
+                drift_candidate="true",
+                affects_decision="art://source",
+                drift_claim="claim",
+                drift_confidence="extreme",  # invalid
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1
+        assert "drift-confidence-invalid" in r.stderr
+    print("  T36 PASS — invalid drift_confidence value fails")
+
+
+def test_drift_candidate_false_no_other_fields_passes():
+    """T37 (F1 corner): drift_candidate: false with no other drift fields
+    must pass — the flag is the gate. False == off, same as absent."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        (vault / "artefacts" / "memo" / "art-flag-off.md").write_text(
+            _drift_memo_md("flag-off", drift_candidate="false"),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, f"drift_candidate: false should be no-op\n{r.stderr}"
+    print("  T37 PASS — drift_candidate: false skips drift validation")
+
+
 if __name__ == "__main__":
     print("Running test_lint_provenance_acceptance.py...")
     test_clean_fixture_exits_0()
@@ -639,4 +827,11 @@ if __name__ == "__main__":
     test_flat_resolves_project_uuid()
     test_malformed_project_slug_fails()
     test_dot_prefixed_dirs_exempt_from_slug_check()
+    test_drift_candidate_well_formed_passes()
+    test_drift_candidate_missing_required_fails()
+    test_memo_without_drift_fields_passes_backward_compat()
+    test_drift_affects_dangling_fails()
+    test_drift_affects_malformed_distinct_from_missing()
+    test_drift_confidence_invalid_value_fails()
+    test_drift_candidate_false_no_other_fields_passes()
     print("All lint-provenance tests passed.")
