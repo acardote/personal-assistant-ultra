@@ -128,6 +128,18 @@ Within the target file, the LLM picks between two diff shapes using a single det
 
 **Same referent test** is concrete: case-insensitive exact match of the proper noun OR a previously-recorded alias. If neither matches, it's a new heading. There is no fuzzy match — if "Leonor Mendonça" exists and the insight is about "Leonor M.", the LLM normalizes the alias as part of the diff (extends the existing heading).
 
+## Decision Scope field (per [#133](https://github.com/acardote/personal-assistant-ultra/issues/133))
+
+Every entry in `<content_root>/kb/decisions.md` MUST include a `**Scope:**` line naming the referent the decision is about — a person, org, team, or project. This is what makes context-dependent decisions retrievable from the always-in-context layer.
+
+Without Scope, a heading like "NYC added as fourth priority geography" is orphaned: a future query about Nuro can't match it (the body says "NYC" + "delivery" — Nuro doesn't appear). With `- **Scope:** Nuro`, the always-loaded layer-3 line links the decision to its referent.
+
+For decisions that apply broadly (e.g., a company-wide policy), use the operating org name (e.g., `Nexar`). For decisions that span multiple referents, name the most direct one and add the others in the body.
+
+The drift detector (per parent [#135](https://github.com/acardote/personal-assistant-ultra/issues/135)) routes newly-harvested memory against decisions sharing the same Scope as the memory's tags or extracted referent. Without Scope, drift detection degrades to noisy topic-overlap inference.
+
+`tools/kb-scan.py`'s decision-extraction prompt emits `referent` in its YAML output today, but the renderer drops it (the bug [#132](https://github.com/acardote/personal-assistant-ultra/issues/132) tracks). Once #132 lands, kb-scan-emitted candidates will carry Scope by construction. Until then, candidates land without Scope and need backfill (as happened to the 54 entries from #116's bootstrap). Existing seed entries (pre-#133) without Scope are grandfathered — `tools/lint-provenance.py` does NOT yet enforce Scope as required (a stricter gate to add later if needed).
+
 ## Provenance (per ADR-0003)
 
 Every diff carries a `<!-- produced_by: session=<8-hex>, query="<short>", at=<iso8601>, sources=[...] -->` line:
@@ -145,6 +157,7 @@ User chat: *"let's go with Option 2 for #51"*.
    ```diff
    + ## Live-call orchestration architecture
    + <!-- produced_by: session=9864c3e9, query="proceed with #51 architecture decision", at=2026-05-06T17:42:00Z, sources=[https://github.com/acardote/personal-assistant-ultra/issues/51] -->
+   + - **Scope:** personal-assistant skill (architecture)
    + ### 2026-05-06 — Skill orchestrates live MCP calls
    + Per parent issue #39, the skill (not route.py) is the live-call orchestrator. Sequential calls; fire all sources on zero_hit; split implementation per source.
    ```

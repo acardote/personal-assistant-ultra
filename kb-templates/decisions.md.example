@@ -13,9 +13,12 @@ Each entry follows the format:
 - **Last verified:** <YYYY-MM-DD>
 - **Expires:** <YYYY-MM-DD or never>
 - **Source:** <ADR / issue / conversation / manual>
+- **Scope:** <person / org / team / project — what this decision is *about*>
 
 <short body — what was decided + the load-bearing reason.>
 ```
+
+The `Scope` field names the referent the decision applies to (e.g., `Nuro`, `BADAS team`, `<your operating org>`). It is what makes context-dependent decisions retrievable from the always-in-context layer — without it, a heading like "NYC added as fourth priority geography" can't be matched to its real subject (e.g., a customer deal). For decisions that apply broadly (e.g., a company-wide policy), use your operating-org name; for org-of-the-decision-itself entries, use the same value. The schema doesn't distinguish "decision about Org X" from "broad-policy scoped to Org X" — that's a known limitation; the body should clarify if the distinction matters. Drift detection (per [#135](https://github.com/acardote/personal-assistant-ultra/issues/135), not yet implemented) is planned to route newly-harvested memory against decisions sharing the same Scope.
 
 This file is for **your** decisions — strategy commitments, policy rules, persistent priorities. Method-level architectural decisions (about the assistant itself) live in `docs/adr/*.md` in the method repo.
 
@@ -28,11 +31,13 @@ This file is for **your** decisions — strategy commitments, policy rules, pers
 - **Last verified:** <YYYY-MM-DD>
 - **Expires:** <YYYY-MM-DD or 'never (revisit if <criterion>)'>
 - **Source:** <pointer to a real artifact: a Granola note, an email thread, a doc>
+- **Scope:** <referent — person, org, team, or project this is about>
 
 <short body: what was decided + the load-bearing reason. Concrete numbers,
 deadlines, named owners. The assistant treats this as ground truth when
-answering related questions; if the decision is reversed, you update or
-remove this entry — the assistant will not auto-detect drift.>
+answering related questions. (Once the drift detector ships per #135, it
+will periodically check newly-harvested memory against this decision and
+surface material contradictions for your review. Not yet implemented.)>
 
 ## <Another Decision>
 
@@ -41,5 +46,6 @@ remove this entry — the assistant will not auto-detect drift.>
 - **Last verified:** <YYYY-MM-DD>
 - **Expires:** <date or 'never'>
 - **Source:** <real-artifact pointer>
+- **Scope:** <referent>
 
 <body>
