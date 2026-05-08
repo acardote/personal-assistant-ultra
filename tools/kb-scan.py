@@ -320,7 +320,8 @@ def load_vault_specific_excludes(content_root: Path) -> set[str]:
     """Optional vault-specific exclusion list at
     `<content_root>/.harvest/kb-scan-config.json`. Schema:
         {"self_exclude_tags": ["term1", "term2", ...]}
-    Empty if file absent or malformed (logged with stderr warning)."""
+    Empty if file absent. Wrong-shape config gets a stderr WARN so the user
+    knows the file is being ignored."""
     p = content_root / ".harvest" / "kb-scan-config.json"
     if not p.is_file():
         return set()
@@ -330,22 +331,35 @@ def load_vault_specific_excludes(content_root: Path) -> set[str]:
         print(f"[kb-scan] WARN: kb-scan-config.json malformed ({exc}); skipping", file=sys.stderr)
         return set()
     if not isinstance(data, dict):
+        print(
+            "[kb-scan] WARN: kb-scan-config.json root is not a JSON object; skipping",
+            file=sys.stderr,
+        )
         return set()
-    excludes = data.get("self_exclude_tags") or []
+    excludes = data.get("self_exclude_tags")
+    if excludes is None:
+        return set()
     if not isinstance(excludes, list):
+        print(
+            f"[kb-scan] WARN: kb-scan-config.json `self_exclude_tags` must be a list "
+            f"(got {type(excludes).__name__}); ignoring",
+            file=sys.stderr,
+        )
         return set()
     return {normalize(str(t)) for t in excludes if isinstance(t, str)}
 
 
 def derive_owner_excludes(content_root: Path) -> set[str]:
-    """Auto-derive owner-tag exclusions from the first non-template heading
-    in `<vault>/kb/people.md` + `<vault>/kb/org.md`. Tokenizes the heading
+    """Auto-derive owner-tag exclusions from EVERY non-template heading in
+    `<vault>/kb/people.md` + `<vault>/kb/org.md`. Tokenizes each heading
     (e.g., `## acardote / André Cardote` → tokens `acardote`, `andre`,
     `cardote`) so any of those tags fired by harvest get excluded.
 
-    F4 closer: prevents `andre` and `nexar` from being emitted as candidates
-    even if no vault-specific config file is present."""
+    Walks all headings (not just the first) so household/team vaults with
+    multiple owners + multi-org vaults work correctly. Per pr-challenger
+    suggestion 1 on #120 fixup: single-owner-only was a real limitation."""
     excludes: set[str] = set()
+    template_norms = {normalize(t) for t in TEMPLATE_HEADINGS}
     for fname in ("people.md", "org.md"):
         path = content_root / "kb" / fname
         if not path.is_file():
@@ -357,16 +371,13 @@ def derive_owner_excludes(content_root: Path) -> set[str]:
                 continue
             heading = m.group(1)
             norm = normalize(heading)
-            if norm in {normalize(t) for t in TEMPLATE_HEADINGS}:
-                continue
-            if not norm:
+            if norm in template_norms or not norm:
                 continue
             # Tokenize; add each token plus the full normalized heading.
             excludes.add(norm)
             for token in norm.split():
                 if len(token) >= 3:  # drop noise like single letters
                     excludes.add(token)
-            break  # just the first non-template heading per file
     return excludes
 
 
@@ -983,7 +994,19 @@ def main(argv=None) -> int:
             path.replace(new_path)
         emit_count += 1
 
-    write_watermark(content_root)
+    # Watermark gate (per pr-challenger suggestion 5 on #120 fixup): if
+    # quota exhausted, do NOT advance the watermark — the next default run
+    # would otherwise skip the un-scanned memories entirely. The user needs
+    # to re-run (with a higher --max-llm-calls or --all) to clear the backlog.
+    if skipped_for_quota == 0:
+        write_watermark(content_root)
+    else:
+        print(
+            f"[kb-scan] WARN: quota exhausted with {skipped_for_quota} candidates skipped; "
+            f"watermark NOT advanced. Re-run with --max-llm-calls > {args.max_llm_calls} "
+            f"or split with --since to clear the backlog.",
+            file=sys.stderr,
+        )
 
     msg = f"[kb-scan] emitted {emit_count} candidate memo(s) to {out_dir} (llm_calls={llm_calls})"
     if skipped_for_quota:
