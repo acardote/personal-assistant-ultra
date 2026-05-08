@@ -112,13 +112,13 @@ If the project's context is loaded into your working memory, you have the full p
 
 ### Pre-flight: kb-candidate count (per [#116](https://github.com/acardote/personal-assistant-ultra/issues/116))
 
-After the project-active check, count unprocessed KB-candidate memos:
+After the project-active check, count unprocessed KB-candidate memos by running (from method-repo root):
 
-```bash
-ls "$VAULT/artefacts/memo/.unprocessed/" 2>/dev/null | grep -c '^art-' || echo 0
+```
+tools/kb-process.py list --count
 ```
 
-(Substitute `$VAULT` with the resolved `paths.content_root` from `.assistant.local.json`.)
+The tool reads `<content_root>` from `.assistant.local.json` (no manual substitution needed) and prints just the integer on stdout — `0` if no candidates pending or the directory doesn't exist.
 
 - **N == 0**: do NOT mention. Silent on every activation when there's nothing to review.
 - **N > 0**: surface a single line to the user verbatim: *"N kb-candidate memo(s) pending review. Run `/personal-assistant kb-process` to walk them, or ignore for now."* Do NOT auto-launch kb-process — the user controls when to engage. Do NOT preview the candidates at activation; the single line is enough.
