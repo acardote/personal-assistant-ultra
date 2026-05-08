@@ -20,6 +20,8 @@ Tests:
   T12 — apply on org candidate appends to org.md
   T13 — apply on decision candidate appends to decisions.md
   T14 — list --json emits parseable array
+  T15 — apply refuses memo whose diff has lines without `+` prefix (strict).
+  T16 — apply refuses + reports clearly when lint-provenance.py is missing.
 """
 
 from __future__ import annotations
@@ -393,6 +395,51 @@ def test_list_json():
     print("  T14 PASS — list --json emits parseable array")
 
 
+def test_apply_strict_diff_format():
+    """T15: a diff with non-blank lines lacking `+` prefix is refused."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        bad_diff = (
+            "```diff\n"
+            "+ ## SomePerson\n"
+            "but this line has no plus prefix\n"  # the producer-bug
+            "+ - **Source:** test\n"
+            "```"
+        )
+        write_candidate_memo(
+            vault, art_id="art-baddiff", kind="person", referent="SomePerson",
+            sources=["mem://m1", "mem://m2"], proposed_diff=bad_diff,
+        )
+        r = run_proc(method, "apply", "art-baddiff",
+                     env_extra={"PA_SESSION_ID": "abcd1234"},
+                     expect_rc=1)
+        assert "lacks `+` prefix" in r.stderr
+        # Memo stays in .unprocessed/
+        assert (vault / "artefacts" / "memo" / ".unprocessed" / "art-baddiff.md").is_file()
+    print("  T15 PASS — strict diff format refuses non-conforming memos")
+
+
+def test_apply_hard_fails_on_missing_lint():
+    """T16: a configured vault with missing lint-provenance.py hard-fails
+    (no soft-pass); the F5 gate depends on the lint actually running."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Remove lint-provenance.py from the test method tree.
+        (method / "tools" / "lint-provenance.py").unlink()
+        write_candidate_memo(
+            vault, art_id="art-nolint", kind="person", referent="Test Person",
+            sources=["mem://m1", "mem://m2"], proposed_diff=make_person_diff(),
+        )
+        r = run_proc(method, "apply", "art-nolint",
+                     env_extra={"PA_SESSION_ID": "abcd1234"},
+                     expect_rc=1)
+        assert "lint-provenance" in r.stderr
+        assert "refusing to proceed" in r.stderr or "rolled back" in r.stderr.lower()
+        # Memo stays in .unprocessed/
+        assert (vault / "artefacts" / "memo" / ".unprocessed" / "art-nolint.md").is_file()
+    print("  T16 PASS — apply hard-fails on missing lint")
+
+
 if __name__ == "__main__":
     print("Running test_kb_process_acceptance.py...")
     test_list_empty()
@@ -409,4 +456,6 @@ if __name__ == "__main__":
     test_apply_org()
     test_apply_decision()
     test_list_json()
+    test_apply_strict_diff_format()
+    test_apply_hard_fails_on_missing_lint()
     print("All kb-process tests passed.")

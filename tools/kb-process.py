@@ -122,21 +122,31 @@ DIFF_BLOCK_RE = re.compile(
 
 
 def extract_proposed_diff(memo_body: str) -> str:
-    """Pull the ```diff block out of the memo body. Strip leading `+ ` from
-    each line — that's the diff format kb-scan emits, marking lines to add."""
+    """Pull the ```diff block out of the memo body. STRICT mode: every
+    non-blank line MUST start with `+` (followed by optional space). Refuses
+    with ValueError otherwise — kb-scan is the only producer of these
+    memos, so a non-conforming diff is a producer bug, not a thing to
+    silently pass through (per pr-challenger #122 suggestion 3)."""
     m = DIFF_BLOCK_RE.search(memo_body)
     if not m:
         raise ValueError("memo body has no ```diff block")
     diff = m.group("body")
     out_lines: list[str] = []
-    for line in diff.splitlines():
+    for n, line in enumerate(diff.splitlines(), start=1):
+        if not line.strip():
+            out_lines.append("")
+            continue
         if line.startswith("+ "):
             out_lines.append(line[2:])
         elif line.startswith("+"):
             out_lines.append(line[1:])
         else:
-            # Lines without `+` prefix (context, headers) — preserve verbatim.
-            out_lines.append(line)
+            raise ValueError(
+                f"diff line {n} lacks `+` prefix: {line!r}. The kb-scan "
+                f"memo format requires every non-blank line in the ```diff "
+                f"block to start with `+` — refusing to inject ambiguous "
+                f"content into the kb file."
+            )
     return "\n".join(out_lines).rstrip() + "\n"
 
 
@@ -199,10 +209,18 @@ def memo_already_applied(kb_text: str, memo_id: str) -> bool:
 
 def run_lint(method_root: Path) -> tuple[int, str]:
     """Run lint-provenance.py against the configured vault. Returns
-    (returncode, stderr)."""
+    (returncode, stderr).
+
+    Hard-fails (rc=2) if lint-provenance.py is missing — a configured vault
+    + missing lint is a deployment misconfiguration, not soft-passable. The
+    F5 atomic gate depends on the lint actually running (per pr-challenger
+    #122 suggestion 1)."""
     lint_path = method_root / "tools" / "lint-provenance.py"
     if not lint_path.is_file():
-        return 0, ""  # lint not available; soft-pass
+        return 2, (
+            f"lint-provenance.py not found at {lint_path}. apply requires "
+            f"the lint to gate kb writes; refusing to proceed without it."
+        )
     r = subprocess.run(
         [str(lint_path), "--require-vault"],
         capture_output=True, text=True,
