@@ -1,5 +1,5 @@
 ---
-description: Personal-assistant routine ops — dispatches metrics / freshness-check / harvest / live-writeback / project subcommands.
+description: Personal-assistant routine ops — dispatches subcommands. See body for the full table.
 ---
 
 The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root.
@@ -99,7 +99,7 @@ After bootstrap, the daily harvest routine + per-turn in-session triggers (per [
 Forward `$ARGUMENTS` after the first token (e.g., `--max-llm-calls=N`, `--enable-glossary`) to `kb-scan`.
 
 **Walk pattern** (the assistant's job):
-1. Confirm with the user that this is a one-time bootstrap. Confirm `PA_SESSION_ID` is set (export a fresh 8-hex if not). Surface the expected LLM-call budget — for the current vault, kb-scan today is bounded by `--max-llm-calls=200` (default).
+1. Before running anything, **ASK the user explicitly** for affirmative confirmation: *"This will scan the FULL memory pool (`kb-scan --all`, ignoring the watermark) and may emit dozens of candidate memos. The default LLM-call budget is `--max-llm-calls=200`. Proceed? [y/N]"*. Do NOT proceed without an explicit affirmative response (`yes`, `y`, `proceed`, `go`). Treat silence, "ok", or off-topic replies as NO. Confirm `PA_SESSION_ID` is set (export a fresh 8-hex if not).
 2. Run `tools/kb-scan.py --all` with the user-provided extras forwarded. Surface the final summary line ("emitted N candidate memo(s)..." with the llm_calls + skipped counts).
 3. Run `tools/kb-process.py list` to enumerate the candidates that landed in `<vault>/artefacts/memo/.unprocessed/`.
 4. Walk each candidate using the **kb-process walk pattern** documented above (`show` → ask user → `apply` / skip / `reject`). All approvals carry the current `PA_SESSION_ID` as the inline session id (NOT the routine session that emitted the memo — that's the F3 closer from #121).
