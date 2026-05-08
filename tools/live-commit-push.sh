@@ -44,31 +44,58 @@ fi
 # our $CONTENT_ROOT arg. If the two disagree, the lint scans the wrong tree
 # and the gate silently misses. Refuse loudly. Single-vault usage by design;
 # multi-vault would need a separate config story.
+#
+# Use python via env-var transport (NOT string interpolation) so paths with
+# quotes / unusual chars don't crash the comparison. samefile handles
+# symlinks AND case-insensitive filesystems (macOS HFS+) in one call.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 METHOD_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-CONFIGURED_ROOT=$(python3 -c "
+SCOPE_CHECK=$(LCP_METHOD_ROOT="$METHOD_ROOT" LCP_ARG_ROOT="$CONTENT_ROOT" python3 -c '
 import json, os, sys
-p = os.path.join('$METHOD_ROOT', '.assistant.local.json')
-if not os.path.isfile(p):
+mr = os.environ["LCP_METHOD_ROOT"]
+arg = os.environ["LCP_ARG_ROOT"]
+cfg = os.path.join(mr, ".assistant.local.json")
+if not os.path.isfile(cfg):
+    print("no-config")
     sys.exit(0)
 try:
-    cr = json.load(open(p)).get('paths', {}).get('content_root')
+    cr = json.load(open(cfg)).get("paths", {}).get("content_root")
 except Exception:
+    print("warn:corrupt-config")
     sys.exit(0)
-if cr:
-    print(os.path.realpath(os.path.expanduser(cr)))
-" 2>/dev/null || true)
-if [[ -n "$CONFIGURED_ROOT" ]]; then
-    ARG_REAL=$(python3 -c "import os, sys; print(os.path.realpath('$CONTENT_ROOT'))")
-    if [[ "$ARG_REAL" != "$CONFIGURED_ROOT" ]]; then
-        echo "[live-commit-push] content_root arg ($ARG_REAL) disagrees with" >&2
-        echo "  .assistant.local.json's configured vault ($CONFIGURED_ROOT)." >&2
+if not cr:
+    print("warn:empty-content-root")
+    sys.exit(0)
+configured = os.path.realpath(os.path.expanduser(cr))
+try:
+    if os.path.samefile(arg, configured):
+        print("ok")
+    else:
+        print(f"mismatch:{configured}")
+except FileNotFoundError:
+    # configured path no longer exists — treat as no-enforcement; the lint
+    # will surface that separately via its own fallback warning.
+    print("warn:configured-missing")
+' 2>/dev/null || echo "warn:python-failed")
+
+case "$SCOPE_CHECK" in
+    ok|no-config|warn:*)
+        # warn:* cases fall through with no enforcement; the lint's own
+        # fallback warning surfaces config issues separately.
+        if [[ "$SCOPE_CHECK" == warn:* ]]; then
+            echo "[live-commit-push] $SCOPE_CHECK — proceeding without scope check" >&2
+        fi
+        ;;
+    mismatch:*)
+        configured="${SCOPE_CHECK#mismatch:}"
+        echo "[live-commit-push] content_root arg ($CONTENT_ROOT) disagrees with" >&2
+        echo "  .assistant.local.json's configured vault ($configured)." >&2
         echo "  The lint would scan the configured vault, not your arg —" >&2
         echo "  refusing to commit with mismatched scope. Either point" >&2
-        echo "  .assistant.local.json at $ARG_REAL or pass the configured path." >&2
+        echo "  .assistant.local.json at the arg, or pass the configured path." >&2
         exit 5
-    fi
-fi
+        ;;
+esac
 
 cd "$CONTENT_ROOT"
 

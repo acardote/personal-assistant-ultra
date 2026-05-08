@@ -121,10 +121,51 @@ def test_missing_config_proceeds():
     print("  T4 PASS — missing config doesn't trigger mismatch refusal")
 
 
+def test_quoted_path_does_not_crash():
+    """Per pr-challenger #104: paths with single quotes shouldn't crash via
+    string interpolation. The env-var transport handles this safely."""
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        # macOS / Linux both allow ' in directory names. Use a folder name
+        # that would have crashed the inlined-string version.
+        odd = td_path / "it's-a-vault"
+        odd.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=odd, check=True)
+        subprocess.run(["git", "config", "user.email", "t@test"], cwd=odd, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=odd, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=odd, check=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=odd, check=True)
+        method = make_method_with_config(td_path, odd)
+        r = run_helper(method, odd, "test-noop")
+        assert r.returncode == 0, (
+            f"quoted path should NOT crash; got rc={r.returncode}\nstderr:\n{r.stderr}"
+        )
+    print("  T5 PASS — quoted path doesn't crash python comparison")
+
+
+def test_corrupt_config_warns_then_proceeds():
+    """Per pr-challenger #104: corrupt .assistant.local.json should warn
+    visibly and proceed without enforcement (same shape as missing config)."""
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        vault = make_vault(td_path, "vault")
+        method = make_method_with_config(td_path, vault)
+        # Clobber the config with garbage.
+        (method / ".assistant.local.json").write_text("{ this is not valid json", encoding="utf-8")
+        r = run_helper(method, vault, "test-noop")
+        # Must not exit 5 (no scope enforcement when config is unparseable).
+        assert r.returncode != 5
+        # Must surface the warn — visibility per pr-challenger.
+        assert "warn:" in r.stderr or "corrupt" in r.stderr.lower()
+    print("  T6 PASS — corrupt config warns + proceeds")
+
+
 if __name__ == "__main__":
     print("Running test_live_commit_push_acceptance.py...")
     test_matching_content_root_proceeds()
     test_mismatched_content_root_refuses()
     test_symlink_to_configured_vault_proceeds()
     test_missing_config_proceeds()
+    test_quoted_path_does_not_crash()
+    test_corrupt_config_warns_then_proceeds()
     print("All live-commit-push tests passed.")
