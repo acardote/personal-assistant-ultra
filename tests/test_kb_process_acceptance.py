@@ -22,6 +22,7 @@ Tests:
   T14 — list --json emits parseable array
   T15 — apply refuses memo whose diff has lines without `+` prefix (strict).
   T16 — apply refuses + reports clearly when lint-provenance.py is missing.
+  T17 — list --count: 0 when empty, exact count when populated, ignores non-art-*.md.
 """
 
 from __future__ import annotations
@@ -440,6 +441,31 @@ def test_apply_hard_fails_on_missing_lint():
     print("  T16 PASS — apply hard-fails on missing lint")
 
 
+def test_list_count():
+    """T17: list --count prints just the integer; ignores non-`art-*.md` files."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Empty
+        r = run_proc(method, "list", "--count")
+        assert r.stdout.strip() == "0"
+        # One memo
+        write_candidate_memo(
+            vault, art_id="art-c1", kind="org", referent="Acme",
+            sources=["mem://m1", "mem://m2"],
+            proposed_diff="```diff\n+ ## Acme\n+ - test\n```",
+        )
+        r = run_proc(method, "list", "--count")
+        assert r.stdout.strip() == "1"
+        # Plus a sidecar / unrelated file in the same dir — must NOT inflate.
+        unprocessed = vault / "artefacts" / "memo" / ".unprocessed"
+        (unprocessed / "art-c1.provenance.json").write_text("{}", encoding="utf-8")
+        (unprocessed / "notes.txt").write_text("hello", encoding="utf-8")
+        (unprocessed / "art-broken.md.bak").write_text("---\n", encoding="utf-8")
+        r = run_proc(method, "list", "--count")
+        assert r.stdout.strip() == "1", f"sidecars/unrelated should be ignored: stdout={r.stdout!r}"
+    print("  T17 PASS — list --count ignores non-art-*.md")
+
+
 if __name__ == "__main__":
     print("Running test_kb_process_acceptance.py...")
     test_list_empty()
@@ -458,4 +484,5 @@ if __name__ == "__main__":
     test_list_json()
     test_apply_strict_diff_format()
     test_apply_hard_fails_on_missing_lint()
+    test_list_count()
     print("All kb-process tests passed.")

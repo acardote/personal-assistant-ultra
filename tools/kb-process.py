@@ -375,6 +375,15 @@ def cmd_reject(args, cfg) -> int:
 
 def cmd_list(args, cfg) -> int:
     memos = list_memos(cfg.content_root, "unprocessed")
+
+    if args.count:
+        # Just the count, on stdout, suitable for `if [ "$(... --count)" -gt 0 ]`
+        # consumption — used by the SKILL.md activation contract pre-flight
+        # (per #127). Resolves the vault via .assistant.local.json so the
+        # caller doesn't have to know the path.
+        print(len(memos))
+        return 0
+
     if args.json:
         out = []
         for p in memos:
@@ -427,6 +436,8 @@ def main(argv=None) -> int:
 
     p_list = sub.add_parser("list", help="list unprocessed candidate memos")
     p_list.add_argument("--json", action="store_true")
+    p_list.add_argument("--count", action="store_true",
+                        help="print just the integer count on stdout (for shell consumption)")
     p_list.set_defaults(func=cmd_list)
 
     p_show = sub.add_parser("show", help="print a memo's body")
