@@ -111,7 +111,16 @@ def parse_memo_frontmatter(memo_path: Path) -> tuple[dict, str]:
 def is_drift_candidate(fm: dict) -> bool:
     """True iff frontmatter sets `drift_candidate: true` (case-insensitive,
     optional surrounding quotes — matches the slice-1 lint's `_drift_truthy`).
-    Drift candidates require a separate handler; `apply` refuses on them."""
+    Drift candidates require a separate handler; `apply` refuses on them.
+
+    Accepted truthy shapes (intentionally narrow per F4 of slice 5 / #141):
+      - YAML bool `true` → Python `True` (PyYAML safe_load output).
+      - String `"true"` / `"yes"` (case-insensitive, stripped quotes).
+
+    Numeric `1` is NOT accepted — PyYAML never parses `true` as `int`, and
+    the conservative-count framing of F4 says only obvious-true should count
+    toward the digest's drift-candidate total. A `drift_candidate: 1` in
+    the wild is a producer bug worth refusing to count silently."""
     v = fm.get("drift_candidate")
     # YAML scalar `true` parses to Python `True` via PyYAML safe_load (used here),
     # whereas the lint's hand-rolled walker keeps it as the string "true". Both
@@ -1075,11 +1084,30 @@ def cmd_reject(args, cfg) -> int:
 def cmd_list(args, cfg) -> int:
     memos = list_memos(cfg.content_root, "unprocessed")
 
+    if args.count_drift:
+        # F4 of slice 5 (#141): the digest count of drift candidates MUST use
+        # `frontmatter.get("drift_candidate") is True`-style semantics so a
+        # memo with `drift_candidate: false` (or absent) is NOT counted.
+        # `is_drift_candidate(fm)` enforces exactly this — single source of
+        # truth shared with `apply` (which refuses on True), `list` (which
+        # tags with [DRIFT] on True), and the slice-3 dispatch.
+        n = 0
+        for p in memos:
+            try:
+                fm, _ = parse_memo_frontmatter(p)
+                if is_drift_candidate(fm):
+                    n += 1
+            except ValueError:
+                continue
+        print(n)
+        return 0
+
     if args.count:
         # Just the count, on stdout, suitable for `if [ "$(... --count)" -gt 0 ]`
         # consumption — used by the SKILL.md activation contract pre-flight
         # (per #127). Resolves the vault via .assistant.local.json so the
-        # caller doesn't have to know the path.
+        # caller doesn't have to know the path. Counts ALL unprocessed memos
+        # (drift + non-drift); for drift-only see `--count-drift`.
         print(len(memos))
         return 0
 
@@ -1146,7 +1174,9 @@ def main(argv=None) -> int:
     p_list = sub.add_parser("list", help="list unprocessed candidate memos")
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument("--count", action="store_true",
-                        help="print just the integer count on stdout (for shell consumption)")
+                        help="print the count of all unprocessed memos (drift + non-drift) on stdout")
+    p_list.add_argument("--count-drift", action="store_true",
+                        help="print the count of drift-candidate memos only (frontmatter drift_candidate: true)")
     p_list.set_defaults(func=cmd_list)
 
     p_show = sub.add_parser("show", help="print a memo's body")

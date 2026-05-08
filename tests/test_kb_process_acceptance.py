@@ -57,6 +57,8 @@ Tests:
   T39 — drift-reenable on a missing entry returns rc=1 (typo signal).
   T40 — manual edit landing a string into `dismissals` doesn't crash
         update_suppression_after_dismissal — defensive coercion to 0.
+  T41 — list --count-drift counts ONLY memos with `drift_candidate: true`
+        (F4 of slice 5: must NOT count `drift_candidate: false` or absent).
 """
 
 from __future__ import annotations
@@ -1144,6 +1146,43 @@ def test_drift_reenable_missing_entry_returns_nonzero():
     print("  T39 PASS — drift-reenable on missing entry returns rc=1")
 
 
+def test_list_count_drift_filters_correctly():
+    """T41 (F4 of slice 5): `--count-drift` returns the number of memos
+    with `drift_candidate: true` (boolean True or string 'true'/'yes').
+    Memos with `drift_candidate: false` or omitted entirely are NOT counted."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # 0/0
+        r = run_proc(method, "list", "--count-drift")
+        assert r.stdout.strip() == "0", r.stdout
+        # 2 drift, 1 non-drift, 1 explicit-false
+        write_drift_memo(vault, art_id="art-d501",
+                         via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        write_drift_memo(vault, art_id="art-d502",
+                         via_uuid="bbbbbbbb-1111-2222-3333-444444444444")
+        write_candidate_memo(
+            vault, art_id="art-c501", kind="org", referent="Acme",
+            sources=["mem://m1", "mem://m2"],
+            proposed_diff="```diff\n+ ## Acme\n+ - test\n```",
+        )
+        # Explicit `drift_candidate: false` — must NOT count.
+        _hand_write_drift_memo(
+            vault, art_id="art-d503",
+            fm_extra={
+                "drift_candidate": False,
+                "affects_decision": "art://cccccccc-1111-2222-3333-444444444444",
+                "drift_claim": "irrelevant",
+                "drift_confidence": "high",
+            },
+        )
+        r = run_proc(method, "list", "--count-drift")
+        assert r.stdout.strip() == "2", f"expected 2 (only true-drift), got {r.stdout!r}"
+        # Sanity: total --count counts all 4.
+        r = run_proc(method, "list", "--count")
+        assert r.stdout.strip() == "4", r.stdout
+    print("  T41 PASS — list --count-drift filters by drift_candidate is True (F4)")
+
+
 def test_dismissal_state_with_malformed_int_doesnt_crash():
     """T40 (defensive coercion): a manual edit that lands a string in
     `dismissals` (e.g., user typed `"three"` while inspecting the file)
@@ -1216,4 +1255,5 @@ if __name__ == "__main__":
     test_drift_apply_clears_prior_suppression()
     test_drift_reenable_missing_entry_returns_nonzero()
     test_dismissal_state_with_malformed_int_doesnt_crash()
+    test_list_count_drift_filters_correctly()
     print("All kb-process tests passed.")
