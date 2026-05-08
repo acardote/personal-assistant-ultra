@@ -21,6 +21,7 @@ The user invoked `/personal-assistant $ARGUMENTS` from the method-repo root.
 | `live-writeback` | `tools/live-writeback.py <flags>` |
 | `project` | nested router (see "Subcommand: project" below) — dispatches to `tools/project.py <subcmd>` |
 | `kb-process` | nested router (see "Subcommand: kb-process" below) — dispatches to `tools/kb-process.py <subcmd>` |
+| `kb-backfill` | one-time bootstrap (see "Subcommand: kb-backfill" below) — runs `kb-scan --all` then walks candidates via `kb-process` |
 
 ## Per-subcommand notes
 
@@ -89,10 +90,29 @@ After all candidates processed, run `tools/live-commit-push.sh <content_root> "k
 
 **On unknown `<kb-process-subcmd>`**: print the valid list and stop.
 
+### `kb-backfill`
+
+One-time bootstrap (per parent [#116](https://github.com/acardote/personal-assistant-ultra/issues/116), child [#123](https://github.com/acardote/personal-assistant-ultra/issues/123)) that converts an empty kb seed into a populated layer-3 by walking the FULL accumulated memory pool, not just memory since the last scan watermark.
+
+After bootstrap, the daily harvest routine + per-turn in-session triggers (per [editorial-rules](../../docs/kb-editorial-rules.md)) handle steady-state. kb-backfill is meant to run at most once per vault — when the kb is fresh and 100+ memory objects have accumulated.
+
+Forward `$ARGUMENTS` after the first token (e.g., `--max-llm-calls=N`, `--enable-glossary`) to `kb-scan`.
+
+**Walk pattern** (the assistant's job):
+1. Confirm with the user that this is a one-time bootstrap. Confirm `PA_SESSION_ID` is set (export a fresh 8-hex if not). Surface the expected LLM-call budget — for the current vault, kb-scan today is bounded by `--max-llm-calls=200` (default).
+2. Run `tools/kb-scan.py --all` with the user-provided extras forwarded. Surface the final summary line ("emitted N candidate memo(s)..." with the llm_calls + skipped counts).
+3. Run `tools/kb-process.py list` to enumerate the candidates that landed in `<vault>/artefacts/memo/.unprocessed/`.
+4. Walk each candidate using the **kb-process walk pattern** documented above (`show` → ask user → `apply` / skip / `reject`). All approvals carry the current `PA_SESSION_ID` as the inline session id (NOT the routine session that emitted the memo — that's the F3 closer from #121).
+5. After all candidates processed, run `tools/live-commit-push.sh <content_root> "kb: bootstrap from <count> scan-driven candidates"` to commit + push the kb edits + the moved memos in one commit.
+
+**Falsifier respected**: kb-backfill does NOT bypass the `--max-llm-calls` cap or the diff-and-approve gate. It's a sequencer, not a fast path.
+
+**On unknown args**: pass them to kb-scan and let kb-scan's argparse refuse them.
+
 ## Empty / unknown response template
 
 When `$ARGUMENTS` is empty or unknown, respond with EXACTLY this shape (substituting the literal subcommand list):
 
-> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`, `project`, `kb-process`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
+> Available subcommands: `metrics`, `freshness-check`, `harvest`, `live-writeback`, `project`, `kb-process`, `kb-backfill`. Pass one as the first token of `/personal-assistant <subcommand> [flags]`.
 
 No skill activation, no clarifying question, no inference.
