@@ -29,6 +29,11 @@ Tests:
   T12 — watermark NOT advanced when --max-llm-calls quota was exhausted.
   T13 — --max-llm-calls cap is hard: exact count of LLM calls is enforced
         even when more pairs survive routing.
+  T14 — partial-quota mid-iteration: cap=2 with 4 pairs invokes judge_drift
+        exactly twice, marks 2 skipped_for_quota, watermark NOT advanced.
+  T15 — F5 hash-boundary: appending a new decision to kb/decisions.md does
+        NOT change the text_hash of the previously-last decision (closes
+        pr-challenger MEDIUM finding on PR #144).
 """
 
 from __future__ import annotations
@@ -134,9 +139,20 @@ def write_decision(
     path.write_text(cur + section, encoding="utf-8")
 
 
+def _reset_module_state() -> None:
+    """Drop the cached `_config` module. The module-under-test's body
+    `from _config import load_config` runs at every fresh module load, but
+    Python skips it when `_config` is already cached. Across tests using
+    different tmpdirs, the cached `_config` references a deleted method
+    root and `METHOD_ROOT` becomes stale — popping forces a clean re-import
+    against the current test's method dir."""
+    sys.modules.pop("_config", None)
+
+
 def import_drift_scan(method: Path):
     """Load tools/kb-drift-scan.py as a module so tests can call internals
     (cache helpers, decision parser, emit) without spinning subprocesses."""
+    _reset_module_state()
     spec = importlib.util.spec_from_file_location(
         "kb_drift_scan_t", method / "tools" / "kb-drift-scan.py",
     )
@@ -147,6 +163,7 @@ def import_drift_scan(method: Path):
 
 
 def import_lint(method: Path):
+    _reset_module_state()
     spec = importlib.util.spec_from_file_location(
         "lint_provenance_t", method / "tools" / "lint-provenance.py",
     )
@@ -560,7 +577,7 @@ def test_watermark_not_advanced_on_quota_exhaustion():
         r = run_drift_scan(method, "--all", "--max-llm-calls", "0")
         assert r.returncode == 0, r.stderr
         # 2 pairs surviving routing + 0 LLM calls = 2 skipped for quota.
-        assert "skipped_for_quota=2" in r.stderr or "skipped 2" in r.stderr or "skipped_for_quota" in r.stderr, r.stderr
+        assert "skipped_for_quota=2" in r.stderr, r.stderr
         # Watermark must NOT exist (or must be unchanged).
         wm = vault / ".harvest" / "kb-drift-scan-watermark.json"
         assert not wm.is_file(), "watermark should not advance on quota exhaustion"
@@ -591,6 +608,83 @@ def test_max_llm_calls_is_hard_cap():
     print("  T13 PASS — max-llm-calls hard cap holds (F3)")
 
 
+def test_partial_quota_mid_iteration():
+    """T14 (F3 partial-quota): cap=2 with 4 surviving pairs invokes judge_drift
+    exactly twice; the remaining 2 pairs increment skipped_for_quota; watermark
+    NOT advanced. Exercises the cap MID-iteration, not just at zero."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        # Make the via-uuid targets exist so emit_drift_memo's slice-1 schema
+        # would resolve (we won't actually emit because verdict.drifted=False
+        # in the stub, but resolution coverage is good defensive belt-and-braces).
+        for via in ("aaaaaaaa-1111-2222-3333-444444444444",
+                    "bbbbbbbb-1111-2222-3333-444444444444"):
+            (vault / "artefacts" / "memo" / f"art-{via}.md").write_text(
+                "---\nid: art-" + via + "\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
+                "title: t\nproduced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
+                "  sources_cited:\n    - https://x.test\n---\nbody",
+                encoding="utf-8",
+            )
+        write_decision(vault, title="d1", scope="Acme",
+                       via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        write_decision(vault, title="d2", scope="Acme",
+                       via_uuid="bbbbbbbb-1111-2222-3333-444444444444")
+        write_memory(vault, "granola_note", "m1", tags=["acme"])
+        write_memory(vault, "granola_note", "m2", tags=["acme"])
+
+        m = import_drift_scan(method)
+        # Stub judge_drift in-process; fake non-drift verdicts so emit_drift_memo
+        # doesn't try to write anything (we're testing the cap, not the emit).
+        call_count = {"n": 0}
+
+        def fake_judge(pair):
+            call_count["n"] += 1
+            return m.DriftVerdict(
+                drifted=False, drift_claim="", drift_confidence="low",
+                verbatim_excerpt="", reasoning="",
+            )
+
+        m.judge_drift = fake_judge
+        rc = m.main(["--all", "--max-llm-calls", "2"])
+        assert rc == 0
+        assert call_count["n"] == 2, f"expected 2 LLM calls (the cap), got {call_count['n']}"
+        wm = vault / ".harvest" / "kb-drift-scan-watermark.json"
+        assert not wm.is_file(), "watermark must not advance when quota partially exhausted"
+        sys.modules.pop("kb_drift_scan_t", None)
+    print("  T14 PASS — partial-quota mid-iteration cap holds (F3)")
+
+
+def test_decision_append_does_not_invalidate_prior_hashes():
+    """T15 (F5 hash-boundary): re.split puts each section's slice up to the
+    next `## ` lookahead. Without normalisation, the LAST section absorbs
+    trailing EOF whitespace and re-orders when a new decision is appended,
+    invalidating its cache spuriously. With trailing-whitespace normalisation,
+    appending must NOT change any existing section's text_hash."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        write_decision(vault, title="First", scope="Acme",
+                       via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        write_decision(vault, title="Second", scope="Beta",
+                       via_uuid="bbbbbbbb-1111-2222-3333-444444444444")
+        m = import_drift_scan(method)
+        before = {d.title: d.text_hash for d in m.load_decisions(vault)}
+        assert "First" in before and "Second" in before, before
+
+        # Append a NEW decision at the end of the file. With the bug, "Second"
+        # (previously the last section) would absorb less trailing content
+        # post-append and its hash would change.
+        write_decision(vault, title="Third", scope="Gamma",
+                       via_uuid="cccccccc-1111-2222-3333-444444444444")
+        after = {d.title: d.text_hash for d in m.load_decisions(vault)}
+        assert before["First"] == after["First"], "First's hash must NOT change after append"
+        assert before["Second"] == after["Second"], (
+            f"Second's hash changed spuriously: {before['Second']} → {after['Second']} "
+            f"(F5 hash-boundary bug)"
+        )
+        sys.modules.pop("kb_drift_scan_t", None)
+    print("  T15 PASS — appending a decision doesn't invalidate prior hashes (F5 hash-boundary)")
+
+
 if __name__ == "__main__":
     print("Running test_kb_drift_scan_acceptance.py...")
     test_empty_pool_emits_nothing()
@@ -606,4 +700,6 @@ if __name__ == "__main__":
     test_cache_write_is_atomic()
     test_watermark_not_advanced_on_quota_exhaustion()
     test_max_llm_calls_is_hard_cap()
+    test_partial_quota_mid_iteration()
+    test_decision_append_does_not_invalidate_prior_hashes()
     print("All kb-drift-scan tests passed.")

@@ -257,12 +257,18 @@ def load_decisions(content_root: Path) -> list[DecisionEntry]:
         if not via_match:
             continue
         via_uuid = via_match.group("via")
-        text_hash = hashlib.sha256(sec.encode("utf-8")).hexdigest()[:8]
+        # Normalize the section before hashing so trailing whitespace at the
+        # file boundary doesn't make the LAST section's hash dependent on
+        # adjacent sections. Without this, appending a new decision at the
+        # end flips the previously-last section's hash and invalidates its
+        # cache spuriously (per pr-challenger MEDIUM finding on PR #144).
+        normalized = sec.rstrip()
+        text_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
         out.append(DecisionEntry(
             art_id=via_uuid,
             title=title,
             scope=scope,
-            text=sec,
+            text=normalized,
             text_hash=text_hash,
         ))
     return out
@@ -658,6 +664,17 @@ def main(argv=None) -> int:
 
     pairs = build_pairs(memories, decisions)
     print(f"[kb-drift-scan] phase 1: {len(pairs)} (memory, decision) pairs after Scope intersection", file=sys.stderr)
+    # Fan-out diagnostic: top scopes by pair count. Helps operators see when
+    # an over-broad Scope value is producing a thousand-pair pile-up before
+    # the cap fires.
+    if pairs:
+        by_scope: dict[str, int] = defaultdict(int)
+        for p in pairs:
+            by_scope[p.decision.scope] += 1
+        top = sorted(by_scope.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        if top:
+            top_str = ", ".join(f"{s}={n}" for s, n in top)
+            print(f"[kb-drift-scan] top scopes by pair fan-out: {top_str}", file=sys.stderr)
 
     if args.skip_llm:
         print("[kb-drift-scan] --skip-llm: stopping after routing", file=sys.stderr)
