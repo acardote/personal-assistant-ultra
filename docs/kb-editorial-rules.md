@@ -42,7 +42,9 @@ The user can approve all, some, or none of the proposed diffs. Each diff is a se
 
 ### When a referent doesn't yet exist in a secondary file
 
-If the primary insight is about Leonor but `## Leonor Mendonça` doesn't yet exist in `<content_root>/kb/people.md`, the LLM does NOT auto-create a person heading — that would be silent over-capture. The LLM proposes only the primary kind. New headings come from rules 3/4 firing as their OWN primary in a future observation, once the trigger threshold is met.
+If the primary insight is about Leonor but `## Leonor Mendonça` doesn't yet exist in `<content_root>/kb/people.md`, the LLM does NOT auto-create a person heading **on the in-session path** — that would be silent over-capture from a single retrieval. The LLM proposes only the primary kind. New headings come from rules 3/4 firing as their OWN primary in a future observation, once the trigger threshold is met.
+
+**This rule is in-session-only.** The scan-driven path (see "Scan-driven contributions" below) explicitly DOES propose new headings — but only after aggregating ≥2 distinct sources at scan time, and always under user approval. The two paths protect against different failure modes: in-session guards against single-retrieval over-capture; scan-driven aggregates accumulated evidence so harvested signal isn't lost.
 
 ## Two paths to a KB update
 
@@ -51,7 +53,9 @@ A KB update can originate from one of two paths. **Both paths share the same app
 - **In-session path** (per-turn): LLM detects drift mid-skill-turn against retrieved memory + the active KB. Aggregation happens at query time. Triggers detailed in "In-session triggers" below.
 - **Scan-driven path** (per-batch): autonomous scan walks accumulated memory between sessions, aggregates per-kind candidates, emits them as `kind=memo` artefacts. Next interactive session reads the candidates and runs the standard diff-and-approve flow per candidate. Detailed in "Scan-driven contributions" below.
 
-When proposing an update, the LLM MUST be explicit which path it's following (e.g., "scan-driven candidate from `<memo path>`" vs "in-session detection on the current turn"). This disambiguates path provenance for reviewers and for the verification lint.
+When proposing an update, the LLM MUST be explicit which path it's following (e.g., "scan-driven candidate from `<memo path>`" vs "in-session detection on the current turn"). This disambiguates path provenance at proposal time for the reviewer.
+
+**Scope of this requirement (slice-1 honesty)**: this is editorial — enforced at proposal time, not at file-write time. Once an approved diff lands in `kb/*` with its inline `<!-- produced_by ... -->` comment, the lint verifies provenance shape (session_id, query, sources_cited) but does NOT carry a `path=scan|in-session` field today. A third party reading a KB entry post-write cannot tell which path produced it from the file alone. Adding the field + lint enforcement is on #116's path forward (slice 2 onward); this slice establishes the contract.
 
 The two paths use the **same numeric thresholds**. What changes is the temporal scope of aggregation, not the threshold values.
 
@@ -81,7 +85,9 @@ If a trigger fires but the LLM judges the insight is too speculative, low-stakes
 
 The in-session path above misses signal that lives in passively-harvested content the user never asks about explicitly: memory objects accumulate between sessions, but no query retrieves them, so no in-session trigger fires.
 
-The scan-driven path closes that gap. `tools/kb-scan.py` walks `<content_root>/memory/` between sessions, aggregates per-kind candidates against the **same numeric thresholds** as the in-session path, and emits each candidate as a `kind=memo` artefact under `<content_root>/artefacts/memo/.unprocessed/`. The next interactive session presents the candidates via `/personal-assistant kb-process`; the user runs the standard diff-and-approve flow per candidate; approved candidates land in `kb/*` exactly as the in-session path lands them.
+The scan-driven path closes that gap. `tools/kb-scan.py` (slice 2 of #116) will walk `<content_root>/memory/` between sessions, aggregate per-kind candidates against the **same numeric thresholds** as the in-session path, and emit each candidate as a `kind=memo` artefact under `<content_root>/artefacts/memo/.unprocessed/`. The next interactive session presents the candidates via `/personal-assistant kb-process` (slice 3); the user runs the standard diff-and-approve flow per candidate; approved candidates land in `kb/*` exactly as the in-session path lands them.
+
+This document establishes the contract scan-driven slices must satisfy; tooling implementations follow.
 
 ### What the scan-driven path may do
 
@@ -94,13 +100,13 @@ The scan-driven path closes that gap. `tools/kb-scan.py` walks `<content_root>/m
 
 - Auto-write to `kb/*`. Even after aggregation, every candidate goes through the user-approval gate. No silent merge, no auto-commit, no "high-confidence bypass."
 - Lower thresholds below the in-session values. Scan-driven aggregation operates on the accumulated memory pool — that's a wider window than session retrieval, but the threshold values are unchanged.
-- Invent a heading from a single mention in a single source. Aggregation is the load-bearing primitive that distinguishes signal-driven creation from hallucination.
+- Invent a heading from a single mention in a single source. Aggregation is the load-bearing primitive that distinguishes signal-driven creation from hallucination. (See also the in-session "When a referent doesn't yet exist" rule above — same anti-hallucination spirit, different temporal scope.)
 
 ### Threshold semantics — temporal scope
 
 In-session: aggregation across the **memory objects retrieved for the current query** (a small subset). Scan-driven: aggregation across the **full memory pool since the last scan watermark** (potentially hundreds). Same thresholds, different denominators. A person who appears in 1 retrieved memory object during a session won't trigger in-session (need ≥2), but might trigger scan-driven if they appear in ≥2 memory objects across the scan window.
 
-This is by design: the scan-driven path is the catch-up mechanism for content that never reaches a session.
+This verdict asymmetry is the gap #116 closes — it's not threshold drift. The scan-driven path produces verdicts the in-session path structurally cannot, by design. A future benchmarker comparing the two paths' verdict counts on the same memory pool should expect scan-driven to be a strict superset, not equal.
 
 ### Path provenance on approved diffs
 
