@@ -360,6 +360,82 @@ def test_just_below_threshold_no_finding():
     print("  T18 PASS — threshold boundary is strict: at threshold = no fire, just above = fire.")
 
 
+def test_mtime_rule_skipped_when_few_created_at():
+    """T23: mtime rule does NOT fire when created_at count is below the floor.
+
+    Fresh-clone vaults have ca=0 (or very low) but plenty of mtime-only
+    objects; the old check `mt > 2.0 * max(ca, 1)` fired forever in that
+    state, exactly the F4 staleness pattern the parent (#41) tries to avoid.
+    The fix gates on `ca >= min_created_at_for_mtime_rule` so the rule
+    silently abstains when it has no real signal."""
+    rev = setup_review()
+    floor = rev.THRESHOLDS["min_created_at_for_mtime_rule"]
+
+    # ca == 0 (fresh-clone): rule must NOT fire even with lots of mtime data.
+    snap_fresh = make_snapshot(memory_quality={"memory_age_source_distribution": {"created_at": 0, "mtime": 50}})
+    recs_fresh = rev.evaluate_rules(snap_fresh)
+    assert not any("mtime dominates" in r["finding"] for r in recs_fresh), (
+        f"fresh-clone (ca=0) should not fire mtime rule, got: {[r['finding'] for r in recs_fresh]}"
+    )
+
+    # ca just below floor: still no fire.
+    snap_below = make_snapshot(memory_quality={"memory_age_source_distribution": {"created_at": floor - 1, "mtime": 50}})
+    recs_below = rev.evaluate_rules(snap_below)
+    assert not any("mtime dominates" in r["finding"] for r in recs_below)
+
+    # ca at the floor with mt > 2x: rule fires (real signal).
+    snap_signal = make_snapshot(memory_quality={"memory_age_source_distribution": {"created_at": floor, "mtime": floor * 3}})
+    recs_signal = rev.evaluate_rules(snap_signal)
+    assert any("mtime dominates" in r["finding"] for r in recs_signal), (
+        f"with ca=floor and mt=3*floor, rule should fire, got: {[r['finding'] for r in recs_signal]}"
+    )
+
+    print("  T23 PASS — mtime rule abstains when created_at count is below the floor (no fresh-clone false-positives).")
+
+
+def test_schema_version_mismatch_warns(capsys):
+    """T24: snapshot with unexpected schema_version produces a stderr warning.
+
+    Aggregator bumps schema_version on RENAMES/REMOVALS. A mismatch means
+    rules may silently degrade to 'key missing → no finding' — surface it
+    loudly so the user updates the tool rather than acting on stale advice."""
+    rev = setup_review()
+    assert hasattr(rev, "EXPECTED_SCHEMA_VERSION")
+    assert rev.EXPECTED_SCHEMA_VERSION == 1
+
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        # Stage a content-root-shaped layout so load_config's metrics_dir resolves here.
+        snap_dir = td_p / ".metrics" / "snapshots"
+        snap_dir.mkdir(parents=True)
+        snap_future = make_snapshot()
+        snap_future["schema_version"] = 2
+        (snap_dir / "snap-future.json").write_text(json.dumps(snap_future))
+
+        # Patch the module's load_config to return a config pointing at td_p.
+        # main() reads cfg.harvest_state_root.parent / ".metrics" — so harvest_state_root
+        # must be td_p / "<anything>" so that .parent gives td_p.
+        class FakeCfg:
+            harvest_state_root = td_p / ".harvest"
+        original_load_config = rev.load_config
+        rev.load_config = lambda **kw: FakeCfg()
+        try:
+            out_path = td_p / "review.md"
+            rc = rev.main(["metrics-self-review.py", "--out", str(out_path)])
+        finally:
+            rev.load_config = original_load_config
+
+        assert rc == 0, f"unexpected exit code: {rc}"
+        # capsys captures stderr from the in-process main() call.
+        captured = capsys.readouterr()
+        assert "schema_version=2" in captured.err, (
+            f"expected schema_version warning in stderr, got: {captured.err!r}"
+        )
+        assert "WARNING" in captured.err
+
+    print("  T24 PASS — snapshot with mismatched schema_version produces a stderr warning.")
+
+
 def test_cli_writes_review():
     """T14: CLI writes review file."""
     with tempfile.TemporaryDirectory() as td:
@@ -403,5 +479,7 @@ if __name__ == "__main__":
     test_mcp_errors_finding()
     test_freshness_states_non_pass()
     test_just_below_threshold_no_finding()
+    test_mtime_rule_skipped_when_few_created_at()
+    test_schema_version_mismatch_warns()
     test_cli_writes_review()
     print("All metrics-self-review tests passed.")

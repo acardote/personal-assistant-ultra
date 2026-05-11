@@ -181,6 +181,68 @@ def test_run_synthesizer_includes_specialist_when_present():
     print("  T7 PASS — SPECIALIST block included when specialist_response is set.")
 
 
+def test_batch_mode_starts_fresh_session_per_case():
+    """T8: --batch loop mints a fresh PA_SESSION_ID per case.
+
+    Without this, route()'s inherit_or_start() reads the prior case's
+    session id from os.environ and every batch case collapses into one
+    session_id in .metrics/events-*.jsonl — breaking per-query aggregation
+    in eval runs. The fix imports start_session and calls it before each
+    route() invocation in the batch loop."""
+    import json as _json
+    import os as _os
+    import tempfile
+
+    route = load_route()
+
+    # Source-level check: start_session is imported.
+    src = (PROJ / "tools" / "route.py").read_text(encoding="utf-8")
+    assert "start_session" in src, "route.py must import start_session for batch session fix"
+
+    # Behavioural check: each case sees a different session id.
+    captured: list[str] = []
+
+    def fake_route(query, *, no_critic=False, no_specialist=False):
+        captured.append(_os.environ.get("PA_SESSION_ID", ""))
+        return route.RouteResult(
+            query=query, kb_tokens=0, memory_tokens=0,
+            memory_files=[], specialist=None,
+        )
+
+    original_route = route.route
+    route.route = fake_route
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            cases_path = td_p / "cases.json"
+            report_path = td_p / "report.json"
+            cases_path.write_text(_json.dumps([
+                {"id": "case-1", "query": "q1"},
+                {"id": "case-2", "query": "q2"},
+                {"id": "case-3", "query": "q3"},
+            ]))
+            # Pre-seed env so we can prove start_session() overwrites it.
+            _os.environ["PA_SESSION_ID"] = "deadbeef"
+            rc = route.main([
+                "route.py", "--batch", str(cases_path),
+                "--report-out", str(report_path),
+            ])
+            assert rc == 0
+            assert len(captured) == 3, f"expected 3 cases captured, got {len(captured)}"
+            assert len(set(captured)) == 3, (
+                f"all batch cases share session id — fix not in place. Captured: {captured}"
+            )
+            # None should equal the pre-seeded value either.
+            assert "deadbeef" not in captured, (
+                "first case inherited the pre-seeded env var; start_session() not called per case"
+            )
+    finally:
+        route.route = original_route
+        _os.environ.pop("PA_SESSION_ID", None)
+
+    print("  T8 PASS — batch mode mints a fresh PA_SESSION_ID per case (no session bleed).")
+
+
 if __name__ == "__main__":
     print("Running test_router_synthesis_acceptance.py...")
     test_route_result_has_synthesized_field()
@@ -190,4 +252,5 @@ if __name__ == "__main__":
     test_synthesize_prompt_exists()
     test_run_synthesizer_prompt_includes_blocks()
     test_run_synthesizer_includes_specialist_when_present()
+    test_batch_mode_starts_fresh_session_per_case()
     print("All router synthesis tests passed.")

@@ -381,6 +381,19 @@ def render_current_state(latest: dict) -> str:
     return "\n".join(sections)
 
 
+def _json_for_script(obj: Any) -> str:
+    """Serialize `obj` for embedding inside a `<script>` tag.
+
+    `json.dumps` does NOT escape `</` — a snapshot value containing the literal
+    `</script>` would break out of the script block. Today only `generated_at`
+    (aggregator-side timestamp) flows into Plotly data, so the path is
+    theoretically unreachable; defense-in-depth so it stays that way when
+    future chart fields source from `by_source_kind` keys or other
+    snapshot-derived strings.
+    """
+    return json.dumps(obj).replace("</", "<\\/")
+
+
 def render_html(snapshots: list[dict]) -> str:
     """Render the full HTML dashboard."""
     latest = snapshots[-1] if snapshots else {}
@@ -388,7 +401,7 @@ def render_html(snapshots: list[dict]) -> str:
 
     chart_divs = "\n".join(f"<div id='chart-{i}' class='chart'></div>" for i in range(len(charts)))
     chart_scripts = "\n".join(
-        f"Plotly.newPlot('chart-{i}', {json.dumps(c['data'])}, {json.dumps(c['layout'])}, {{responsive: true}});"
+        f"Plotly.newPlot('chart-{i}', {_json_for_script(c['data'])}, {_json_for_script(c['layout'])}, {{responsive: true}});"
         for i, c in enumerate(charts)
     )
 
@@ -457,8 +470,8 @@ def main(argv: list[str]) -> int:
         out_path = metrics_dir / "dashboard.html"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    html = render_html(snapshots)
-    out_path.write_text(html, encoding="utf-8")
+    html_out = render_html(snapshots)  # local name avoids shadowing the `html` stdlib import
+    out_path.write_text(html_out, encoding="utf-8")
     print(f"[metrics-dashboard] {len(snapshots)} snapshot(s) → {out_path}", file=sys.stderr)
 
     if args.serve:
