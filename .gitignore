@@ -40,3 +40,13 @@ __pycache__/
 venv/
 node_modules/
 .DS_Store
+
+# Work-specific commands (Nexar-internal) imported from ~/Projects/personal_assistant/
+# Intentionally local-only — see ~/.claude/plans/purring-wibbling-conway.md.
+# Listed explicitly (vs a glob) so future legitimate project commands are not
+# accidentally excluded.
+/.claude/commands/atlas-new-user.md
+/.claude/commands/pdf.md
+/.claude/commands/trello-iterate.md
+/.claude/commands/trello-tasks.md
+/.claude/commands/weekly-update.md
