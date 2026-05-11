@@ -111,20 +111,27 @@ def read_events_for_window(
     return events
 
 
-def build_compress_source_index(events: list[dict]) -> dict[tuple, str]:
-    """Index `compress_end` events by (session_id, ts) so `compress_result`
+def build_compress_source_index(events: list[dict]) -> dict[tuple, list[tuple[str, str]]]:
+    """Index `compress_end` events by (session_id, ts_minute) so `compress_result`
     events can be joined back to their source_kind.
 
     Per PR-B's design: compress_end carries source_kind + raw_chars +
     output_chars (timing-side data); compress_result carries kind +
     body_tokens + over_budget + cluster_role (post-validation outcome).
-    Aggregator joins them by session_id + ts proximity (within ~5 seconds
-    in normal operation).
+    Aggregator joins them by session_id + ts proximity.
 
-    Returns {(session_id, approx_ts_minute): source_kind}. Approximate
-    minute-bucketing is good enough — compress is per-item and far apart.
+    Returns `{(session_id, ts_minute): [(compress_end_ts, source_kind), ...]}`.
+    The list-valued bucket preserves all `compress_end` events that land in the
+    same `(session_id, minute)` — the prior `dict[tuple, str]` shape collapsed
+    them via last-write-wins, silently misattributing back-to-back compresses
+    of different sources (slack_thread → gmail_thread within one harvest
+    minute) in `lookup_source_kind`. This is the #157 closer.
+
+    `lookup_source_kind` resolves the join by nearest-ts within the current +
+    previous minute buckets, falling back to "unknown" when no candidate
+    matches the session.
     """
-    index: dict[tuple, str] = {}
+    index: dict[tuple, list[tuple[str, str]]] = defaultdict(list)
     for e in events:
         if e.get("event") != "compress_end":
             continue
@@ -134,33 +141,60 @@ def build_compress_source_index(events: list[dict]) -> dict[tuple, str]:
         if not (sid and ts and sk):
             continue
         # Bucket on first 16 chars (YYYY-MM-DDTHH:MM) so a same-session
-        # compress_result emitted seconds after end joins to same source_kind.
+        # compress_result emitted seconds later still finds candidates via
+        # the current+previous minute search at lookup time.
         ts_bucket = ts[:16]
-        index[(sid, ts_bucket)] = sk
-    return index
+        index[(sid, ts_bucket)].append((ts, sk))
+    return dict(index)
 
 
-def lookup_source_kind(idx: dict[tuple, str], session_id: str, ts: str) -> str:
+def lookup_source_kind(idx: dict[tuple, list[tuple[str, str]]], session_id: str, ts: str) -> str:
     """Return source_kind for a compress_result by joining to compress_end.
-    Falls back to "unknown" if no matching compress_end was indexed."""
+
+    Strategy: collect all `(compress_end_ts, source_kind)` candidates from the
+    current and previous minute buckets in the same session, then pick the
+    nearest-ts match. Falls back to "unknown" when no candidate exists (per
+    #157 F3 closer: honest gaps beat silent misattribution).
+
+    The earlier implementation returned at the first non-empty bucket which,
+    combined with last-write-wins indexing, attributed every same-minute
+    compress_result to whichever compress_end happened to land last — wrong
+    under realistic harvest batches that process slack+gmail back-to-back.
+    """
     if not (session_id and ts):
         return "unknown"
+
+    target_dt: _dt.datetime | None
+    try:
+        target_dt = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        target_dt = None
+
     ts_bucket = ts[:16]
-    # Try exact bucket; if miss, try previous minute (compress_result might
-    # land 5-15s after compress_end at minute boundaries).
-    for offset_min in (0, -1):
-        b = ts_bucket
-        if offset_min < 0:
-            try:
-                t = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                t = t - _dt.timedelta(minutes=1)
-                b = t.strftime("%Y-%m-%dT%H:%M")
-            except ValueError:
-                continue
-        sk = idx.get((session_id, b))
-        if sk:
-            return sk
-    return "unknown"
+    candidates: list[tuple[str, str]] = list(idx.get((session_id, ts_bucket), []))
+    if target_dt is not None:
+        prev_dt = target_dt - _dt.timedelta(minutes=1)
+        prev_bucket = prev_dt.strftime("%Y-%m-%dT%H:%M")
+        candidates.extend(idx.get((session_id, prev_bucket), []))
+
+    if not candidates:
+        return "unknown"
+
+    if target_dt is None:
+        # Couldn't parse target ts — return the first candidate in the current
+        # bucket rather than guessing distance. Deterministic; "unknown" would
+        # be more honest but the caller already lacked a usable ts.
+        return candidates[0][1]
+
+    def _abs_diff(candidate: tuple[str, str]) -> float:
+        try:
+            ce_dt = _dt.datetime.fromisoformat(candidate[0].replace("Z", "+00:00"))
+        except ValueError:
+            return float("inf")
+        return abs((ce_dt - target_dt).total_seconds())
+
+    candidates.sort(key=_abs_diff)
+    return candidates[0][1]
 
 
 def read_harvest_runs(
