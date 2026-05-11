@@ -124,8 +124,8 @@ Decision rules:
 
 **Abort condition**: if Slack OR Granola is missing after the rules above, immediately:
 
-  - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`
-  - Commit + push that file (so dual-machine setups can see the failure).
+  - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`.
+  - **Push that single file via the GitHub MCP `push_files` tool** (same transport as the normal commit-push at the end of the routine — see that procedure below for vault-coordinate parsing and error handling). Do NOT use `git push` here — the sandbox's git proxy returns 403 (the failure mode this whole prompt was rewritten for). If `push_files` itself errors out (tool not attached / 4xx / 5xx-after-retry), emit `echo "FATAL: preflight abort run-status could not be pushed — A1 falsified; failure visible only in routine logs" >&2` so the routine log carries the signal even though no cross-machine surface will.
   - Exit. **Do NOT proceed to harvest.** A successful-looking partial run with a critical source missing is worse than a clean failure.
 
 The most likely cause of a missing critical connector is "the connector is enabled in claude.ai but not authenticated." Surface that explicitly in the error so the user knows where to look.
@@ -241,30 +241,44 @@ Procedure:
 
        VAULT_URL=$(git -C "$VAULT" config --get remote.origin.url)
        VAULT_OWNER=$(echo "$VAULT_URL" | sed -E 's|.*github\.com[/:]([^/]+)/.*|\1|')
-       VAULT_REPO=$(echo "$VAULT_URL"  | sed -E 's|.*github\.com[/:][^/]+/([^/.]+)(\.git)?$|\1|')
-       if [ -z "$VAULT_OWNER" ] || [ -z "$VAULT_REPO" ]; then
-         echo "FATAL: could not parse vault owner/repo from $VAULT_URL" >&2
+       # Strip a trailing .git and an optional trailing / from the last URL segment.
+       # Uses .+? rather than [^/.]+ so repo names containing a dot (e.g. foo.bar.io) parse correctly.
+       VAULT_REPO=$(echo "$VAULT_URL"  | sed -E 's|.*github\.com[/:][^/]+/(.+)|\1|; s|\.git/?$||; s|/$||')
+       # Positive-match guards. If sed didn't match the input, $VAULT_URL passes through unchanged;
+       # these checks catch that (and other malformed inputs) before they reach push_files.
+       if [ -z "$VAULT_OWNER" ] || [ -z "$VAULT_REPO" ] \
+          || [ "$VAULT_OWNER" = "$VAULT_URL" ] || [ "$VAULT_REPO" = "$VAULT_URL" ] \
+          || [[ "$VAULT_OWNER" == *"/"* ]] || [[ "$VAULT_REPO" == *"/"* ]]; then
+         echo "FATAL: could not parse vault owner/repo from $VAULT_URL (got OWNER=$VAULT_OWNER REPO=$VAULT_REPO)" >&2
          exit 1
        fi
 
-2. **Discover changed files** via the local checkout's git index:
+2. **Discover changed files** via the local checkout's git index. Use `-z` (NUL-delimited records) and `--untracked-files=all` (the default `normal` mode collapses brand-new top-level directories like `artefacts/memo/.unprocessed/` into a single trailing-slash entry — exactly the case `git add -A` would expand to per-file):
 
        cd "$VAULT"
-       CHANGED=$(git status --porcelain)
+       git status -z --porcelain --untracked-files=all
 
-   `git status --porcelain` respects `.gitignore`, so `raw/` (per [ADR-0001](../../docs/adr/0001-storage-backend.md) + the vault's `.gitignore`) is excluded by construction — no special handling needed. The output is one line per changed path in the form `XY <path>` where `XY` is the two-char status. The relevant statuses for harvest output are `A` (new file), `M` (modified), `??` (untracked); harvest does not produce deletions in normal operation, so `D` is unexpected — if you see one, log a warning to stderr and skip that path rather than try to delete via `push_files` (the tool's delete semantics differ across MCP server versions; out of scope here).
+   Parse the output as NUL-terminated records. Each record starts with two status chars + one space (3 bytes total), then the path verbatim — no octal-escape quoting, no surrounding double-quotes (that's what `-z` buys you). Strip the leading 3 bytes from each record to get the raw path; the trailing NUL is the record separator. Verified shape on a test repo: `?? memory/slack_thread/André's-team.md\0` — non-ASCII bytes are passed through unchanged.
 
-   **If `$CHANGED` is empty**: harvest produced no new files. Write a `runs/<ts>.json` locally with `ok: true`, totals at zero, and `notes: "harvest produced no new files"`. Then re-run `git status --porcelain` (it will now show the runs file as `??`) and proceed to step 3 with that single file — there's still a run-status to land for the freshness check / watchdog.
+   `git status` respects `.gitignore`, so `raw/` (per [ADR-0001](../../docs/adr/0001-storage-backend.md) + the vault's `.gitignore`) is excluded by construction — no special handling needed. The relevant statuses for harvest output are `A` (new file), `M` (modified), `??` (untracked); harvest does not produce deletions in normal operation, so `D` is unexpected — if you see one, log a warning to stderr and skip that path rather than try to delete via `push_files` (the tool's delete semantics differ across MCP server versions; out of scope here).
 
-3. **Build the `files[]` payload**. For each path in `$CHANGED` (parse column 2 onward — handles spaces in paths correctly), Read the file content and append:
+   **Renames** (`R `): in porcelain `-z`, a rename emits two NUL-separated paths in one record (`R  newpath\0oldpath`). Harvest doesn't produce renames in normal operation, but if you see one, push the new path's content and treat the old path as a deletion (log to stderr, skip).
+
+   **Binary files**: today, all harvest outputs are Markdown or JSON (text). If the Read tool refuses a file as binary, OR the first 4 KB of file bytes contains a NUL byte, skip that path with a stderr warning and add `{"kind": "binary_skipped", "path": "..."}` to the run-status `errors` list. `push_files`'s `content` field expects a UTF-8 string; passing a binary-refusal string would silently corrupt the file in the vault.
+
+   **If `git status` returns an empty result**: harvest produced no new files. Write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: true, scheduler: "routine"`, populate the `sources` object with zero-shaped per-source entries (`"slack": {"new": 0, "errors": []}` etc.), and `notes: "harvest produced no new files"` — i.e. the SAME schema specified earlier in this prompt for the success-path run-status JSON, not a different shape. Then re-run `git status -z --porcelain --untracked-files=all`; the runs file will now appear as `??` and step 3 has a single-file payload to push for freshness-check visibility.
+
+3. **Build the `files[]` payload**. For each path from step 2, Read the file content and append:
 
        {"path": "<vault-relative path>", "content": "<file body, verbatim>"}
 
    to a list. The path must be vault-relative (NOT including the `$VAULT/` prefix) — `push_files` writes paths relative to the repo root.
 
-   **Batching cap** (per A2 on #153): if the list exceeds **50 files**, split it by top-level directory (`memory/`, `.harvest/`, `artefacts/`, `work/`, root-level files) and push each batch as a separate `push_files` call with commit message `harvest YYYY-MM-DD batch <N>/<M> (routine)`. This is defensive — the May 11 steady-state fire produced 12 files, well under the cap; the cap is sized for a 30-day cold-start (which can produce dozens-to-hundreds of files across sources).
+   **Order**: append paths in the order step 2 emits them, but **move the `.harvest/runs/<ts>.json` entry to the END of the list**. That run-status JSON should be in the FINAL batch — if an earlier batch fails mid-way, the next fire can see a vault state that's partial-data + no-success-marker (correctly STALE) rather than partial-data + success-marker (silently corrupt).
 
-4. **Invoke `push_files`** (GitHub MCP tool — the routine LLM resolves the namespaced name from the auto-attached connector):
+   **Batching cap** (per A2 on #153): if the list exceeds **30 files**, split into consecutive **slices of up to 30 files each in insertion order** (NOT grouped by top-level directory — that axis under-defends because `memory/` alone can hold 80–120 files on a 30-day cold-start). Push each slice as a separate `push_files` call with commit message `harvest YYYY-MM-DD batch <N>/<M> (routine)`. The last slice contains the runs file by construction. Steady-state harvests (~12 files) hit a single batch and the cap is a no-op; cold-start backfills get split deterministically.
+
+4. **Invoke `push_files`** (GitHub MCP tool — the routine LLM resolves the namespaced name from the auto-attached connector). The commit is attributed to the routine's OAuth account identity (not a generic agent identity); the `(routine)` suffix in the commit subject disambiguates routine commits from hand-authored ones in `git log` / `git blame`, so no author override is needed:
 
        owner:   "$VAULT_OWNER"
        repo:    "$VAULT_REPO"
@@ -274,14 +288,13 @@ Procedure:
 
 5. **Error handling** (apply mechanically — no judgment):
 
-   - **Tool not found / discovery error** (e.g., "no tool named push_files"): A1 on #153 is falsified for this run — the GitHub MCP is not attached. Write a `runs/<ts>.json` locally with `ok: false, phase: "commit_push", error: "github_mcp_push_files_unavailable"`. Do NOT fall back to `git push` — the proxy 403 is exactly the failure mode this whole path was designed to avoid; falling back re-creates it. Exit non-zero. The watchdog routine will surface this on its next fire.
-   - **Transient error** (5xx, network timeout, rate limit): wait 30 seconds, retry the same call once. If the retry also fails transiently, treat as terminal (next bullet).
-   - **Terminal error** (4xx auth/permission, branch protection violation, structural API error after one retry): write `runs/<ts>.json` locally with `ok: false, phase: "commit_push", error: "<MCP error code + first 200 chars of error message>"`. Then attempt a SECOND `push_files` call pushing ONLY that single runs file (small payload — most likely to succeed if the failure was payload-shape-related). If that second call also errors, log to stderr and exit. The local-checkout side of any dual-machine setup will see the working-tree changes on next sync.
-   - **Empty response**: treat as transient — wait 30s and retry once.
+   - **Tool not found / discovery error** (e.g., "no tool named push_files"): A1 on #153 is falsified for this run — the GitHub MCP is not attached. Write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: false, phase: "commit_push", error: "github_mcp_push_files_unavailable"`. Do NOT fall back to `git push` — the proxy 403 is exactly the failure mode this whole path was designed to avoid; falling back re-creates it. Then emit `echo "FATAL: github_mcp_push_files_unavailable — run-status was written locally but cannot reach the vault; the watchdog will report STALE within 26h with no further detail. Inspect this routine's logs in claude.ai/code/routines to recover the cause." >&2` so the failure is at least loud in the routine UI. Exit non-zero.
+   - **Transient error** (5xx, network timeout, rate limit, empty response): wait 30 seconds, retry the same call once. If the retry also fails transiently, treat as terminal (next bullet).
+   - **Terminal error** (4xx auth/permission, branch protection violation, structural API error after one retry): write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: false, phase: "commit_push", error: "<MCP error code + first 2000 chars of error message with newlines stripped to keep the JSON valid>"`. Then attempt a SECOND `push_files` call pushing ONLY that single runs file (small payload — most likely to succeed if the failure was payload-shape-related). If that second call also errors, log to stderr and exit. The local-checkout side of any dual-machine setup will see the working-tree changes on next sync.
 
 6. **On success**: the `push_files` response includes a commit SHA. Echo it to stderr (`echo "harvest commit: $SHA" >&2`) so the run log carries it for debugging out-of-band. Multiple SHAs if you batched in step 3.
 
-Why no rebase-retry on the MCP path: `push_files` operates via the GitHub Contents API which serializes against the branch tip server-side. Non-fast-forward errors don't manifest the same way as on `git push` — instead the API returns a 409 / 422 if the branch moved underneath, which the terminal-error branch above handles. Cross-machine race conditions still exist but surface as a clean `runs/*.json` failure rather than a half-broken local merge state.
+A note on race semantics. The GitHub MCP `push_files` is typically implemented as a Git Database API sequence (createBlob → createTree with `base_tree` → createCommit with the current tip as parent → updateRef). The `updateRef` step's fast-forward enforcement and force-flag behavior **varies across MCP server builds** and has not been verified for this routine's sandbox. The conservative assumption: under cross-machine contention with launchd, the failure may surface either as a clean 422 (caught by the terminal-error branch above) OR as a silent force-update that clobbers the laptop's concurrent push. **The "Choose ONE scheduler" discipline at the top of this file is therefore load-bearing**, not merely a nicety — file a falsifier on #153 with evidence if you operate dual-active and observe behavior under race.
 
 In your final response, summarize:
 - Which sources fired and what each produced.
