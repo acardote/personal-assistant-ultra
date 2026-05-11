@@ -533,6 +533,99 @@ def test_source_economy_buckets_by_source_kind():
     print("  T15 PASS — source_economy buckets by source_kind via session+ts join.")
 
 
+def test_same_minute_multisource_join_correct():
+    """T19 (#157): two compress_end events in the same (session_id, minute)
+    with different source_kind must be preserved — `compress_result` events
+    join to the nearest-ts compress_end, not last-write-wins.
+
+    Adversarial scenario from the PR-44 challenger finding: harvest batch
+    processes slack+gmail back-to-back. The old implementation overwrote
+    `index[(sid, minute)] = sk` and every compress_result in that minute
+    attributed to whichever compress_end ran second. F1 of #157 retracts
+    the fix if both attribute to the same source_kind."""
+    import datetime as _dt
+    agg = setup_aggregate()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        events = [
+            # Both compress_end events in the same (sid=h1, minute=10:00),
+            # different source_kind, 30s apart.
+            {"ts": "2026-05-06T10:00:15Z", "session_id": "h1", "event": "compress_end", "duration_ms": 3000,
+             "data": {"source_kind": "slack_thread", "raw_chars": 2000, "output_chars": 1500}},
+            {"ts": "2026-05-06T10:00:45Z", "session_id": "h1", "event": "compress_end", "duration_ms": 3500,
+             "data": {"source_kind": "gmail_thread", "raw_chars": 2500, "output_chars": 1800}},
+            # compress_result at 10:00:17 → nearer to :15 → slack_thread
+            {"ts": "2026-05-06T10:00:17Z", "session_id": "h1", "event": "compress_result",
+             "data": {"kind": "thread", "body_tokens": 700, "over_budget": False, "cluster_role": "canonical"}},
+            # compress_result at 10:00:46 → nearer to :45 → gmail_thread
+            {"ts": "2026-05-06T10:00:46Z", "session_id": "h1", "event": "compress_result",
+             "data": {"kind": "thread", "body_tokens": 800, "over_budget": True, "cluster_role": "canonical"}},
+        ]
+        write_events_file(td_p / ".metrics", "2026-05-06", events)
+        snap = agg.build_snapshot(
+            metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
+            start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
+        )
+        by_source = snap["source_economy"]["by_source_kind"]
+        # Both source_kinds should be present with exactly one compress_result each.
+        assert "slack_thread" in by_source, f"missing slack_thread; got {list(by_source.keys())}"
+        assert "gmail_thread" in by_source, f"missing gmail_thread; got {list(by_source.keys())}"
+        assert by_source["slack_thread"]["compress_result_count"] == 1, (
+            f"slack_thread should have 1 result (the 10:00:17 event), "
+            f"got {by_source['slack_thread']['compress_result_count']} — "
+            f"same-minute join collision regressed"
+        )
+        assert by_source["gmail_thread"]["compress_result_count"] == 1, (
+            f"gmail_thread should have 1 result (the 10:00:46 event), "
+            f"got {by_source['gmail_thread']['compress_result_count']} — "
+            f"same-minute join collision regressed"
+        )
+        # F1-adversarial: the previous over-budget=True signal is on the
+        # gmail_thread result; it must NOT have leaked to slack_thread.
+        assert by_source["gmail_thread"]["over_budget_count"] == 1
+        assert by_source["slack_thread"]["over_budget_count"] == 0
+        # "unknown" bucket should be absent — every compress_result joined.
+        assert "unknown" not in by_source, (
+            "no compress_result should have fallen to 'unknown' in this fixture"
+        )
+    print("  T19 PASS — same-minute multisource compresses join correctly per nearest-ts (#157 F1 closer).")
+
+
+def test_no_compress_end_falls_back_to_unknown():
+    """T20 (#157 F3): compress_result events with no matching compress_end
+    in their (session_id, minute) or (session_id, minute-1) buckets land
+    under 'unknown' rather than being misattributed to a wrong-but-plausible
+    source_kind. Honest gaps beat silent misattribution."""
+    import datetime as _dt
+    agg = setup_aggregate()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        events = [
+            # compress_end in session h1
+            {"ts": "2026-05-06T10:00:00Z", "session_id": "h1", "event": "compress_end", "duration_ms": 3000,
+             "data": {"source_kind": "slack_thread", "raw_chars": 2000, "output_chars": 1500}},
+            # compress_result in DIFFERENT session h2, same minute — must NOT
+            # cross-join to h1's source_kind.
+            {"ts": "2026-05-06T10:00:05Z", "session_id": "h2", "event": "compress_result",
+             "data": {"kind": "thread", "body_tokens": 700, "over_budget": False, "cluster_role": "canonical"}},
+        ]
+        write_events_file(td_p / ".metrics", "2026-05-06", events)
+        snap = agg.build_snapshot(
+            metrics_dir=td_p / ".metrics", runs_dir=td_p / "runs", memory_root=td_p / "memory",
+            start=_dt.date(2026, 5, 6), end=_dt.date(2026, 5, 6),
+        )
+        by_source = snap["source_economy"]["by_source_kind"]
+        # The orphan compress_result must land under "unknown", NOT "slack_thread".
+        assert "slack_thread" not in by_source or by_source["slack_thread"]["compress_result_count"] == 0, (
+            "compress_result from session h2 cross-joined to session h1's source_kind — F3 retract"
+        )
+        assert "unknown" in by_source, (
+            f"orphan compress_result should land under 'unknown'; got {list(by_source.keys())}"
+        )
+        assert by_source["unknown"]["compress_result_count"] == 1
+    print("  T20 PASS — compress_result with no matching compress_end falls back to 'unknown' (#157 F3 closer).")
+
+
 def test_memory_age_from_frontmatter():
     """T16: memory_age uses frontmatter created_at when available, falls back to mtime."""
     import datetime as _dt
@@ -577,5 +670,7 @@ if __name__ == "__main__":
     test_malformed_lines_tolerated()
     test_cli_writes_snapshot()
     test_source_economy_buckets_by_source_kind()
+    test_same_minute_multisource_join_correct()
+    test_no_compress_end_falls_back_to_unknown()
     test_memory_age_from_frontmatter()
     print("All metrics-aggregate tests passed.")
