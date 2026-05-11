@@ -7,12 +7,12 @@ This is the artifact-of-record for the production scheduled harvest, per [#25](h
 Claude Code routines run on Anthropic's web infrastructure (verified end-to-end by probes 1–6 on 2026-05-05; canonical reference: probe `trig_012bbTLE2G6RYFsncQH89Ysy` for MCP discovery + `trig_01E63nUVn7TsfKVdCTnZbjHJ` for Granola body extraction). They:
 
 - Fire on schedule even when your laptop is closed or off.
-- Have authenticated git push to linked repos (no per-machine `gh auth` setup needed).
+- Push commits to the vault via the GitHub MCP `push_files` tool, attached automatically to the routine's account-level GitHub OAuth (no per-machine `gh auth` setup needed). The routine sandbox's git CLI proxy started returning 403 on `git-receive-pack` POSTs from 2026-05-08 onward; the MCP path bypasses that proxy — see [#153](https://github.com/acardote/personal-assistant-ultra/issues/153) for the diagnostic and the decision to standardize on MCP push.
 - Auto-attach your account-level MCP connectors (Slack, Gmail, Granola, GitHub all confirmed reachable from the routine sandbox).
 - Draw down the same Claude subscription as interactive sessions (no separate billing).
 - Are subject to per-tier daily limits (Pro: 5/day, Max: 15/day, Team/Enterprise: 25/day).
 
-**Choose ONE scheduler** — do not run routines and launchd against the same vault simultaneously. They will race on `git push` to the vault and the dedup state files (`.harvest/<source>.json`) are last-writer-wins JSON. The launchd-based path (`templates/launchd/`) remains as an **alternative** for users without routine eligibility (lower tiers, certain enterprise restrictions) or who prefer strictly local execution. If you switch, disable the previous scheduler before enabling the new one.
+**Choose ONE scheduler** — do not run routines and launchd against the same vault simultaneously. They will race on writes to the vault's `main` branch (launchd via `git push`, routine via the GitHub MCP `push_files`) and the dedup state files (`.harvest/<source>.json`) are last-writer-wins JSON. The launchd-based path (`templates/launchd/`) remains as an **alternative** for users without routine eligibility (lower tiers, certain enterprise restrictions) or who prefer strictly local execution. If you switch, disable the previous scheduler before enabling the new one.
 
 **Sources NOT covered by the routine path**: Google Meet folder watch and generic transcript drop. These are file-system-based sources that need either local Meet-export sync or a folder you drop transcripts into — neither exists in the routine sandbox. If you depend on those sources, either keep launchd active alongside routines for those sources only (with the same vault — but bear in mind the lock-and-race caveat above), or run them ad-hoc via `tools/harvest.py --source gmeet|transcripts --folder <path>` from a Mac session.
 
@@ -124,13 +124,13 @@ Decision rules:
 
 **Abort condition**: if Slack OR Granola is missing after the rules above, immediately:
 
-  - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`
-  - Commit + push that file (so dual-machine setups can see the failure).
+  - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`.
+  - **Push that single file via the GitHub MCP `push_files` tool** (same transport as the normal commit-push at the end of the routine — see that procedure below for vault-coordinate parsing and error handling). Do NOT use `git push` here — the sandbox's git proxy returns 403 (the failure mode this whole prompt was rewritten for). If `push_files` itself errors out (tool not attached / 4xx / 5xx-after-retry), emit `echo "FATAL: preflight abort run-status could not be pushed — A1 falsified; failure visible only in routine logs" >&2` so the routine log carries the signal even though no cross-machine surface will.
   - Exit. **Do NOT proceed to harvest.** A successful-looking partial run with a critical source missing is worse than a clean failure.
 
 The most likely cause of a missing critical connector is "the connector is enabled in claude.ai but not authenticated." Surface that explicitly in the error so the user knows where to look.
 
-Also detect dual-active scheduler conflict. List `$VAULT/.harvest/runs/*.json` files modified within a window of `max(60min, 2 × your-routine-cadence-minutes)` — the larger window catches a launchd run from this morning when this routine fires this evening. If any matching file has `"scheduler": "launchd"`, append a `"warnings": ["launchd active alongside routine — pick one to avoid race conditions on git push and dedup state"]` entry to your run-status JSON. (Do not abort — the user may intentionally have both running for the Meet/transcript-drop workaround. Just surface the conflict.) The window may produce false negatives if the user's launchd cadence is sparser than 2x the routine cadence — accept this as best-effort detection.
+Also detect dual-active scheduler conflict. List `$VAULT/.harvest/runs/*.json` files modified within a window of `max(60min, 2 × your-routine-cadence-minutes)` — the larger window catches a launchd run from this morning when this routine fires this evening. If any matching file has `"scheduler": "launchd"`, append a `"warnings": ["launchd active alongside routine — pick one to avoid race conditions on writes to main and dedup state"]` entry to your run-status JSON. (Do not abort — the user may intentionally have both running for the Meet/transcript-drop workaround. Just surface the conflict.) The window may produce false negatives if the user's launchd cadence is sparser than 2x the routine cadence — accept this as best-effort detection.
 
 Determine harvest cutoff:
 - If `$VAULT/.harvest/runs/` contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
@@ -233,18 +233,80 @@ Quota-exhaustion line template (used only by the second branch): immediately aft
 
 Expected steady-state: 0-5 drift candidates per daily run (most pairs are cached or judged not-drifted). Cold-start fills the cache incrementally over multiple fires (subject to the default `--max-llm-calls=100` cap).
 
-After all sources complete (including the live write-back catch-up + kb-scan + kb-drift-scan), from $VAULT:
+After all sources complete (including the live write-back catch-up + kb-scan + kb-drift-scan), commit the harvest to the vault via the **GitHub MCP `push_files`** tool. **Do NOT use `git push` from the routine sandbox** — the sandbox's git proxy returns 403 on `git-receive-pack` POSTs (observed 2026-05-08 → 2026-05-11, 6/6 fires before the switch). The MCP path goes through the github.com API directly under the routine's account-level OAuth and works deterministically. Rationale: [#153](https://github.com/acardote/personal-assistant-ultra/issues/153).
 
-  git add -A
-  git commit -m "harvest $(date -u +%Y-%m-%d) (routine)"
-  git push origin main
+Procedure:
 
-If `git push` fails (e.g., non-fast-forward because another machine pushed first), do NOT loop — write the failure to the run-status JSON and exit. The next day's run will pull and proceed. (Per #74 the per-query path uses `tools/live-commit-push.sh` with rebase-retry; the routine doesn't yet — keeping the simpler exit-on-fail behavior here is a deliberate choice for the daily-batch surface, where loud-fail is acceptable.)
+1. **Determine vault repo coordinates** from the local checkout (the linked-repo config is the source of truth, not the prompt — works for any vault, not just the author's):
+
+       VAULT_URL=$(git -C "$VAULT" config --get remote.origin.url)
+       VAULT_OWNER=$(echo "$VAULT_URL" | sed -E 's|.*github\.com[/:]([^/]+)/.*|\1|')
+       # Strip a trailing .git and an optional trailing / from the last URL segment.
+       # Uses .+? rather than [^/.]+ so repo names containing a dot (e.g. foo.bar.io) parse correctly.
+       VAULT_REPO=$(echo "$VAULT_URL"  | sed -E 's|.*github\.com[/:][^/]+/(.+)|\1|; s|\.git/?$||; s|/$||')
+       # Positive-match guards. If sed didn't match the input, $VAULT_URL passes through unchanged;
+       # these checks catch that (and other malformed inputs) before they reach push_files.
+       if [ -z "$VAULT_OWNER" ] || [ -z "$VAULT_REPO" ] \
+          || [ "$VAULT_OWNER" = "$VAULT_URL" ] || [ "$VAULT_REPO" = "$VAULT_URL" ] \
+          || [[ "$VAULT_OWNER" == *"/"* ]] || [[ "$VAULT_REPO" == *"/"* ]]; then
+         echo "FATAL: could not parse vault owner/repo from $VAULT_URL (got OWNER=$VAULT_OWNER REPO=$VAULT_REPO)" >&2
+         exit 1
+       fi
+
+2. **Discover changed files** via the local checkout's git index. Use `-z` (NUL-delimited records) and `--untracked-files=all` (the default `normal` mode collapses brand-new top-level directories like `artefacts/memo/.unprocessed/` into a single trailing-slash entry — exactly the case `git add -A` would expand to per-file):
+
+       cd "$VAULT"
+       git status -z --porcelain --untracked-files=all
+
+   Parse the output as NUL-separated fields with a *status-dependent record arity* (this matters — naive split-on-NUL with a fixed-arity assumption breaks on rename/copy entries):
+
+   - **Most statuses** (`A`, `M`, `D`, `??`, etc.) consume ONE NUL-separated field per record. The field's leading 3 bytes are the two status chars + the separator space; bytes 4 onward are the raw path, verbatim — no octal-escape quoting, no surrounding double-quotes (that's what `-z` buys you).
+   - **Rename `R` and copy `C`** consume TWO NUL-separated fields per logical record. The first field carries the status prefix + the NEW path; the second field is the OLD path with no status prefix. Treat the second field as part of the SAME record, not as a new record starting at byte 0.
+
+   The first-field status prefix is exactly 3 bytes for *any* status (`A `, `??`, `RM`, `R `, etc.) — the two status chars may include a space (e.g. `R ` or `M `), followed by one literal space separator. Strip those 3 bytes to get the path.
+
+   Verified shape on a test repo: `?? memory/slack_thread/André's-team.md\0` — non-ASCII bytes are passed through unchanged.
+
+   `git status` respects `.gitignore`, so `raw/` (per [ADR-0001](../../docs/adr/0001-storage-backend.md) + the vault's `.gitignore`) is excluded by construction — no special handling needed. The relevant statuses for harvest output are `A` (new file), `M` (modified), `??` (untracked); harvest does not produce deletions in normal operation, so `D` is unexpected — if you see one, log a warning to stderr and skip that path rather than try to delete via `push_files` (the tool's delete semantics differ across MCP server versions; out of scope here).
+
+   **Renames / copies**: harvest doesn't produce these in normal operation. If you see one (per the two-field rule above), push the NEW path's content via `push_files` and treat the OLD path as a deletion (log to stderr, skip — the runs file will note the inconsistency).
+
+   **Binary files**: today, all harvest outputs are Markdown or JSON (text). If the Read tool refuses a file as binary, OR the first 4 KB of file bytes contains a NUL byte, skip that path with a stderr warning and add `{"kind": "binary_skipped", "path": "..."}` to the run-status `errors` list. `push_files`'s `content` field expects a UTF-8 string; passing a binary-refusal string would silently corrupt the file in the vault.
+
+   **If `git status` returns an empty result**: harvest produced no new files. Write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: true, scheduler: "routine"`, populate the `sources` object with zero-shaped per-source entries (`"slack": {"new": 0, "errors": []}` etc.), and `notes: "harvest produced no new files"` — i.e. the SAME schema specified earlier in this prompt for the success-path run-status JSON, not a different shape. Then re-run `git status -z --porcelain --untracked-files=all`; the runs file will now appear as `??` and step 3 has a single-file payload to push for freshness-check visibility.
+
+3. **Build the `files[]` payload**. For each path from step 2, Read the file content and append:
+
+       {"path": "<vault-relative path>", "content": "<file body, verbatim>"}
+
+   to a list. The path must be vault-relative (NOT including the `$VAULT/` prefix) — `push_files` writes paths relative to the repo root.
+
+   **Order**: append paths in the order step 2 emits them, but **move the `.harvest/runs/<ts>.json` entry to the END of the list**. That run-status JSON should be in the FINAL batch — if an earlier batch fails mid-way, the next fire can see a vault state that's partial-data + no-success-marker (correctly STALE) rather than partial-data + success-marker (silently corrupt).
+
+   **Batching cap** (per A2 on #153): if the list exceeds **30 files**, split into consecutive **slices of up to 30 files each in insertion order** (NOT grouped by top-level directory — that axis under-defends because `memory/` alone can hold 80–120 files on a 30-day cold-start). Push each slice as a separate `push_files` call with commit message `harvest YYYY-MM-DD batch <N>/<M> (routine)`. The last slice contains the runs file by construction. Steady-state harvests (~12 files) hit a single batch and the cap is a no-op; cold-start backfills get split deterministically.
+
+4. **Invoke `push_files`** (GitHub MCP tool — the routine LLM resolves the namespaced name from the auto-attached connector). The commit is attributed to the routine's OAuth account identity (not a generic agent identity); the `(routine)` suffix in the commit subject disambiguates routine commits from hand-authored ones in `git log` / `git blame`, so no author override is needed:
+
+       owner:   "$VAULT_OWNER"
+       repo:    "$VAULT_REPO"
+       branch:  "main"
+       files:   [<the payload built above>]
+       message: "harvest $(date -u +%Y-%m-%d) (routine)"
+
+5. **Error handling** (apply mechanically — no judgment):
+
+   - **Tool not found / discovery error** (e.g., "no tool named push_files"): A1 on #153 is falsified for this run — the GitHub MCP is not attached. Write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: false, phase: "commit_push", error: "github_mcp_push_files_unavailable"`. Do NOT fall back to `git push` — the proxy 403 is exactly the failure mode this whole path was designed to avoid; falling back re-creates it. Then emit `echo "FATAL: github_mcp_push_files_unavailable — run-status was written locally but cannot reach the vault; the watchdog will report STALE within 26h with no further detail. Inspect this routine's logs in claude.ai/code/routines to recover the cause." >&2` so the failure is at least loud in the routine UI. Exit non-zero.
+   - **Transient error** (5xx, network timeout, rate limit, empty response): wait 30 seconds, retry the same call once. If the retry also fails transiently, treat as terminal (next bullet).
+   - **Terminal error** (4xx auth/permission, branch protection violation, structural API error after one retry): write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: false, phase: "commit_push", error: "<MCP error code + first 2000 chars of error message with newlines stripped to keep the JSON valid>"`. Then attempt a SECOND `push_files` call pushing ONLY that single runs file (small payload — most likely to succeed if the failure was payload-shape-related). If that second call also errors, log to stderr and exit. The local-checkout side of any dual-machine setup will see the working-tree changes on next sync.
+
+6. **On success**: the `push_files` response includes a commit SHA. Echo it to stderr (`echo "harvest commit: $SHA" >&2`) so the run log carries it for debugging out-of-band. Multiple SHAs if you batched in step 3.
+
+A note on race semantics. The GitHub MCP `push_files` is typically implemented as a Git Database API sequence (createBlob → createTree with `base_tree` → createCommit with the current tip as parent → updateRef). The `updateRef` step's fast-forward enforcement and force-flag behavior **varies across MCP server builds** and has not been verified for this routine's sandbox. The conservative assumption: under cross-machine contention with launchd, the failure may surface either as a clean 422 (caught by the terminal-error branch above) OR as a silent force-update that clobbers the laptop's concurrent push. **The "Choose ONE scheduler" discipline at the top of this file is therefore load-bearing**, not merely a nicety — file a falsifier on #153 with evidence if you operate dual-active and observe behavior under race.
 
 In your final response, summarize:
 - Which sources fired and what each produced.
 - Any errors encountered.
-- Whether git push succeeded.
+- Whether the MCP `push_files` call(s) succeeded, including the commit SHA(s) from the response.
 - The run-status JSON path.
 ```
 
