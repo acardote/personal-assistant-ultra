@@ -292,6 +292,36 @@ def test_html_escaping_xss():
     print("  T11 PASS — hostile snapshot values are escaped, no XSS.")
 
 
+def test_plotly_script_break_out_escaped():
+    """T14: snapshot string flowing into Plotly JSON cannot break out of `<script>`.
+
+    `json.dumps` does NOT escape `</` — a snapshot value containing the literal
+    `</script>` would close the inline `<script>` block and execute whatever
+    follows. Today only `generated_at` (server-side timestamp) flows into Plotly
+    data, so the path is theoretically unreachable; defense-in-depth keeps it
+    that way when future chart fields source from snapshot strings (by_source_kind
+    keys, gap reasons, etc.)."""
+    dash = setup_dashboard()
+    # Inject a hostile generated_at so it lands inside Plotly chart data.
+    hostile_ts = "2026-05-07</script><script>alert(1)</script>"
+    snaps = [
+        make_snapshot("2026-05-06T12:00:00Z"),
+        make_snapshot(hostile_ts),
+    ]
+    html_out = dash.render_html(snaps)
+    # The literal break-out string must NOT appear — escaping should have
+    # turned every `</` inside Plotly JSON into `<\/`.
+    assert "</script><script>alert(1)" not in html_out, (
+        "Plotly JSON allowed </script> break-out — XSS surface remains."
+    )
+    # The escaped form is what we expect to see embedded in the Plotly data
+    # (alongside any other escaped occurrences from JSON strings).
+    assert "<\\/script>" in html_out or "alert(1)" not in html_out, (
+        "Expected escaped form '<\\/script>' to appear in Plotly data block."
+    )
+    print("  T14 PASS — `</script>` in Plotly data is escaped to `<\\/script>` (defense-in-depth).")
+
+
 def test_charts_skip_single_snapshot():
     """T12: build_charts requires ≥2 snapshots; single-point lines are misleading."""
     dash = setup_dashboard()
@@ -369,5 +399,6 @@ if __name__ == "__main__":
     test_html_escaping_xss()
     test_charts_skip_single_snapshot()
     test_staleness_warning()
+    test_plotly_script_break_out_escaped()
     test_cli_writes_html()
     print("All metrics-dashboard tests passed.")

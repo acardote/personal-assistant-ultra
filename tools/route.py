@@ -49,7 +49,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _config import load_config  # noqa: E402
 from _live import should_go_live  # noqa: E402
-from _metrics import emit, time_event, inherit_or_start  # noqa: E402
+from _metrics import emit, time_event, inherit_or_start, start_session  # noqa: E402
 
 _CFG = load_config()
 METHOD_ROOT = _CFG.method_root
@@ -446,6 +446,11 @@ def main(argv: list[str]) -> int:
         results = []
         for i, case in enumerate(cases, start=1):
             print(f"\n=== case {i}/{len(cases)}: {case.get('id', '<unnamed>')} ===", file=sys.stderr)
+            # Fresh session per case: route() calls inherit_or_start(), which
+            # would inherit the prior case's PA_SESSION_ID from os.environ and
+            # collapse all batch events under one session_id — breaking per-
+            # query aggregation in eval runs.
+            start_session()
             r = route(case["query"], no_critic=args.no_critic, no_specialist=args.no_specialist)
             results.append({**case, **asdict(r)})
         report = {"cases": results}

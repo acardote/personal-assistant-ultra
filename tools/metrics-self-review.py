@@ -65,6 +65,12 @@ load_config = _config_module.load_config
 METHOD_ROOT = Path(__file__).resolve().parent.parent
 AGGREGATE_TOOL = METHOD_ROOT / "tools" / "metrics-aggregate.py"
 
+# Producer/consumer schema contract. Aggregator bumps schema_version on field
+# RENAMES or REMOVALS (additive changes don't bump). A mismatch means rules
+# below may silently degrade to "key missing → no finding" — surface it loudly
+# rather than producing a clean-looking but stale report.
+EXPECTED_SCHEMA_VERSION = 1
+
 # Thresholds. Hoisted to module level so calibration is one edit; tests
 # reference these constants instead of hardcoded literals. Expect to re-tune
 # after 2-4 weeks of real production data.
@@ -77,6 +83,7 @@ THRESHOLDS = {
     "harvest_success_rate": 0.95,        # high: harvest failing more than rarely
     "token_budget_violations": 10,       # medium: >10/window suggests bloat
     "mtime_to_created_at_ratio": 2.0,    # medium: vault rehydration likely
+    "min_created_at_for_mtime_rule": 3,  # need ≥3 created_at-dated objects for the ratio to be meaningful — under that, fresh-clone vaults trip the rule every run forever
     "live_calls_per_query": 0.50,        # medium: half+ of queries need live (#39 not fully closed)
     "live_call_error_rate": 0.10,        # high (provisional pre-data): >10% of live calls erroring → MCP auth/latency
     "live_call_empty_rate": 0.40,        # medium (provisional pre-data): >40% empty → over-firing or wrong scope
@@ -257,7 +264,11 @@ def evaluate_rules(snapshot: dict) -> list[dict]:
     ad = safe_get(snapshot, "memory_quality", "memory_age_source_distribution") or {}
     ca = ad.get("created_at", 0) or 0
     mt = ad.get("mtime", 0) or 0
-    if mt > THRESHOLDS["mtime_to_created_at_ratio"] * max(ca, 1):
+    # Skip when ca is below the floor: the ratio is undefined / dominated by
+    # the +1 in max(ca, 1) and fires every run on fresh-clone vaults until
+    # backfill, which is exactly the F4 staleness pattern the parent (#41)
+    # explicitly tries to avoid.
+    if ca >= THRESHOLDS["min_created_at_for_mtime_rule"] and mt > THRESHOLDS["mtime_to_created_at_ratio"] * ca:
         recs.append({
             "severity": "medium",
             "category": "memory_quality",
@@ -361,6 +372,15 @@ def main(argv: list[str]) -> int:
     if snap is None:
         print("[metrics-self-review] no snapshot found. Run tools/metrics-aggregate.py first or use --aggregate-first.", file=sys.stderr)
         return 1
+
+    snap_version = snap.get("schema_version")
+    if snap_version != EXPECTED_SCHEMA_VERSION:
+        print(
+            f"[metrics-self-review] WARNING: snapshot schema_version={snap_version!r} "
+            f"but this tool expects {EXPECTED_SCHEMA_VERSION}. Rules may silently misfire "
+            f"on renamed/removed keys. Update this tool or re-run metrics-aggregate.py.",
+            file=sys.stderr,
+        )
 
     recs = evaluate_rules(snap)
     review = render_review(snap, recs)
