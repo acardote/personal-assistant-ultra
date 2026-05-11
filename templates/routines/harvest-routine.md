@@ -258,11 +258,18 @@ Procedure:
        cd "$VAULT"
        git status -z --porcelain --untracked-files=all
 
-   Parse the output as NUL-terminated records. Each record starts with two status chars + one space (3 bytes total), then the path verbatim — no octal-escape quoting, no surrounding double-quotes (that's what `-z` buys you). Strip the leading 3 bytes from each record to get the raw path; the trailing NUL is the record separator. Verified shape on a test repo: `?? memory/slack_thread/André's-team.md\0` — non-ASCII bytes are passed through unchanged.
+   Parse the output as NUL-separated fields with a *status-dependent record arity* (this matters — naive split-on-NUL with a fixed-arity assumption breaks on rename/copy entries):
+
+   - **Most statuses** (`A`, `M`, `D`, `??`, etc.) consume ONE NUL-separated field per record. The field's leading 3 bytes are the two status chars + the separator space; bytes 4 onward are the raw path, verbatim — no octal-escape quoting, no surrounding double-quotes (that's what `-z` buys you).
+   - **Rename `R` and copy `C`** consume TWO NUL-separated fields per logical record. The first field carries the status prefix + the NEW path; the second field is the OLD path with no status prefix. Treat the second field as part of the SAME record, not as a new record starting at byte 0.
+
+   The first-field status prefix is exactly 3 bytes for *any* status (`A `, `??`, `RM`, `R `, etc.) — the two status chars may include a space (e.g. `R ` or `M `), followed by one literal space separator. Strip those 3 bytes to get the path.
+
+   Verified shape on a test repo: `?? memory/slack_thread/André's-team.md\0` — non-ASCII bytes are passed through unchanged.
 
    `git status` respects `.gitignore`, so `raw/` (per [ADR-0001](../../docs/adr/0001-storage-backend.md) + the vault's `.gitignore`) is excluded by construction — no special handling needed. The relevant statuses for harvest output are `A` (new file), `M` (modified), `??` (untracked); harvest does not produce deletions in normal operation, so `D` is unexpected — if you see one, log a warning to stderr and skip that path rather than try to delete via `push_files` (the tool's delete semantics differ across MCP server versions; out of scope here).
 
-   **Renames** (`R `): in porcelain `-z`, a rename emits two NUL-separated paths in one record (`R  newpath\0oldpath`). Harvest doesn't produce renames in normal operation, but if you see one, push the new path's content and treat the old path as a deletion (log to stderr, skip).
+   **Renames / copies**: harvest doesn't produce these in normal operation. If you see one (per the two-field rule above), push the NEW path's content via `push_files` and treat the OLD path as a deletion (log to stderr, skip — the runs file will note the inconsistency).
 
    **Binary files**: today, all harvest outputs are Markdown or JSON (text). If the Read tool refuses a file as binary, OR the first 4 KB of file bytes contains a NUL byte, skip that path with a stderr warning and add `{"kind": "binary_skipped", "path": "..."}` to the run-status `errors` list. `push_files`'s `content` field expects a UTF-8 string; passing a binary-refusal string would silently corrupt the file in the vault.
 
