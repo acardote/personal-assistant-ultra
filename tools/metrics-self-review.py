@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -91,6 +92,114 @@ THRESHOLDS = {
     "min_mcp_errors_to_flag": 1,         # low: any MCP error worth surfacing
     "min_memory_for_orphan_check": 5,    # low: source needs ≥5 memory objects to flag
 }
+
+# Cross-run staleness state (#156, F4 closer of #41).
+# `_seen.json` lives in the reviews dir and tracks how many consecutive
+# runs each canonical finding has fired. The key includes the full
+# finding text so genuinely-different values (e.g., empty_handed_rate at
+# 35% vs 60%) do NOT collapse to one staleness counter (per #156 F2).
+SEEN_STATE_FILENAME = "_seen.json"
+STALE_RUN_THRESHOLD = 5          # annotate `[stale: N runs]` once run_count crosses this
+SEEN_RETENTION_DAYS = 90         # keys not touched in this many days are pruned (per #156 F3)
+
+
+def _canonical_finding_key(rec: dict) -> str:
+    """Stable hash of severity:category:finding-text. Two genuinely-different
+    findings (different values rendered in `finding`) produce different keys
+    so the staleness counter doesn't aggregate across real change (#156 F2).
+    Hash, not raw text, keeps the file compact and the JSON shape simple."""
+    payload = f"{rec.get('severity', 'low')}|{rec.get('category', '')}|{rec.get('finding', '')}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_seen_state(path: Path) -> dict:
+    """Load the seen-state JSON. Returns empty dict on any read/parse error
+    (instrumentation MUST NEVER crash the host tool)."""
+    if not path.exists():
+        return {"findings": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"findings": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("findings"), dict):
+        return {"findings": {}}
+    return data
+
+
+def _save_seen_state(path: Path, state: dict) -> None:
+    """Atomic write via tmpfile + rename. Silent on filesystem failure."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _parse_iso(s: str) -> _dt.datetime | None:
+    try:
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def annotate_with_staleness(
+    recs: list[dict],
+    seen_state: dict,
+    now: _dt.datetime,
+    *,
+    stale_threshold: int = STALE_RUN_THRESHOLD,
+    retention_days: int = SEEN_RETENTION_DAYS,
+) -> dict:
+    """Update `seen_state` with the current findings, prune old entries, and
+    mutate each rec in `recs` to carry `run_count` + (when threshold crossed)
+    a `stale_runs` field. Returns the updated `seen_state` for persistence.
+
+    Algorithm:
+    - For each finding in `recs`: compute canonical key. If key in state,
+      increment `run_count`; else seed with 1.
+    - Update `last_seen` to `now` for every key seen this run.
+    - Prune keys whose `last_seen` is older than `retention_days` (per #156 F3).
+    - Set `rec['run_count']` and (when run_count >= threshold) `rec['stale_runs']`.
+    """
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    findings = seen_state.setdefault("findings", {})
+
+    keys_seen_this_run: set[str] = set()
+    for r in recs:
+        key = _canonical_finding_key(r)
+        keys_seen_this_run.add(key)
+        entry = findings.get(key)
+        if entry is None:
+            findings[key] = {
+                "first_seen": now_iso,
+                "last_seen": now_iso,
+                "run_count": 1,
+                "severity": r.get("severity"),
+                "category": r.get("category"),
+            }
+            r["run_count"] = 1
+        else:
+            entry["run_count"] = int(entry.get("run_count", 0)) + 1
+            entry["last_seen"] = now_iso
+            r["run_count"] = entry["run_count"]
+            if r["run_count"] >= stale_threshold:
+                r["stale_runs"] = r["run_count"]
+
+    # Prune retention-expired entries that did NOT appear in this run.
+    retention_cutoff = now - _dt.timedelta(days=retention_days)
+    keys_to_drop: list[str] = []
+    for key, entry in findings.items():
+        if key in keys_seen_this_run:
+            continue
+        last_seen_dt = _parse_iso(entry.get("last_seen", ""))
+        if last_seen_dt is None or last_seen_dt < retention_cutoff:
+            keys_to_drop.append(key)
+    for key in keys_to_drop:
+        findings.pop(key, None)
+
+    return seen_state
 
 
 def latest_snapshot(snapshots_dir: Path) -> dict | None:
@@ -329,7 +438,8 @@ def render_review(snapshot: dict, recs: list[dict]) -> str:
         sections.append(f"## {emoji} {sev.title()} severity")
         sections.append("")
         for r in items:
-            sections.append(f"### [{r['category']}] {r['finding']}")
+            stale_note = f" [stale: {r['stale_runs']} runs]" if r.get("stale_runs") else ""
+            sections.append(f"### [{r['category']}] {r['finding']}{stale_note}")
             sections.append("")
             sections.append(f"**Suggested action**: {r['suggested_action']}")
             sections.append("")
@@ -383,6 +493,16 @@ def main(argv: list[str]) -> int:
         )
 
     recs = evaluate_rules(snap)
+
+    # Stateful staleness: track each finding's run_count across reviews so
+    # the user sees `[stale: N runs]` when the analyzer keeps repeating
+    # itself without escalating context — the F4 falsifier closer of #41.
+    reviews_dir = metrics_dir / "reviews"
+    seen_path = reviews_dir / SEEN_STATE_FILENAME
+    seen_state = _load_seen_state(seen_path)
+    seen_state = annotate_with_staleness(recs, seen_state, _dt.datetime.now(_dt.timezone.utc))
+    _save_seen_state(seen_path, seen_state)
+
     review = render_review(snap, recs)
 
     if args.out:

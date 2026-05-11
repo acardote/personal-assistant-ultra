@@ -412,9 +412,6 @@ def test_schema_version_mismatch_warns(capsys):
         snap_future["schema_version"] = 2
         (snap_dir / "snap-future.json").write_text(json.dumps(snap_future))
 
-        # Patch the module's load_config to return a config pointing at td_p.
-        # main() reads cfg.harvest_state_root.parent / ".metrics" — so harvest_state_root
-        # must be td_p / "<anything>" so that .parent gives td_p.
         class FakeCfg:
             harvest_state_root = td_p / ".harvest"
         original_load_config = rev.load_config
@@ -434,6 +431,151 @@ def test_schema_version_mismatch_warns(capsys):
         assert "WARNING" in captured.err
 
     print("  T24 PASS — snapshot with mismatched schema_version produces a stderr warning.")
+
+
+def test_stale_finding_annotated_after_threshold():
+    """T25 (#156 F1 closer): a finding firing for >= STALE_RUN_THRESHOLD
+    consecutive runs is annotated `[stale: N runs]` in the rendered review.
+
+    Tests the annotation pathway directly via annotate_with_staleness so the
+    test doesn't depend on real on-disk runs. Simulates the 7-runs-in-a-row
+    failure mode the issue describes."""
+    import datetime as _dt
+    rev = setup_review()
+    threshold = rev.STALE_RUN_THRESHOLD
+    state: dict = {"findings": {}}
+    snap = make_snapshot(coverage={"empty_handed_rate": 0.45})
+    now = _dt.datetime(2026, 5, 1, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    last_rec: dict = {}
+    for i in range(threshold + 1):
+        recs = rev.evaluate_rules(snap)
+        target = next(r for r in recs if "empty_handed_rate" in r["finding"])
+        rev.annotate_with_staleness(
+            [target], state, now + _dt.timedelta(days=i),
+        )
+        last_rec = target
+    assert last_rec.get("run_count") == threshold + 1, (
+        f"expected run_count={threshold+1}, got {last_rec.get('run_count')}"
+    )
+    assert last_rec.get("stale_runs") == threshold + 1, (
+        "rec should carry stale_runs once threshold crossed"
+    )
+    review = rev.render_review(snap, [last_rec])
+    assert f"[stale: {threshold + 1} runs]" in review, (
+        f"render should include stale annotation; got: {review!r}"
+    )
+    print(f"  T25 PASS — finding annotated `[stale: {threshold + 1} runs]` after {threshold + 1} consecutive runs (#156 F1).")
+
+
+def test_different_values_do_not_collapse():
+    """T26 (#156 F2 closer): two findings with the same rule but different
+    rendered values produce different canonical keys; neither accumulates
+    staleness against the other.
+
+    The PR-46 challenger's specific concern: dedup keying so loose that
+    'empty_handed_rate is 35%' and 'empty_handed_rate is 60%' collapse to
+    one counter hides real change."""
+    import datetime as _dt
+    rev = setup_review()
+    state: dict = {"findings": {}}
+    now = _dt.datetime(2026, 5, 1, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+    # Run 1: empty_handed_rate at 35%
+    snap_35 = make_snapshot(coverage={"empty_handed_rate": 0.35})
+    recs_35 = rev.evaluate_rules(snap_35)
+    target_35 = next(r for r in recs_35 if "empty_handed_rate" in r["finding"])
+    rev.annotate_with_staleness([target_35], state, now)
+    key_35 = rev._canonical_finding_key(target_35)
+
+    # Run 2: empty_handed_rate at 60% — different value, different finding string.
+    snap_60 = make_snapshot(coverage={"empty_handed_rate": 0.60})
+    recs_60 = rev.evaluate_rules(snap_60)
+    target_60 = next(r for r in recs_60 if "empty_handed_rate" in r["finding"])
+    rev.annotate_with_staleness([target_60], state, now + _dt.timedelta(days=1))
+    key_60 = rev._canonical_finding_key(target_60)
+
+    assert key_35 != key_60, (
+        "different finding values must produce different keys — F2 retract"
+    )
+    assert state["findings"][key_35]["run_count"] == 1
+    assert state["findings"][key_60]["run_count"] == 1
+    assert target_60.get("run_count") == 1, (
+        f"second value should be a NEW finding with run_count=1, got "
+        f"{target_60.get('run_count')} — staleness collapsed across different values"
+    )
+    print("  T26 PASS — different rendered values produce different canonical keys (#156 F2).")
+
+
+def test_seen_state_prunes_old_keys():
+    """T27 (#156 F3 closer): keys whose last_seen is older than
+    SEEN_RETENTION_DAYS are pruned. Prevents the side-record file from
+    growing unboundedly on long-lived vaults."""
+    import datetime as _dt
+    rev = setup_review()
+    retention = rev.SEEN_RETENTION_DAYS
+    now = _dt.datetime(2026, 5, 1, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    stale_iso = (now - _dt.timedelta(days=retention + 10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fresh_iso = (now - _dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state = {
+        "findings": {
+            "stale_key": {
+                "first_seen": stale_iso, "last_seen": stale_iso, "run_count": 3,
+                "severity": "low", "category": "coverage",
+            },
+            "fresh_key": {
+                "first_seen": fresh_iso, "last_seen": fresh_iso, "run_count": 2,
+                "severity": "low", "category": "system_health",
+            },
+        }
+    }
+    state = rev.annotate_with_staleness([], state, now)
+    assert "stale_key" not in state["findings"], (
+        "stale_key should have been pruned past retention"
+    )
+    assert "fresh_key" in state["findings"], (
+        "fresh_key should be preserved — within retention window"
+    )
+    print(f"  T27 PASS — keys older than {retention} days pruned, fresh keys retained (#156 F3).")
+
+
+def test_seen_state_persisted_across_runs():
+    """T28 (#156): _seen.json file is created and updated atomically; a
+    second invocation reads it and resumes the counter. End-to-end on-disk
+    verification via main()."""
+    rev = setup_review()
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        snap_dir = td_p / ".metrics" / "snapshots"
+        snap_dir.mkdir(parents=True)
+        snap = make_snapshot(coverage={"empty_handed_rate": 0.45})
+        (snap_dir / "snap.json").write_text(json.dumps(snap))
+
+        class FakeCfg:
+            harvest_state_root = td_p / ".harvest"
+        original_load_config = rev.load_config
+        rev.load_config = lambda **kw: FakeCfg()
+        try:
+            out1 = td_p / "review-1.md"
+            out2 = td_p / "review-2.md"
+            rc1 = rev.main(["metrics-self-review.py", "--out", str(out1)])
+            rc2 = rev.main(["metrics-self-review.py", "--out", str(out2)])
+        finally:
+            rev.load_config = original_load_config
+
+        assert rc1 == 0 and rc2 == 0
+        seen_path = td_p / ".metrics" / "reviews" / rev.SEEN_STATE_FILENAME
+        assert seen_path.exists(), "seen_state file not written"
+        state = json.loads(seen_path.read_text())
+        run_counts = [
+            entry.get("run_count")
+            for entry in state.get("findings", {}).values()
+            if entry.get("category") == "coverage"
+        ]
+        assert any(rc == 2 for rc in run_counts), (
+            f"expected at least one coverage finding with run_count=2 after two runs, "
+            f"got run_counts={run_counts}"
+        )
+    print("  T28 PASS — _seen.json persisted across runs; counter resumes from disk (#156).")
 
 
 def test_cli_writes_review():
@@ -481,5 +623,9 @@ if __name__ == "__main__":
     test_just_below_threshold_no_finding()
     test_mtime_rule_skipped_when_few_created_at()
     test_schema_version_mismatch_warns()
+    test_stale_finding_annotated_after_threshold()
+    test_different_values_do_not_collapse()
+    test_seen_state_prunes_old_keys()
+    test_seen_state_persisted_across_runs()
     test_cli_writes_review()
     print("All metrics-self-review tests passed.")
