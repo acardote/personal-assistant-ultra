@@ -42,17 +42,25 @@ When this skill is invoked, your **first two actions** are:
    ```
 
    Do this exactly once at turn start. The `echo` to stderr surfaces the
-   session id so a missing/broken `openssl` produces a visible failure
-   (empty session id → first tool mints its own; the inheritance contract
-   relies on the env being set).
+   session id so a missing/broken `openssl` produces a visible failure.
 
-   Subsequent tool invocations within the same turn (route.py, assemble-kb.py,
-   compress.py, check-harvest-freshness.py) will inherit the session via
-   `PA_SESSION_ID` and emit events that aggregate correctly. If you skip
-   this step entirely, the first tool to run will mint its own session and
-   the rest will inherit that — within-turn aggregation still works, but
-   the session start point is the first tool call rather than skill entry.
-   Cross-turn isolation is unaffected.
+   How within-turn inheritance actually works (per [#155](https://github.com/acardote/personal-assistant-ultra/issues/155)):
+   each Claude Code Bash tool invocation is its own `bash -c` child, so the
+   `export PA_SESSION_ID=...` above does NOT survive into the next Bash
+   call — env doesn't carry across tool invocations. Inheritance instead
+   relies on `tools/_metrics.py` persisting the session id to
+   `<metrics_dir>/.current_session.json` when `log-event.py skill_start
+   --inherit-session` runs. Subsequent tools (route.py, assemble-kb.py,
+   compress.py, check-harvest-freshness.py) fall back to that file when
+   env is empty (which it always is across Bash-tool boundaries). The
+   `export` line above is kept because it still helps within a single
+   bash session (harvest-routine path) and surfaces failures via `echo`.
+
+   If you skip this bootstrap entirely, the first tool to run will mint
+   its own session and persist it to the same file — within-turn
+   aggregation still works, but the start point is the first tool call
+   rather than skill entry. Cross-turn isolation is bounded by the file's
+   TTL (`SESSION_STATE_TTL_SECONDS` in `_metrics.py`, currently 30 min).
 
 2. **Load layer-3** by running:
 

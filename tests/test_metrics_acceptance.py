@@ -468,6 +468,121 @@ def test_log_event_json_data_typing():
     print("  T20 PASS — --data keeps strings; --json-data parses typed values.")
 
 
+def test_inherit_from_state_file_when_env_empty():
+    """T25 (#155): inherit_or_start() falls back to the on-disk session-state
+    file when PA_SESSION_ID env is unset.
+
+    This is the load-bearing case for cross-Bash-tool-call inheritance: each
+    Claude Code Bash invocation is a fresh `bash -c`, so the env-var export
+    from skill bootstrap doesn't survive into call N+1. The fix persists the
+    session id to `<metrics_dir>/.current_session.json` so subsequent tools
+    in the same turn can recover it."""
+    import datetime as _dt
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        # Simulate "skill bootstrap" — process A mints + writes state file.
+        m1 = fresh_metrics_module(td_p)
+        bootstrap_sid = m1.start_session()
+        state_file = td_p / m1.SESSION_STATE_FILENAME
+        assert state_file.exists(), "start_session must write state file (#155 fix)"
+        persisted = json.loads(state_file.read_text())
+        assert persisted["session_id"] == bootstrap_sid
+
+        # Simulate "second Bash tool invocation in same turn" — fresh process,
+        # no env (Claude Code's bash -c didn't inherit), state file present.
+        os.environ.pop("PA_SESSION_ID", None)
+        sys.modules.pop("metrics_test", None)
+        m2 = load_module("metrics_test", PROJ / "tools" / "_metrics.py")
+        recovered = m2.inherit_or_start()
+        assert recovered == bootstrap_sid, (
+            f"second process should inherit bootstrap session from file, "
+            f"got {recovered!r} != {bootstrap_sid!r}"
+        )
+        # And env should now be set (so any same-process chain continues to work).
+        assert os.environ.get("PA_SESSION_ID") == bootstrap_sid
+    print("  T25 PASS — inherit_or_start() recovers session from state file when env empty (#155).")
+
+
+def test_state_file_ttl_expires():
+    """T26 (#155): a state file older than SESSION_STATE_TTL_SECONDS is
+    treated as stale and inherit_or_start() mints fresh.
+
+    Prevents two distinct user turns (>30 min apart) from silently sharing
+    a session when no explicit bootstrap re-mints."""
+    import datetime as _dt
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        m = fresh_metrics_module(td_p)
+        # Stage a state file with last_access well past TTL.
+        stale_sid = "deadbeef"
+        stale_ts = (_dt.datetime.now(_dt.timezone.utc)
+                    - _dt.timedelta(seconds=m.SESSION_STATE_TTL_SECONDS + 60))
+        state_file = td_p / m.SESSION_STATE_FILENAME
+        state_file.write_text(json.dumps({
+            "session_id": stale_sid,
+            "last_access": stale_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }))
+        # No env set; inherit_or_start should mint fresh, NOT use stale file.
+        os.environ.pop("PA_SESSION_ID", None)
+        sys.modules.pop("metrics_test", None)
+        m2 = load_module("metrics_test", PROJ / "tools" / "_metrics.py")
+        sid = m2.inherit_or_start()
+        assert sid != stale_sid, (
+            f"stale state file (>TTL) must not be inherited, got {sid!r}"
+        )
+    print("  T26 PASS — state file older than TTL is ignored, fresh session minted.")
+
+
+def test_state_file_touched_on_inherit():
+    """T27 (#155): every successful inheritance refreshes last_access so a
+    long-running but active session doesn't expire mid-turn."""
+    import datetime as _dt
+    import time as _time
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        m = fresh_metrics_module(td_p)
+        original_sid = m.start_session()
+        state_file = td_p / m.SESSION_STATE_FILENAME
+        original_ts = json.loads(state_file.read_text())["last_access"]
+        # Sleep just enough that the second-resolution timestamp can advance.
+        _time.sleep(1.1)
+        # Second invocation — fresh module, empty env, fresh file → inherit.
+        os.environ.pop("PA_SESSION_ID", None)
+        sys.modules.pop("metrics_test", None)
+        m2 = load_module("metrics_test", PROJ / "tools" / "_metrics.py")
+        recovered = m2.inherit_or_start()
+        assert recovered == original_sid
+        new_ts = json.loads(state_file.read_text())["last_access"]
+        assert new_ts > original_ts, (
+            f"inherit_or_start should refresh last_access; "
+            f"old={original_ts}, new={new_ts}"
+        )
+    print("  T27 PASS — inherit_or_start refreshes last_access (no premature expiry).")
+
+
+def test_env_takes_priority_over_state_file():
+    """T28 (#155): env-set session_id wins over a different file-stored id.
+
+    Preserves the existing inherit_or_start() semantic — when the caller
+    explicitly set PA_SESSION_ID (e.g., harvest routine within one bash
+    session), that's authoritative."""
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        m = fresh_metrics_module(td_p)
+        # File says one session.
+        m.start_session(session_id="aaaaaaaa")
+        # Env says a different one.
+        os.environ["PA_SESSION_ID"] = "bbbbbbbb"
+        sys.modules.pop("metrics_test", None)
+        m2 = load_module("metrics_test", PROJ / "tools" / "_metrics.py")
+        sid = m2.inherit_or_start()
+        assert sid == "bbbbbbbb", f"env must win over file, got {sid!r}"
+        # And file should now be updated to env's value.
+        state_file = td_p / m.SESSION_STATE_FILENAME
+        assert json.loads(state_file.read_text())["session_id"] == "bbbbbbbb"
+    print("  T28 PASS — env-set session_id wins over state file (semantics preserved).")
+
+
 if __name__ == "__main__":
     print("Running test_metrics_acceptance.py...")
     test_emit_writes_jsonl()
@@ -494,4 +609,8 @@ if __name__ == "__main__":
     test_data_json_data_precedence()
     test_default_str_bounded()
     test_log_event_json_data_typing()
+    test_inherit_from_state_file_when_env_empty()
+    test_state_file_ttl_expires()
+    test_state_file_touched_on_inherit()
+    test_env_takes_priority_over_state_file()
     print("All metrics tests passed.")
