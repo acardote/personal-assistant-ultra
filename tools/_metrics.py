@@ -42,16 +42,29 @@ The library enforces:
 
 ## Sessions
 
-- `start_session()` always mints a fresh 8-hex-char id and overwrites
-  `PA_SESSION_ID` env var. Top-level entry points (skill startup, harvest
-  routine kickoff) should call this.
+- `start_session()` always mints a fresh 8-hex-char id, overwrites
+  `PA_SESSION_ID` env var, AND persists the id to `<metrics_dir>/.current_session.json`.
+  Top-level entry points (skill startup, harvest routine kickoff) should
+  call this.
 - `inherit_or_start()` honors an inherited `PA_SESSION_ID` if set; otherwise
-  starts fresh. Child tool subprocesses use this to participate in the
-  parent's session.
+  falls back to the on-disk session-state file (if fresh, per
+  `SESSION_STATE_TTL_SECONDS`); otherwise starts fresh. Child tool
+  subprocesses use this to participate in the parent's session.
 - `get_session_id()` is lazy: if no session has been started, it calls
   `start_session()` (i.e., fresh, NOT env-inherited). This avoids the
   env-bleed bug where two top-level invocations from the same shell
   silently share session ids.
+
+### Cross-Bash-tool-call inheritance (#155)
+
+Claude Code spawns each tool invocation in its own `bash -c` child of the
+harness, so `export PA_SESSION_ID=...` in tool call N does NOT carry to
+tool call N+1 within the same user turn. To aggregate `query_start →
+kb_load_end → memory_retrieve_end → query_end` under one `session_id`,
+`start_session()` and `inherit_or_start()` persist the id to an on-disk
+state file alongside the env var. Subsequent tools in the same turn read
+the file as a fallback when env is empty. A TTL keeps two distinct user
+turns from sharing a session when no explicit bootstrap re-mints.
 
 ## Locating the metrics dir
 1. `$PA_METRICS_DIR` env var (explicit override)
@@ -82,6 +95,16 @@ from typing import Any
 MAX_KEYWORDS = 5
 MAX_KEYWORD_LEN = 32
 MAX_LINE_BYTES = 4000  # PIPE_BUF on most POSIX = 4096; stay under for atomic appends.
+
+# Cross-Bash-tool-call session inheritance (#155). Claude Code spawns each
+# tool in its own `bash -c`, so the env-var export from the skill's bootstrap
+# doesn't reach subsequent tool calls. We persist the session id to a state
+# file in the metrics dir; subsequent tools fall back to it when env is empty.
+# The TTL bounds session bleed across distinct user turns when no explicit
+# bootstrap re-mints — 30 min comfortably covers a single user turn while
+# still separating most cross-turn activity.
+SESSION_STATE_FILENAME = ".current_session.json"
+SESSION_STATE_TTL_SECONDS = 30 * 60
 
 # Field names that almost certainly carry PII; dropped from **data unconditionally.
 # Best-effort, not exhaustive — the privacy contract docstring puts the bar on
@@ -221,12 +244,65 @@ def _set_env_session(sid: str) -> None:
         pass
 
 
+def _session_state_path() -> Path | None:
+    """Locate the on-disk session-state file. None if metrics dir is unresolvable."""
+    md = _get_metrics_dir()
+    if md is None:
+        return None
+    return md / SESSION_STATE_FILENAME
+
+
+def _read_session_state() -> dict | None:
+    """Load the session-state JSON. Returns None on any read/parse error."""
+    p = _session_state_path()
+    if p is None or not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _write_session_state(sid: str) -> None:
+    """Persist the current session_id + last-access timestamp. Atomic via rename;
+    silent on filesystem failure (instrumentation MUST NEVER crash the host)."""
+    p = _session_state_path()
+    if p is None:
+        return
+    payload = {"session_id": sid, "last_access": _utcnow_iso()}
+    try:
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _session_state_is_fresh(state: dict) -> bool:
+    """True if state's last_access is within SESSION_STATE_TTL_SECONDS."""
+    last_access = state.get("last_access")
+    if not isinstance(last_access, str):
+        return False
+    try:
+        last_dt = _dt.datetime.fromisoformat(last_access.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    age_seconds = (_dt.datetime.now(_dt.timezone.utc) - last_dt).total_seconds()
+    return 0 <= age_seconds <= SESSION_STATE_TTL_SECONDS
+
+
 def start_session(*, session_id: str | None = None) -> str:
-    """Begin a new session, always fresh. Overwrites PA_SESSION_ID env var.
+    """Begin a new session, always fresh. Overwrites PA_SESSION_ID env var
+    AND the on-disk session-state file.
 
     Top-level entry points (skill startup, harvest routine kickoff) should
     call this to avoid the env-bleed bug where two top-level invocations
-    from the same shell silently share session ids.
+    from the same shell silently share session ids. The on-disk write makes
+    the fresh session id available to subsequent Bash tool invocations
+    within the same user turn (#155 closer).
 
     If `session_id` is provided, validates it; falls back to fresh on invalid.
     """
@@ -236,20 +312,41 @@ def start_session(*, session_id: str | None = None) -> str:
     else:
         _SESSION_ID = secrets.token_hex(4)
     _set_env_session(_SESSION_ID)
+    _write_session_state(_SESSION_ID)
     return _SESSION_ID
 
 
 def inherit_or_start() -> str:
-    """For child processes: inherit PA_SESSION_ID if valid, else start fresh.
+    """For child processes: inherit PA_SESSION_ID if valid, else fall back to
+    the on-disk session-state file (if fresh per SESSION_STATE_TTL_SECONDS),
+    else start fresh.
 
-    This is the right call for tools spawned as subprocesses of the skill
-    or harvest routine. It honors the parent's session id when set.
+    The on-disk fallback closes the cross-Bash-tool-call inheritance gap
+    (#155): Claude Code spawns each tool in its own `bash -c`, so the
+    env-var export from the skill's bootstrap doesn't reach subsequent tool
+    calls. The state file persists across calls; the TTL keeps two distinct
+    turns from sharing a session when no explicit bootstrap re-mints.
+
+    Every successful inheritance touches the state file's `last_access`
+    timestamp so a long-running but active session doesn't expire mid-turn.
     """
     global _SESSION_ID
+    # 1. Env inheritance — fast path, preserves existing semantics.
     env_sid = os.environ.get("PA_SESSION_ID", "")
     if _is_valid_session_id(env_sid):
         _SESSION_ID = env_sid
+        _write_session_state(_SESSION_ID)  # keep file in sync + extend TTL
         return _SESSION_ID
+    # 2. File inheritance — closes the Bash-tool-call gap.
+    state = _read_session_state()
+    if state is not None and _session_state_is_fresh(state):
+        file_sid = state.get("session_id", "")
+        if _is_valid_session_id(file_sid):
+            _SESSION_ID = file_sid
+            _set_env_session(_SESSION_ID)
+            _write_session_state(_SESSION_ID)  # extend TTL
+            return _SESSION_ID
+    # 3. Mint fresh.
     return start_session()
 
 
