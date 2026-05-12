@@ -136,9 +136,15 @@ The most likely cause of a missing critical connector is "the connector is enabl
 
 Also detect dual-active scheduler conflict. List `$VAULT/.harvest/runs/*.json` files modified within a window of `max(60min, 2 × your-routine-cadence-minutes)` — the larger window catches a launchd run from this morning when this routine fires this evening. If any matching file has `"scheduler": "launchd"`, append a `"warnings": ["launchd active alongside routine — pick one to avoid race conditions on writes to main and dedup state"]` entry to your run-status JSON. (Do not abort — the user may intentionally have both running for the Meet/transcript-drop workaround. Just surface the conflict.) The window may produce false negatives if the user's launchd cadence is sparser than 2x the routine cadence — accept this as best-effort detection.
 
-Determine harvest cutoff:
-- If `$VAULT/.harvest/runs/` contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
-- Otherwise: this IS a cold start: use "since 30 days ago".
+Determine harvest cutoff. **This rule is load-bearing for gap recovery** — if the last successful push was N days ago (e.g. transport was broken or routine fires failed), the next successful fire must recover all N days, not just yesterday. Per [#152](https://github.com/acardote/personal-assistant-ultra/issues/152):
+
+- **Walk `$VAULT/.harvest/runs/*.json` newest-first** (timestamp filenames sort lexicographically = chronologically) and pick the first one with `ok: true` at the top level.
+- **If a matching `ok: true` run is found**: anchor the cutoff at THAT file's `started_at` field (ISO timestamp). The harvest window is `[started_at, now]`. This automatically recovers any gap caused by failed-push days because the last *successful* run is the last point we know the vault has data through — anything after that is in scope, regardless of how many failed fires happened in between.
+- **If NO `ok: true` run exists in `$VAULT/.harvest/runs/`** (either empty directory or all runs are `ok: false`): this IS a cold start. Use "since 30 days ago".
+
+Record the resolved cutoff in the run-status JSON's top-level `cutoff` field as the ISO timestamp (or "30d cold-start" sentinel) so post-fire reconciliation can verify which window was used. Do NOT use a calendar-yesterday string ("since yesterday", "last 24 hours") — that's the prior buggy rule that orphaned the 2026-05-08 → 2026-05-10T15:25Z window during the proxy-403 outage on [#153](https://github.com/acardote/personal-assistant-ultra/issues/153).
+
+**Runtime safety note**: if the anchor `started_at` is more than 14 days old (e.g. routine was disabled for a long time, OR the vault's runs/ directory has stale files from a different setup), cap the harvest at 14 days back. This is a guard against runaway runtime — anything older than 14 days should be backfilled via a deliberate on-demand `--since <date>` fire, not the daily routine. Log a `"warnings": ["cutoff_capped_at_14d_from <YYYY-MM-DD>"]` entry on the run-status JSON.
 
 Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source. **Do not stop at the first few items per source — enumerate and fetch comprehensively** (per #34 — the original cold-start fetched only 9 items because the prompt was vague about completeness).
 
