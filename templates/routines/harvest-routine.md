@@ -58,7 +58,11 @@ If you have additional connectors, the API attaches them automatically based on 
 
 ### Model
 
-`claude-sonnet-4-6` (default). Override only if you have a specific reason.
+`claude-opus-4-7` (default). The harvest's multi-step orchestration (preflight, per-source enumeration, compress, live-writeback, kb-scan, kb-drift-scan, batched MCP push) benefits from Opus's stronger prompt-following discipline — see [#165](https://github.com/acardote/personal-assistant-ultra/issues/165) for the assumption ledger and validation.
+
+**Cost note**: Opus is roughly 5× Sonnet per token (both input and output) at current pricing. A daily steady-state harvest is small (single digits of LLM calls outside kb-drift-scan), but `tools/kb-drift-scan.py` caps at 100 LLM calls per fire by default — that cap dominates per-fire cost. Sonnet 4.6 / Haiku 4.5 are valid overrides if you want the cheaper path and accept the discipline tradeoff. The watchdog routine (`templates/routines/watchdog-routine.md`) appropriately runs on Haiku 4.5 — model choice should match workload, not just default everywhere.
+
+**Runtime override**: to swap models on an already-created routine without re-creating it, partial-update via `RemoteTrigger` with `{"job_config": {"ccr": {"session_context": {"model": "<id>", ...}}}}`. The `session_context` block needs the full set (`allowed_tools`, `model`, `sources`) — partials of that subobject are rejected.
 
 ### Routine prompt
 
