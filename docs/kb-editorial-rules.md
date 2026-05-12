@@ -186,4 +186,141 @@ ADR-0003 is the parent design; this document operationalizes its `knowledge` hal
 
 **Knowledge contributions are global, not project-scoped.** Even when an insight emerges from inside an active PA project (per #88), `person-update` / `org-update` / `decision` / `glossary-term` updates land in the same `<content_root>/kb/` files (or `<method_root>/kb/glossary.md`) — never under `<content_root>/projects/<slug>/`. The kind selector and triggers above are unchanged by the project tier.
 
-If the same insight produces both a project artefact (e.g., a memo summarizing Q3 strategy decisions) and a KB update (e.g., a new entry in `decisions.md`), they're separate diffs: the artefact lands in `<content_root>/projects/<slug>/artefacts/memo/`, the KB update lands in `<content_root>/kb/decisions.md`. The compound-insight rule (primary + secondary diffs) operates on the KB side only — projects don't appear in it.
+If the same insight produces both a project artefact (e.g., a memo summarizing Q3 strategy decisions) and a KB update (e.g., a new entry in `<content_root>/kb/decisions.md`), they're separate diffs: the artefact lands in `<content_root>/projects/<slug>/artefacts/memo/`, the KB update lands in `<content_root>/kb/decisions.md`. The compound-insight rule (primary + secondary diffs) operates on the KB side only — projects don't appear in it.
+
+## Pattern catalog (per [#173](https://github.com/acardote/personal-assistant-ultra/issues/173), slice 1 [#174](https://github.com/acardote/personal-assistant-ultra/issues/174))
+
+Empirical rules harvested from `/personal-assistant kb-process` walk sessions. Each rule captures a generalizable correction the user made during candidate review, distilled into a trigger + action shape that can be applied (manually now; mechanically in #173's deferred slice 3) on future walks.
+
+**Purpose**: shift kb-process candidate review from a per-candidate human gate to mostly-autonomous classification by accumulating user corrections as a structured rubric. Parent issue: [#173](https://github.com/acardote/personal-assistant-ultra/issues/173). This section: [#174](https://github.com/acardote/personal-assistant-ultra/issues/174).
+
+**Rule shape — exactly 5 fields, in this order, parseable mechanically by slice 2's Phase-1 reader**:
+
+- **Name** — encoded in the `### Rule N: <imperative title>` heading; short imperative (3–10 words).
+- `- **Trigger**:` observable condition on a kb-scan-emitted candidate (one bullet, single paragraph).
+- `- **Action**:` one of `approve`, `reject as <category>`, `amend <field>: <value>` (one bullet, single paragraph).
+- `- **Reasoning**:` one line explaining why the rule is load-bearing (one bullet, single paragraph).
+- `- **Example**:` a verifiable reference — commit SHA in `getnexar/acardote-pa-vault` (preferred) OR art-uuid under `<content_root>/artefacts/memo/.rejected/` (one bullet, single paragraph).
+
+The parser regex contract (for slice 2): rules begin with `^### Rule \d+:` and each field begins with `^- \*\*(Trigger|Action|Reasoning|Example)\*\*:`. Multi-paragraph fields are NOT allowed — keep each field to one paragraph so the parser can tokenize on the next `- **` boundary.
+
+**Categories for `reject as <X>`**:
+
+- `not-formalized` — an idea, brainstorm, or unconfirmed option; not a committed decision.
+- `ephemeral` — tactical/operational decision that expires within days (booth setup, demo prep, one-off message).
+- `wrong-layer` — should be person/org/glossary, not decision (or vice versa).
+- `inaccurate` — extract materially misrepresents the source memo; unsalvageable.
+- `dup-of-<art-uuid>` — duplicate of another candidate; use the canonical art-uuid.
+
+---
+
+### Rule 1: Default Vera scope on Granola product-huddle decisions
+
+- **Trigger**: candidate's `sources_cited` includes `mem-60438256-0519-4a6b-b442-2cf96a873132` (the 2026-05-12 product-team huddle Granola note) AND body covers a product/pricing/indexing decision.
+- **Action**: `amend Scope: Vera` (default), unless body explicitly mentions Atlas surfaces (MCP, data sources, ordering flow).
+- **Reasoning**: kb-scan defaults this source to "Atlas" or "Nexar-wide"; user-corrected to Vera in multiple walks against the same memo.
+- **Example**: commit `fd08f9f` in `getnexar/acardote-pa-vault` (composite risk indices, Atlas → Vera amendment).
+
+### Rule 2: Disambiguate pricing direction
+
+- **Trigger**: candidate title or body mentions "<vendor> pricing unchanged", "<vendor> integration pricing", or "pricing to/from <vendor>" without naming WHICH party pays whom.
+- **Action**: `amend title + body to clarify direction (<vendor>→customers vs Nexar→<vendor>)`.
+- **Reasoning**: the same English phrase covers two opposite commercial decisions; the user's intent is always one direction, never both.
+- **Example**: commit `802856b` in `getnexar/acardote-pa-vault` (Axon's customer-facing pricing, amended from generic "Axon integration pricing").
+
+### Rule 3: Reject ephemeral event/booth/demo prep
+
+- **Trigger**: candidate title contains `booth`, `screen showcase`, `scale-up for <X demo>`, `<event> setup`, `showcase plan`, or names a specific upcoming date as the entire frame ("Monday Nuro demo slot").
+- **Action**: `reject as ephemeral`.
+- **Reasoning**: tactical event prep doesn't survive the event; not durable-decision shape.
+- **Example**: commit `c82f768` in `getnexar/acardote-pa-vault` (IBM booth showcase plan, rejected); commit `705a847` (Atlas scale-up before Nuro demo, rejected).
+
+### Rule 4: Reject single-recipient tactical comms unless reframed around a durable stance
+
+- **Trigger**: candidate body is about a single message/note/email to a single person, with no underlying durable policy named.
+- **Action**: `reject as ephemeral` by default. UNLESS the user reframes around a durable stance during review, in which case `amend body to lead with the stance and demote the note to evidence`.
+- **Reasoning**: one-off communications are not decisions; the policy behind them is. The reframe is what's durable.
+- **Example**: commit `4d041cb` in `getnexar/acardote-pa-vault` (Waylens "soft note" — landed only after the user-reframed "do not re-engage Waylens" durable stance replaced the per-note framing).
+
+### Rule 5: Reject ideas and brainstorms
+
+- **Trigger**: candidate body uses speculative language ("adopted a structure where...", "positioned as...", multi-tier pricing options without commitment, hypothetical scoping), OR the user-facing prose reads like exploration rather than a committed decision.
+- **Action**: `reject as not-formalized`.
+- **Reasoning**: brainstorm captures and decisions look the same to kb-scan; only the latter belong in KB.
+- **Example**: commit `96d7fc2` in `getnexar/acardote-pa-vault` (sharing-model pricing with 10× multiplier, rejected with user reason "was just an idea").
+
+### Rule 6: Reject inaccurate kb-scan extracts (do not amend)
+
+- **Trigger**: candidate body materially misrepresents the source memo (reversed constraints, fabricated detail, contradicts the source on a load-bearing claim).
+- **Action**: `reject as inaccurate`. Do NOT amend — the extract is unsalvageable; salvaging costs more than waiting for the underlying memo to regenerate a candidate.
+- **Reasoning**: kb-scan occasionally hallucinates structure that contradicts the source; partial fixes leave subtle drift in the KB.
+- **Example**: art-uuid `art-6c8a7f9d-3d6a-425c-a462-1035e9f9a89f` (Vera MVP candidate, rejected with reason "highly inaccurate"; dup pair member with `art-b36abf1f-c96f-4ff6-a82a-d0675137a002`; both archived under `<content_root>/artefacts/memo/.rejected/`).
+
+### Rule 7: Q-goals get bounded Expires
+
+- **Trigger**: candidate title or body names a quarterly goal (`Q<N> goal`, `quarterly goal`, `this quarter's commitment`).
+- **Action**: `amend Expires: end of Q<N> (or until quarterly goals refresh)`.
+- **Reasoning**: Q-goals expire by definition; `Expires: never` is structurally wrong-shaped for them.
+- **Example**: commit `00fe30f` in `getnexar/acardote-pa-vault` (MoD business case validation as Q-goal, amended `never` → `end of Q2`).
+
+### Rule 8: Launch-dated decisions get bounded Expires
+
+- **Trigger**: candidate title contains a target launch window (`launches end of June`, `GA early August`, `<feature> launch <date>`).
+- **Action**: `amend Expires: at launch (~<date>)`.
+- **Reasoning**: launch decisions self-expire at launch; `Expires: never` overstates durability.
+- **Example**: commit `6d3a6f3` in `getnexar/acardote-pa-vault` (CartTag launches end of June / beginning of July 2026, amended to `at launch (~2026-07)`).
+
+### Rule 9: Reject Nexar products mistakenly extracted as external orgs
+
+- **Trigger**: candidate kind is `org-update` AND the referent is a Nexar product (Vera, Atlas, CartTag, BADAS, MoD, Guardian Mode, Atlas 2.0, etc.).
+- **Action**: `reject as wrong-layer`.
+- **Reasoning**: kb-scan surfaces product names as nouns and sometimes extracts them as external partner orgs; this poisons `<content_root>/kb/org.md` retrieval.
+- **Example**: commit `6e27d3c` in `getnexar/acardote-pa-vault` (Vera-as-org candidate `art-f451c201-dfdd-4b62-b342-469e0c503dfa`, rejected with user reason "Vera is one thing — Nexar product").
+
+### Rule 10: Correct Nauto/merged-entity CEO to Zach Greenberger
+
+- **Trigger**: candidate body names anyone other than Zach Greenberger (commonly: Eran) as the post-merger Nauto/Nexar CEO.
+- **Action**: `amend body: replace named CEO with "Zach Greenberger"`.
+- **Reasoning**: kb-scan misattributes the Nauto founder Eran to the CEO role; Zach is the named CEO of the merged entity.
+- **Example**: commit `3630094` in `getnexar/acardote-pa-vault` (Nauto merger plan, user-corrected Eran → Zach during the 2026-05-12 walk).
+
+### Rule 11: Internal product announcements happen at NLM
+
+- **Trigger**: candidate body names "upcoming conference", "next big event", or another external venue as the announcement channel for an internal Nexar product / spin-out / org change.
+- **Action**: `amend venue: "NLM (Nexar all-hands meeting)"`.
+- **Reasoning**: internal-facing announcements happen at NLM by Nexar convention; kb-scan defaults to external venues.
+- **Example**: commit `93b1151` in `getnexar/acardote-pa-vault` (Mithran spin-out, user-corrected announcement venue to NLM).
+
+### Rule 12: Disambiguate heat-map type (opt-in vs coverage)
+
+- **Trigger**: candidate body about "Nexar opt-in heat maps to Axon" (or similar partner data delivery) without naming the heat-map TYPE.
+- **Action**: `amend body: "opt-in OR coverage heat maps"`.
+- **Reasoning**: two heat-map types exist; kb-scan defaults to "opt-in" only and loses the coverage variant.
+- **Example**: commit `35986fa` in `getnexar/acardote-pa-vault` (heat maps to Axon, user-amended to opt-in OR coverage).
+
+---
+
+### Applying the catalog
+
+The catalog is used in two contexts:
+
+1. **Manual review (today)**: during a `/personal-assistant kb-process` walk, the LLM consults the catalog after running `tools/kb-process.py show <art-uuid>` and BEFORE drafting the proposed diff. If any rule's trigger matches, the LLM proposes the rule's action with the rule's name cited. The user still has the final say. Slice 2 of #173 will wire the catalog into Phase 1 of the personal-assistant skill so this consultation is automatic.
+
+2. **Mechanical pre-bin (deferred, slice 3 of #173)**: `tools/kb-classify.py` walks `.unprocessed/` once per session, applies the catalog's triggers, and routes each candidate into `auto-approve`, `auto-reject`, or `needs-review` piles. The user only walks `needs-review`. Triggered when catalog has ≥50 rules AND prediction agreement is reliably ≥85%.
+
+### How to add a rule
+
+When a user correction during a walk reveals a generalizable pattern (the same correction would plausibly apply to ≥3 future candidates):
+
+1. Draft the rule using the 5-field template above. All 5 fields are required; missing fields fail the slice-2 parser.
+2. Choose an existing-commit example from the current session (preferred), or reference an art-uuid in `<content_root>/artefacts/memo/.rejected/`.
+3. Append the rule under the next available `### Rule N:` heading. Numbering is monotonic — never reuse a number after a rule is superseded.
+4. Run `tools/lint-docs.py` to confirm the catalog parses.
+
+Do NOT add rules for one-off corrections; the catalog's value is generalization, not narration.
+
+### Catalog hygiene
+
+- **Contradictions**: if a new rule contradicts an existing rule on the same trigger shape, refactor by adding a guard condition to the older rule and a new rule for the new branch. Two rules SHOULD NEVER produce contradictory actions on the same candidate (per falsifier 1 on #174).
+- **Deletion**: rules are not deleted when superseded — instead, append `**Status:** superseded by Rule N` as a sixth field, keeping the entry for audit-trail purposes.
+- **Drift**: if a rule's `Example` commit becomes unreachable (force-pushed away, history rewritten), re-anchor to a different verifiable example or retire the rule. Unreachable examples fail falsifier 3 on #174.

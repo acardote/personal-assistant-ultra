@@ -139,6 +139,8 @@ Do NOT auto-launch kb-process — the user controls when to engage. Do NOT previ
 
 This is a passive nudge for harvest-emitted candidates (slice 5 / #125) and drift-detector-emitted candidates (slice 5 / #141) that need the user's diff-and-approve gate. Without this surface, candidates accumulate in `.unprocessed/` indefinitely until the user remembers to look — defeating the visibility-loop purpose of #116 and #135.
 
+**Pattern catalog (per [#173](https://github.com/acardote/personal-assistant-ultra/issues/173) / slice 1 [#174](https://github.com/acardote/personal-assistant-ultra/issues/174))**: when walking candidates inside `/personal-assistant kb-process`, consult the [Pattern catalog](../../../docs/kb-editorial-rules.md#pattern-catalog-per-173-slice-1-174) section of editorial rules — it lists generalizable corrections harvested from prior walks (default scope rules, ephemeral-rejection triggers, pricing-direction disambiguation, etc.). If a candidate matches a rule's trigger, propose the rule's action with the rule name cited; the user still has final say. Slice 2 of #173 will load the catalog into Phase 1 automatically; until then, the consultation is a manual read at walk time.
+
 ## Editorial discipline
 
 - **Never invent KB entries.** If the user asks about something that isn't in the KB and isn't derivable from layer-2 memory objects (when retrieval lands), say so explicitly. Hallucinated grounding is the failure mode that poisons every downstream consumer (see falsifier F2 on issue #3 / #4).
