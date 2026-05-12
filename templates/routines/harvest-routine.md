@@ -58,7 +58,9 @@ If you have additional connectors, the API attaches them automatically based on 
 
 ### Model
 
-`claude-sonnet-4-6` (default). Override only if you have a specific reason.
+`claude-opus-4-7` (default). The harvest's multi-step orchestration (preflight, per-source enumeration, compress, live-writeback, kb-scan, kb-drift-scan, batched MCP push) benefits from Opus's stronger prompt-following discipline — see [#165](https://github.com/acardote/personal-assistant-ultra/issues/165) for the assumption ledger and validation.
+
+Sonnet 4.6 / Haiku 4.5 remain valid overrides if you specifically want the lower-cost path and accept the discipline tradeoff. Note the watchdog routine (a small read-only freshness checker) appropriately runs on Haiku 4.5 — model choice should match workload, not just default everywhere.
 
 ### Routine prompt
 
