@@ -1,7 +1,7 @@
 # personal-assistant-ultra
 
-> **Status**: `v0.4.1` shipped (closes #41 structural follow-ups: cross-Bash-tool session-id state file #155, minute-bucket join restructure #157, F4 stateful staleness #156, + trivial cleanups). `v0.5.0` not yet in flight.
-> `latest` tracks the most recent immutable release tag — currently `v0.4.1`. See [`RELEASE.md`](RELEASE.md) for the policy.
+> **Status**: `v0.4.2` shipped (harvest routine commit-push transport: git CLI → GitHub MCP `push_files`, closed #153 + children #161/#162/#163). Also bundled in this tag but with parents still OPEN under empirical-monitoring windows through 2026-05-26: Opus 4.7 as default model #165, mid-batched-push 401 token-expiration handler #166 — code on `main` and live trigger but assumption ledgers not yet reconciled against fire data. `v0.5.0` not yet in flight.
+> `latest` tracks the most recent immutable release tag — currently `v0.4.2`. See [`RELEASE.md`](RELEASE.md) for the policy.
 
 A Claude Code skill that gives Claude a long-term, three-layer memory architecture (raw archive → editorially compressed memory objects → always-in-context knowledge base) over your accumulated working context (Slack, Gmail, Granola, Google Meet, transcripts, docs).
 
