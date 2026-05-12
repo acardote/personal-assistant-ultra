@@ -1,7 +1,7 @@
 # personal-assistant-ultra
 
-> **Status**: `v0.4.2` shipped (harvest routine commit-push transport: git CLI → GitHub MCP `push_files`, closed #153 + children #161/#162/#163). Also bundled in this tag but with parents still OPEN under empirical-monitoring windows through 2026-05-26: Opus 4.7 as default model #165, mid-batched-push 401 token-expiration handler #166 — code on `main` and live trigger but assumption ledgers not yet reconciled against fire data. `v0.5.0` not yet in flight.
-> `latest` tracks the most recent immutable release tag — currently `v0.4.2`. See [`RELEASE.md`](RELEASE.md) for the policy.
+> **Status**: `v0.5.0` shipped, partial — closed-and-reconciled: harvest-routine filename-ts cutoff anchor #170 (leg 1 of #152), kb-editorial-rules pattern catalog slice 1 (#174 closer of #173 slice 1). Also bundled in this tag but with parents still OPEN under empirical-monitoring windows through 2026-05-26: Opus 4.7 as default model #165, mid-batched-push 401 token-expiration handler #166 — code on `main` and live trigger but assumption ledgers not yet reconciled against fire data. Parent #173 (kb-process autonomy) is open: slice 2 (predict-then-verify protocol) + slice 3 (deferred classifier) pending.
+> `latest` tracks the most recent immutable release tag — currently `v0.5.0`. See [`RELEASE.md`](RELEASE.md) for the policy.
 
 A Claude Code skill that gives Claude a long-term, three-layer memory architecture (raw archive → editorially compressed memory objects → always-in-context knowledge base) over your accumulated working context (Slack, Gmail, Granola, Google Meet, transcripts, docs).
 
