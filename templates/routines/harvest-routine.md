@@ -136,9 +136,35 @@ The most likely cause of a missing critical connector is "the connector is enabl
 
 Also detect dual-active scheduler conflict. List `$VAULT/.harvest/runs/*.json` files modified within a window of `max(60min, 2 × your-routine-cadence-minutes)` — the larger window catches a launchd run from this morning when this routine fires this evening. If any matching file has `"scheduler": "launchd"`, append a `"warnings": ["launchd active alongside routine — pick one to avoid race conditions on writes to main and dedup state"]` entry to your run-status JSON. (Do not abort — the user may intentionally have both running for the Meet/transcript-drop workaround. Just surface the conflict.) The window may produce false negatives if the user's launchd cadence is sparser than 2x the routine cadence — accept this as best-effort detection.
 
-Determine harvest cutoff:
-- If `$VAULT/.harvest/runs/` contains any file, this is NOT a cold start: use "since yesterday" (last 24 hours).
-- Otherwise: this IS a cold start: use "since 30 days ago".
+Determine harvest cutoff. **This rule is load-bearing for gap recovery** — if the last successful push was N days ago (e.g. transport was broken or routine fires failed), the next successful fire must recover all N days, not just yesterday. Per [#152](https://github.com/acardote/personal-assistant-ultra/issues/152):
+
+1. **List runs files matching the canonical name pattern.** Match strictly: `runs/YYYY-MM-DDTHHMMSSZ.json` (regex: `^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.json$` on the basename). Skip ANY file that doesn't match — backup files, stale launchd-format files, hand-edits all get filtered. This shape is the one the shell-substituted `$(date -u +%Y-%m-%dT%H%M%SZ).json` upstream writes and `tools/scheduled-harvest.py:217` writes; nothing else is in-scope. The strict regex pins the lexicographic-equals-chronological invariant.
+
+2. **Sort newest-first by filename** (lexicographic sort is correct under the strict regex above) and walk the list:
+   - For each file: parse JSON. **If parsing fails, treat the file as `ok: false`** (corrupt → does not anchor). Do NOT abort the walk on parse errors; continue to the next file.
+   - If `payload.get("ok") is True` (Python-truthy check on a literal boolean — missing or non-boolean `ok` counts as `ok: false`): this is the anchor candidate.
+   - **No early termination on count.** Walk the entire list if necessary; only stop when the first `ok: true` is found OR every file has been examined.
+
+3. **Anchor source** — and this is the LOAD-BEARING DECISION: anchor at the **filename timestamp** (parsed from the basename's `YYYY-MM-DDTHHMMSSZ` prefix), NOT the JSON's `started_at` field. Rationale: `started_at` is LLM-written inside the routine prompt and has been observed to drift forward by ~1 hour (Opus and Sonnet both, see #170 challenger evidence). The filename is shell-substituted (`date -u +%Y-%m-%dT%H%M%SZ`) upstream of the LLM and is the only timestamp on the artifact that's mechanically trustworthy.
+
+   **How to parse the filename ts** (mechanical, no judgment):
+   ```python
+   import datetime, re
+   m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{6}Z)\.json$', basename)
+   filename_dt = datetime.datetime.strptime(m.group(1), '%Y-%m-%dT%H%M%SZ').replace(tzinfo=datetime.timezone.utc)
+   cutoff_iso = filename_dt.strftime('%Y-%m-%dT%H:%M:%SZ')   # ISO form with colons for the cutoff field
+   ```
+   The filename is compact (`061100Z`); the `cutoff` field on the run-status JSON is colon-separated ISO (`06:11:00Z`). Reformat explicitly — do not paste the basename into `cutoff` verbatim.
+
+   If the LLM-written `started_at` in the file matches the parsed filename ts within ±5 minutes, that's confirmation; if it drifts more, prefer the filename ts and add a `"warnings": ["started_at_drift: file=<ts>, json=<ts>"]` entry so the divergence is visible.
+
+4. **Same-second tiebreak** — two files with the same `YYYY-MM-DDTHHMMSSZ` (rare but possible — preflight-abort + commit-push partial in the same second): prefer the one whose `ok: true`. If both `ok: true` (unlikely), prefer the one with the most-recent `ended_at` field. If neither has `ended_at`, accept either deterministically (the lexicographic sort already does).
+
+5. **If NO `ok: true` run is found** (empty directory, all `ok: false`, all parse-failures): this IS a cold start. Use "since 30 days ago".
+
+Record the resolved cutoff in the run-status JSON's top-level `cutoff` field as an ISO timestamp (e.g. `"cutoff": "2026-05-08T06:11:00Z"`) or the sentinel `"30d cold-start"`. The canonical run-status schema (see "After all sources complete" block below) is extended to include this `cutoff` field. Do NOT use a calendar-yesterday string ("since yesterday", "last 24 hours") — that's the prior buggy rule that orphaned the 2026-05-08 → 2026-05-10T15:25Z window during the proxy-403 outage on [#153](https://github.com/acardote/personal-assistant-ultra/issues/153) (now the subject of backfill child [#172](https://github.com/acardote/personal-assistant-ultra/issues/172)).
+
+**Runtime safety: if the anchor filename ts is more than 14 days old**, do NOT silently cap the harvest. That is the exact failure mode this whole rule is designed to eliminate. Instead: write `runs/<ts>.json` with `ok: false, phase: "cutoff", error: "anchor_older_than_14d_cap — file a deliberate backfill child (e.g. modeled on #172) to harvest this window via an explicit since parameter"`, push the marker via `push_files` (same transport as the commit-push procedure below). **If that `push_files` itself errors** (token-expired, MCP-unavailable, terminal 4xx), emit `echo "FATAL: anchor_older_than_14d_cap AND marker push failed — vault has no observable signal; check claude.ai/code/routines logs and file a backfill child manually." >&2` so the failure surfaces in the routine UI even though no cross-machine signal lands. Exit non-zero. The watchdog will surface STALE within 26h once the marker DOES reach the vault.
 
 Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source. **Do not stop at the first few items per source — enumerate and fetch comprehensively** (per #34 — the original cold-start fetched only 9 items because the prompt was vague about completeness).
 
@@ -196,7 +222,7 @@ Compress writes to $VAULT/memory/<source-kind>/, applies #10's clustering (event
 
 Update $VAULT/.harvest/<source>.json dedup state. Append today's section to $VAULT/.harvest/daily/$(date -u +%Y-%m-%d).md following SKILL.md's daily digest format. Create $VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json with structured run status:
 
-  {"started_at": "...", "ok": true|false, "scheduler": "routine", "sources": {"slack": {"new": N, "errors": []}, ...}, "ended_at": "..."}
+  {"started_at": "...", "ok": true|false, "scheduler": "routine", "cutoff": "<ISO-ts or '30d cold-start'>", "sources": {"slack": {"new": N, "errors": []}, ...}, "ended_at": "..."}
 
 The `"scheduler": "routine"` field is mandatory — it is the marker the dual-active detection above grep's for. Match it exactly.
 
