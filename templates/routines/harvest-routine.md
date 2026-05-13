@@ -380,12 +380,80 @@ Procedure:
            --base main \
            --head "$BRANCH" \
            --title "harvest $(date -u +%Y-%m-%d) (routine)" \
-           --body "$(printf 'Routine harvest fire %s.\n\n- Commit: %s\n- Branch: %s\n- Runs JSON: .harvest/runs/%s.json\n\nMerge after reviewing the diff. Adversarial-review automation lands in slice 2 of #178.\n' "$RUN_TS" "$SHA" "$BRANCH" "$RUN_TS")")
+           --body "$(printf 'Routine harvest fire %s.\n\n- Commit: %s\n- Branch: %s\n- Runs JSON: .harvest/runs/%s.json\n\nThis PR will auto-merge after CI checks pass + adversarial review clears (per slice 2 of #178).\n' "$RUN_TS" "$SHA" "$BRANCH" "$RUN_TS")")
        echo "harvest PR: $PR_URL" >&2
 
-   Apply the error matrix in step 9 below if either `git push` or `gh pr create` fails. The runs JSON is already part of the commit, so even if step 8 is interrupted between `git push` and `gh pr create`, the branch on origin carries the complete harvest and a fresh `gh pr create --head "$BRANCH"` from a recovery session will open the PR cleanly. **NOTE on what the slice-1 contract preserves**: once `git push` succeeds, the harvest IS durable on GitHub regardless of what happens to `gh pr create` — slice 1's failure modes degrade to "operator opens the PR manually" rather than "data loss".
+   Apply the error matrix in step 10 below if either `git push` or `gh pr create` fails. The runs JSON is already part of the commit, so even if step 8 is interrupted between `git push` and `gh pr create`, the branch on origin carries the complete harvest and a fresh `gh pr create --head "$BRANCH"` from a recovery session will open the PR cleanly. **NOTE on what slice 1 preserves**: once `git push` succeeds, the harvest IS durable on GitHub regardless of what happens downstream — failures from step 9 onward (review, merge) degrade to "PR left open for manual review" rather than "data loss".
 
-9. **Error matrix** (apply mechanically — no judgment). All run-status JSONs landed in this section use the SAME canonical schema as the success path and may carry forward-compatible diagnostic extension fields (`phase`, `error`, `push.fallback_reason`, etc.). The runs JSON is **already part of the commit** (step 5 + 6 wrote it; step 7 committed it) — so failure branches below operate on a runs JSON that already exists locally and may need to be MODIFIED before any fallback push.
+9. **Adversarial review + auto-merge** (slice 2 of #178, hybrid mechanism — pr-reviewer #180 closed-and-reconciled, slice 2 child = #181). CI workflows (`lint-docs`, `lint-provenance`) on the harvest PR act as the HARD gate via `--auto` merge. `pr-reviewer` + `pr-challenger` subagents run as a SOFT gate posting findings as PR comments; their findings block the merge ONLY if either output contains a literal `**BLOCKING (harvest)**` token (per the rubric agreed for #181). Total time budget for this sub-procedure: **60 minutes** (worst-case: subagent latency + CI wait time).
+
+   a. **Invoke `pr-reviewer` via the Agent tool**:
+
+          subagent_type: pr-review-team:pr-reviewer
+          description: harvest-PR review (routine)
+          prompt: |
+              Review this autonomous harvest PR for routine auto-merge: $PR_URL.
+
+              Context: routine harvest fire. The diff contains DATA files (memory/, .harvest/,
+              kb/, artefacts/), NOT code. Focus on DATA correctness, not architectural concerns.
+
+              CI lints (lint-docs, lint-provenance) act as the required-check HARD gate and
+              will block merge if they fail. Your review is a SOFT gate: findings are advisory
+              UNLESS you flag a Class-B concern serious enough to block.
+
+              Class-B concerns to flag with the literal token `**BLOCKING (harvest)**`
+              (place it at the START of your review body):
+              - Credential, PII, secret, or token leakage in any file.
+              - Memory file or kb entry with anomalous content (10x normal size, non-harvest
+                content, references to a different vault or org).
+              - Cross-file inconsistency that lint can't catch (runs.json claims source counts
+                that don't match the files present; dedup state file references missing files).
+              - Suspicious volume anomaly (200+ memory objects from a window that normally
+                produces 10-20 — possible dedup-state corruption).
+
+              If none of the above: do NOT include the BLOCKING token. Other findings (nits,
+              suggestions, future improvements) get posted as PR comments and remain advisory.
+
+              Return your review in your normal pr-reviewer report shape.
+
+   b. **Invoke `pr-challenger` via the Agent tool** (same prompt structure, different agent + harsher framing):
+
+          subagent_type: pr-review-team:pr-challenger
+          description: harvest-PR challenge (routine)
+          prompt: |
+              [Same prompt as (a) but addressed to pr-challenger; ask it to push back hard
+              on anything that looks anomalous, with the same `**BLOCKING (harvest)**` token
+              rubric.]
+
+   c. **Post both reviews as PR comments** so they're durable on the PR:
+
+          gh pr comment "$PR_URL" --body "## pr-reviewer (routine adversarial review)
+
+          $REVIEWER_OUTPUT"
+
+          gh pr comment "$PR_URL" --body "## pr-challenger (routine adversarial review)
+
+          $CHALLENGER_OUTPUT"
+
+   d. **Check for the BLOCKING token** (case-insensitive substring match — robust to minor formatting variations):
+
+          if printf '%s\n%s' "$REVIEWER_OUTPUT" "$CHALLENGER_OUTPUT" | grep -iqF "**blocking (harvest)**"; then
+              BLOCKING_FOUND=true
+          else
+              BLOCKING_FOUND=false
+          fi
+
+   e. **If `BLOCKING_FOUND=false` — set auto-merge** (the `--auto` flag waits for required checks before merging):
+
+          gh pr merge "$PR_URL" --auto --squash --delete-branch
+
+      Then poll `gh pr view "$PR_URL" --json mergedAt --jq .mergedAt` every 30s, max 50 minutes (60min budget minus ~10min for the review). If the merge lands, capture `MERGE_SHA=$(gh pr view "$PR_URL" --json mergeCommit --jq .mergeCommit.oid)`.
+
+   f. **If `BLOCKING_FOUND=true` — leave PR open**. Do NOT call `gh pr merge`. The PR-comments posted in step (c) already document WHICH agent flagged WHAT, so the operator can read the reviews and decide whether to merge manually after addressing.
+
+   g. **Update local runs JSON**: if merged, add `push.merged_at: "<iso>"`, `push.merge_commit_sha: "<sha>"`. If left open due to BLOCKING, add `push.blocking_token: true`, `push.blocking_source: "pr-reviewer|pr-challenger|both"`. Either way, the runs JSON is already on the (merged or open) feature branch, so this is local-only state for the routine's final response; downstream consumers re-derive from `gh pr view`.
+
+10. **Error matrix** (apply mechanically — no judgment). All run-status JSONs landed in this section use the SAME canonical schema as the success path and may carry forward-compatible diagnostic extension fields (`phase`, `error`, `push.fallback_reason`, etc.). The runs JSON is **already part of the commit** (step 5 + 6 wrote it; step 7 committed it) — so failure branches below operate on a runs JSON that already exists locally and may need to be MODIFIED before any fallback push.
 
    - **`git push` network failure** (timeout, DNS, transient connection reset): retry the same push once after 30 seconds. If the retry succeeds, continue. If the retry also fails, update local `runs/<RUN_TS>.json` (overwriting the success-shaped one written in step 5) with `ok: false, phase: "commit_push"`, `push.transport: "mcp-push-files"`, `push.fallback_reason: "git_push_network_failure"`, `push.original_branch: "<BRANCH>"` (so the operator can tell the routine TRIED feature-branch first). Re-stage + amend the commit if it already happened locally, then fall back to MCP `push_files`.
    - **`git push` returns 403 on feature branch** (A1 of #178 falsified — the proxy auth has changed again or the `acardote` principal has lost feature-branch write): update local runs JSON `push.transport: "mcp-push-files"`, `push.fallback_reason: "git_push_403_on_feature_branch_a1_falsified"`. Emit `echo "WARN: git push 403 on feature branch — #178 A1 (proxy auth stability) falsified. Falling back to MCP push_files. File evidence on #178." >&2` so the falsification is visible in the routine UI. Fall back to MCP `push_files`.
@@ -395,17 +463,23 @@ Procedure:
    - **`gh pr create` "command not found"** (gh CLI not installed in the sandbox): the branch was already pushed in step 8's first command, so the harvest data IS on GitHub. Update runs JSON `push.transport: "git-feature-branch-no-pr"`, `push.pr_create_error: "gh_cli_not_found"`. Surface in final response with the EXACT command the operator can run from their laptop: `gh pr create --repo $VAULT_OWNER/$VAULT_REPO --head $BRANCH --base main --title "harvest $(date -u +%Y-%m-%d) (routine)"`. Do NOT fall back to MCP push_files (data is already on GitHub).
    - **`gh pr create` auth failure / API error** (auth, rate limit, API 4xx after `gh` is installed): the branch was already pushed, so the harvest IS on GitHub. Retry `gh pr create` once after 30 seconds. If retry fails, leave the branch as-is (don't tear it down), update runs JSON `push.transport: "git-feature-branch-no-pr"`, `push.pr_create_error: "<short error>"`. Emit `echo "WARN: branch pushed to $BRANCH but gh pr create failed: <err>. Operator must manually open the PR or merge the branch directly. Surface in final response with the exact command." >&2`. **Do NOT fall back to MCP push_files** — data is already on GitHub via `git push`; falling back would duplicate-commit under a different transport.
    - **MCP `push_files` fallback path** (triggered by the `git push` failure branches above): see the "MCP `push_files` fallback" section below. The fallback procedure is unchanged from the prior MCP-as-primary implementation (it's verbatim what shipped in #161 / v0.4.2, including the 401-retry-on-demand-pause flow on #166); slice 1 just demotes it from primary to fallback.
+   - **Agent tool unavailable during step 9** (subagent_type not resolvable / Agent tool not attached): skip the review entirely. Leave PR open. Update local runs JSON `push.auto_merge: false`, `push.skip_reason: "agent_tool_unavailable"`. Emit `echo "WARN: Agent tool unavailable in this fire — adversarial review skipped, PR left open for manual review. File evidence on #181." >&2`. Surface in final response.
+   - **Subagent timeout or error during step 9** (pr-reviewer or pr-challenger fails to return within the budget, or errors): treat as `BLOCKING_FOUND=true` (fail-safe — don't auto-merge what wasn't reviewed). Update runs JSON `push.auto_merge: false`, `push.skip_reason: "subagent_timeout|subagent_error"`. Post a PR comment noting which subagent failed and why so the operator has context.
+   - **`gh pr merge --auto` returns "not eligible for auto-merge"** (branch protection requires checks/reviews `--auto` can't satisfy autonomously — possibly an updated branch protection rule or a required reviewer outside the routine's principal): leave PR open. Update runs JSON `push.auto_merge: false`, `push.skip_reason: "branch_protection_blocks_auto_merge"`. Surface the required-check name from the API response (if available) in the final response so the operator knows what to satisfy. Per #181 A5 — the operator agreed to handle this case manually.
+   - **Merge-conflict-on-main** (poll detects the merge couldn't complete due to conflict): another fire / launchd raced. Leave PR open. Update runs JSON `push.auto_merge: false`, `push.skip_reason: "merge_conflict"`. Surface in final response with a one-line "operator: rebase the branch on origin/main and retry the merge" hint.
+   - **Auto-merge poll timeout** (50min of polling without `mergedAt` becoming non-null AND no conflict / not-eligible error — CI is just slow): leave the `--auto` flag set (the merge will happen when CI eventually passes); the routine exits with "merge pending". Update runs JSON `push.auto_merge: "pending"`, `push.merge_poll_timed_out: true`. Surface in final response: "Auto-merge set but did not complete within 50min — merge will happen when CI passes. PR: $PR_URL".
 
-10. **In your final user-facing response, surface the PR URL prominently** so the operator can review + merge. Template:
+11. **In your final user-facing response, surface the OUTCOME of step 9** so the operator knows whether to act:
 
         Harvest complete (routine, $RUN_TS).
         - Sources: <one-line per-source summary>
         - Commit: $SHA on branch $BRANCH
         - PR: $PR_URL
         - Runs JSON: .harvest/runs/$RUN_TS.json
-        - **Action**: merge $PR_URL after reviewing the diff. Auto-merge wires in slice 2 of #178.
+        - Adversarial review: <PASS|BLOCKING from pr-reviewer|BLOCKING from pr-challenger|SKIPPED — agent unavailable|FAIL — subagent timeout>
+        - Merge: <merged at $MERGE_SHA|PENDING — auto-merge set, awaiting CI|LEFT OPEN — see review comments|LEFT OPEN — branch protection blocks auto-merge|LEFT OPEN — merge conflict>
 
-   If the fallback path was hit, surface the fallback reason in place of the PR URL: e.g., `Push fell back to MCP push_files (reason: <fallback_reason>). Commit landed directly on main.`
+   If the fallback path (MCP push_files) was hit, surface the fallback reason in place of the PR URL: e.g., `Push fell back to MCP push_files (reason: <fallback_reason>). Commit landed directly on main; adversarial review and auto-merge skipped — those apply only to the feature-branch primary transport.`
 
 ### MCP `push_files` fallback
 
@@ -427,30 +501,25 @@ The historical concern (recorded for the MCP-primary era): `push_files`'s `updat
 
 Under the new feature-branch primary: the **harvest-payload commit-time** branch-collision-on-`main` race is structurally eliminated — `git push` to a per-fire feature branch CANNOT race launchd's direct-push-to-main since they target different refs. The PR-merge step (slice 2) re-introduces a race surface, but only at merge time and GitHub's merge code path handles the bounded conflict cleanly (fails closed on conflict rather than potentially-clobbering). **The "Choose ONE scheduler" discipline remains load-bearing** for the dedup-state-file race (`.harvest/<source>.json` files) and for the slice-1→slice-2 freshness regression noted below.
 
-### Slice-1→slice-2 freshness regression (per pr-challenger B1 on #180)
+### Freshness window — now closed by slice 2 (auto-merge), with caveats
 
-The slice-1 stop-at-PR-open boundary creates a real data-availability regression in the slice-1→slice-2 window — not just operator burden. Document this as a known cost and prioritize slice 2 accordingly:
+The slice-1 stop-at-PR-open boundary was documented as a known cost. **Slice 2 (this prompt's current step 9 — adversarial review + auto-merge) closes that window** by auto-merging harvest PRs within ~60 minutes of fire end (worst case; typical: 1-5 min after CI passes). Three regressions slice 2 closes:
 
-1. **Cutoff-anchor walks stale `runs/*.json`**: the cutoff procedure (steps near line 139) walks `$VAULT/.harvest/runs/*.json` to find the newest `ok: true`. The vault's working tree on the operator's laptop tracks `origin/main`; if the prior fire's PR is unmerged, the laptop-side clone DOES NOT see that fire's runs file. The next fire's anchor lands on an OLDER `ok: true`, re-harvesting the same window. With 12h cadence + 24h operator-merge latency, every fire re-does the prior fire's work.
+1. **Cutoff-anchor walks stale `runs/*.json`** — RESOLVED. Within minutes of fire end the harvest PR merges to main; the next fire (12h cadence) sees the prior fire's `runs/<ts>.json` on origin/main and anchors correctly.
 
-2. **Dual-scheduler-detection becomes false-negative-by-construction**: the "Choose ONE scheduler" detection lists `runs/*.json` to spot launchd vs routine collisions. With routine-fire runs files on feature branches (not main), launchd activity that overlapped with a routine fire is invisible to the next fire's collision check.
+2. **Dual-scheduler-detection** — RESOLVED. Routine-fire runs files reach main within minutes; the next fire's collision check sees them.
 
-3. **Dedup state divergence**: `.harvest/<source>.json` dedup state files live in the working tree. If fire N+1 starts before fire N's PR merges, fire N+1's dedup state is built from main's stale state and won't see fire N's deduped items. Re-fetches happen; once both PRs merge in some order, the state file ends up in a forensically ambiguous condition.
+3. **Dedup state divergence** — RESOLVED. Fire N's `.harvest/<source>.json` lands on main before fire N+1 starts (under typical cadence + auto-merge latency); fire N+1's dedup state is correctly seeded.
 
-**Operational implication**: during the slice-1→slice-2 window, the operator MUST merge each harvest PR before the next fire (or accept the regression above). The routine's final user-facing message must surface this clearly so the operator can choose their cadence. Slice 2 of #178 (auto-merge + adversarial review integration) closes this regression by collapsing the window.
+**Residual operational risk during the slice-2 era**:
 
-### Preflight-abort marker vs feature-branch harvest (per pr-challenger B3 on #180)
+- **Slow CI / pending auto-merge**: if `lint-docs` or `lint-provenance` take longer than ~50 min (the routine's auto-merge poll cap), the merge is set to happen autonomously when CI eventually passes — but the next routine fire may start BEFORE it lands. Operationally rare (lints are seconds-fast); but if observed, file evidence on #181.
+- **BLOCKING-token gate triggers**: if `pr-reviewer` or `pr-challenger` flag `**BLOCKING (harvest)**`, the PR sits open until the operator reviews. During that window the slice-1 regressions return for THAT specific PR's data. Operator response time is the new gating variable. Reasonable: most BLOCKING events should require manual judgment anyway.
+- **Branch protection blocks `--auto`**: per #181 A5, the operator agreed to handle this case manually. Surface the required-check name in the final response so they know what to satisfy.
 
-Mixed-transport scenario to watch: if fire N's harvest is on an unmerged feature branch and fire N+1's preflight aborts (writing a marker via MCP `push_files` to `main`), then:
+### Preflight-abort marker vs feature-branch harvest (residual mixed-transport hazard)
 
-- Vault `main` shows fire N+1's `ok: false` preflight-abort marker as the newest runs file.
-- Fire N's harvest content (with its `ok: true` marker) is on a feature branch, invisible to main.
-- The cutoff anchor walks newest-first, skips the `ok: false`, lands on an older `ok: true` (fire N-1's, the most recent merged). The cutoff anchor's correctness is preserved, but the apparent "last harvest" timestamp on main is older than reality.
-
-This is acceptable for the slice-1→slice-2 window (preflight aborts should be rare; the watchdog still catches a STALE main correctly), but during a preflight-abort burst it could mislead anyone debugging. Two mitigations:
-
-- **Slice 1 (now)**: document the scenario here so debuggers don't waste time. Marker pushes stay on MCP `push_files` because a 1-file marker doesn't justify a branch+PR ceremony.
-- **Slice 2 (auto-merge)**: collapses the window — once auto-merge lands, harvest PRs merge within minutes and the mixed-transport hazard window narrows to those minutes.
+The mixed-transport scenario documented in slice 1 (fire N's harvest on a feature branch + fire N+1's preflight aborts via MCP `push_files` to `main`) is **narrowed but not eliminated** by slice 2. With auto-merge typically landing within minutes, the window for fire N's harvest to still be unmerged when fire N+1 fires is small. But during a BLOCKING-token gate event (PR sits open pending operator review), the hazard returns for that fire's data — debuggers should remain aware that a `runs/<ts>.json` with `ok: false phase=preflight` on main may exist alongside a feature-branch carrying an `ok: true` harvest for a different timestamp. The cutoff anchor's lexicographic walk handles this correctly (newest-first, skips `ok: false`), but the apparent "last harvest" timestamp on main may not reflect the latest-actually-completed harvest until the BLOCKING-gated PR resolves.
 
 In your final response, summarize:
 - Which sources fired and what each produced.
