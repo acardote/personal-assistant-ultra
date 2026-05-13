@@ -129,7 +129,7 @@ Decision rules:
 **Abort condition**: if Slack OR Granola is missing after the rules above, immediately:
 
   - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`.
-  - **Push that single file via the GitHub MCP `push_files` tool** — marker pushes stay on MCP push_files (NOT the new feature-branch primary) because a one-file marker doesn't justify the branch + PR ceremony. Direct `git push` to `main` would 403 here per #178 (proxy `acardote` principal has no main-branch-protection bypass). If `push_files` itself errors out (tool not attached / 4xx / 5xx-after-retry), emit `echo "FATAL: preflight abort run-status could not be pushed — both transports unavailable; failure visible only in routine logs" >&2` so the routine log carries the signal even though no cross-machine surface will.
+  - **Push that single file via the GitHub MCP `push_files` tool** — direct `git push` to `main` would 403 (proxy `acardote` principal has no main-branch-protection bypass per #178), and the feature-branch+PR ceremony for a one-file failure marker is overkill — so marker pushes stay on MCP `push_files`. (Mixed-transport hazard during slice-1→slice-2 window is documented under "Preflight-abort marker vs feature-branch harvest" near the bottom of this prompt.) If `push_files` itself errors out (tool not attached / 4xx / 5xx-after-retry), emit `echo "FATAL: preflight abort run-status could not be pushed — both transports unavailable; failure visible only in routine logs" >&2` so the routine log carries the signal even though no cross-machine surface will.
   - Exit. **Do NOT proceed to harvest.** A successful-looking partial run with a critical source missing is worse than a clean failure.
 
 The most likely cause of a missing critical connector is "the connector is enabled in claude.ai but not authenticated." Surface that explicitly in the error so the user knows where to look.
@@ -307,86 +307,93 @@ Procedure:
 
    **If `git status` returns an empty result**: harvest produced no new files. Write `$VAULT/.harvest/runs/<ts>.json` locally with `ok: true, scheduler: "routine"`, populate the `sources` object with zero-shaped per-source entries (`"slack": {"new": 0, "errors": []}` etc.), and `notes: "harvest produced no new files"` — i.e. the SAME schema specified earlier in this prompt for the success-path run-status JSON, not a different shape. Then re-run `git status -z --porcelain --untracked-files=all`; the runs file will now appear as `??` and step 3 has a single-file payload to push for freshness-check visibility.
 
-3. **Derive a unique branch name** from the run-status timestamp (already established convention for `runs/<ts>.json`):
+3. **Derive a unique branch name + sync local main to origin/main**. The branch name uses the run-status timestamp (already established convention for `runs/<ts>.json`); the local-main sync is the base-of-branch guarantee — without it, a stale local clone could base the branch on outdated main and the PR diff would show files that don't belong to this fire (per pr-reviewer B2 on #180):
 
        RUN_TS=$(date -u +%Y-%m-%dT%H%M%SZ)
        BRANCH="harvest-$RUN_TS"
-
-   The second-resolution ts is the same one used for `.harvest/runs/<ts>.json`. If a fire retries (same-session re-run, rare), reusing the branch is safe with `--force-with-lease` (see error matrix). If two unrelated fires somehow generated the SAME `RUN_TS` (extremely improbable since the routine waits for completion before allowing another fire), the second fire's branch-create or push fails — the error matrix surfaces it as a hard error, not a silent overwrite.
-
-4. **Create the branch + stage harvest paths**. Stage the same paths as `tools/live-commit-push.sh` (`memory/ .harvest/ kb/ artefacts/`); `raw/` is `.gitignore`'d per [ADR-0001](../../docs/adr/0001-storage-backend.md). Stage paths individually because `git add a b c` aborts on the first nonexistent path:
-
        cd "$VAULT"
+       git fetch origin main 2>&1 >&2
+       # Stash any pre-existing working-tree state (defensive — the sandbox SHOULD be a fresh
+       # ephemeral checkout, but we don't trust that without a probe).
+       git checkout main 2>&1 >&2
+       git reset --hard origin/main 2>&1 >&2  # ephemeral sandbox; main MUST track origin/main before branching
+       # Re-apply the harvest's working-tree changes (the sandbox session's earlier source
+       # writes ARE the harvest output — they live on disk independent of the index).
+       # Step 2 already discovered them; re-running git status post-reset confirms they survived.
+       if [ -z "$(git status -z --porcelain --untracked-files=all)" ]; then
+           echo "FATAL: harvest output disappeared after reset — sandbox state corruption?" >&2
+           exit 1
+       fi
+
+   The second-resolution `RUN_TS` is the same one used for `.harvest/runs/<ts>.json`. If a fire retries (same-LLM-conversation re-execution, rare), reusing the branch is safe with `--force-with-lease` (see error matrix). If two unrelated fires somehow generated the SAME `RUN_TS` (extremely improbable since the routine waits for completion before allowing another fire), the second fire's branch-create or push fails — the error matrix surfaces it as a hard error, not a silent overwrite.
+
+4. **Probe `gh` ambient auth** before staging — fast-fails if `gh pr create` won't work later (per pr-challenger S2):
+
+       gh auth status -h github.com 2>&1 >&2 || echo "WARN: gh auth status failed — gh pr create likely will too; will fall back to MCP push_files if step 7 fails" >&2
+
+   This is informational only — does NOT exit. Step 7's failure handling routes to MCP fallback if `gh pr create` does fail.
+
+5. **Write the run-status JSON locally FIRST, then stage everything together** (per pr-reviewer B1 + pr-challenger S3 on #180 — eliminates the post-PR-amend dance and the transient "PR open with no runs marker" window). The runs JSON's `push` block is populated WITHOUT `pr_url` at this stage — `pr_url` lives in the stderr log + final user-facing message only, recoverable via `gh pr list --head "$BRANCH"` if needed:
+
+       # Write runs/<RUN_TS>.json locally with the canonical schema + push block.
+       cat > "$VAULT/.harvest/runs/$RUN_TS.json" <<EOF
+       {
+         "started_at": "<step-1 start ts>",
+         "ok": true,
+         "scheduler": "routine",
+         "sources": { <per-source counts> },
+         "ended_at": "<now>",
+         "push": {
+           "transport": "git-feature-branch",
+           "branch": "$BRANCH"
+         }
+       }
+       EOF
+
+   The `commit_shas` field is omitted at this point (the commit hasn't happened yet); it can be added by a downstream tool that walks `git log $BRANCH ^main` if a later consumer needs it. Slice 1's contract is that the runs JSON carries enough to identify the branch — not the SHA.
+
+6. **Create the branch + stage harvest paths**. Stage the same paths as `tools/live-commit-push.sh` (`memory/ .harvest/ kb/ artefacts/`); `raw/` is `.gitignore`'d per [ADR-0001](../../docs/adr/0001-storage-backend.md). Stage paths individually because `git add a b c` aborts on the first nonexistent path:
+
        git checkout -b "$BRANCH"
        for path in memory/ .harvest/ kb/ artefacts/; do
            [ -e "$path" ] && git add "$path" 2>/dev/null || true
        done
-       # Sanity: refuse to proceed if nothing got staged (shouldn't happen — step 2 verified ≥1 changed file).
+       # Sanity: refuse to proceed if nothing got staged (shouldn't happen — step 2 verified ≥1
+       # changed file AND step 5 wrote the runs JSON, which itself is a staged file).
        if git diff --cached --quiet; then
-           echo "FATAL: no files staged after $(date) despite git status reporting changes; aborting before commit." >&2
-           git checkout main
-           git branch -D "$BRANCH"
+           echo "FATAL: no files staged after step 6 despite step 2 reporting changes and step 5 writing runs JSON; aborting." >&2
+           git checkout - 2>/dev/null || git checkout main 2>/dev/null || git checkout --detach origin/main
+           git branch -D "$BRANCH" 2>/dev/null || true
            exit 1
        fi
 
-5. **Commit the harvest**. The `(routine)` suffix in the subject disambiguates routine commits from hand-authored ones in `git log` / `git blame`:
+7. **Commit the harvest as a single commit** (the runs JSON is already in the staged set — no amend needed). The `(routine)` suffix in the subject disambiguates routine commits from hand-authored ones in `git log` / `git blame`:
 
-       git commit -m "harvest $(date -u +%Y-%m-%d) (routine, $BRANCH)"
+       git commit -m "harvest $(date -u +%Y-%m-%d) (routine)"
+       SHA=$(git rev-parse HEAD)
+       echo "harvest commit: $SHA on $BRANCH" >&2
 
-   Capture the resulting commit SHA: `SHA=$(git rev-parse HEAD)`. Echo to stderr so the run log carries it: `echo "harvest commit: $SHA on $BRANCH" >&2`.
-
-6. **Push the branch to origin**:
+8. **Push the branch to origin + open the PR**. Two commands, with the PR URL captured directly from `gh pr create`'s stdout (per pr-reviewer S1 on #180 — single CLI call, no separate `gh pr view` lookup):
 
        git push -u origin "$BRANCH"
-
-   Apply the error matrix in step 9 below if push fails.
-
-7. **Open the PR via `gh pr create`**. The PR body is short — it surfaces the commit + the branch + the runs.json path so the operator can spot-check before merging. Slice 1 of #178 stops at PR-open; slice 2 will wire auto-merge after adversarial review:
-
-       gh pr create \
+       PR_URL=$(gh pr create \
            --base main \
            --head "$BRANCH" \
            --title "harvest $(date -u +%Y-%m-%d) (routine)" \
-           --body "$(printf 'Routine harvest fire %s.\n\n- Commit: %s\n- Branch: %s\n- Runs JSON: .harvest/runs/%s.json\n\nMerge after reviewing the diff. Adversarial-review automation lands in slice 2 of #178.\n' "$RUN_TS" "$SHA" "$BRANCH" "$RUN_TS")"
+           --body "$(printf 'Routine harvest fire %s.\n\n- Commit: %s\n- Branch: %s\n- Runs JSON: .harvest/runs/%s.json\n\nMerge after reviewing the diff. Adversarial-review automation lands in slice 2 of #178.\n' "$RUN_TS" "$SHA" "$BRANCH" "$RUN_TS")")
+       echo "harvest PR: $PR_URL" >&2
 
-   Capture the resulting PR URL: `PR_URL=$(gh pr view "$BRANCH" --json url --jq .url)`. Echo to stderr: `echo "harvest PR: $PR_URL" >&2`.
+   Apply the error matrix in step 9 below if either `git push` or `gh pr create` fails. The runs JSON is already part of the commit, so even if step 8 is interrupted between `git push` and `gh pr create`, the branch on origin carries the complete harvest and a fresh `gh pr create --head "$BRANCH"` from a recovery session will open the PR cleanly. **NOTE on what the slice-1 contract preserves**: once `git push` succeeds, the harvest IS durable on GitHub regardless of what happens to `gh pr create` — slice 1's failure modes degrade to "operator opens the PR manually" rather than "data loss".
 
-   Apply the error matrix in step 9 below if `gh pr create` fails.
+9. **Error matrix** (apply mechanically — no judgment). All run-status JSONs landed in this section use the SAME canonical schema as the success path and may carry forward-compatible diagnostic extension fields (`phase`, `error`, `push.fallback_reason`, etc.). The runs JSON is **already part of the commit** (step 5 + 6 wrote it; step 7 committed it) — so failure branches below operate on a runs JSON that already exists locally and may need to be MODIFIED before any fallback push.
 
-8. **Write the run-status JSON** at `$VAULT/.harvest/runs/<RUN_TS>.json` with the canonical schema (`started_at, ok: true, scheduler: "routine", sources, ended_at`) PLUS the new `push` block carrying the transport, branch, PR URL, and commit SHA:
-
-       {
-         "started_at": "...",
-         "ok": true,
-         "scheduler": "routine",
-         "sources": { ... },
-         "ended_at": "...",
-         "push": {
-           "transport": "git-feature-branch",
-           "branch": "<BRANCH>",
-           "pr_url": "<PR_URL>",
-           "commit_shas": ["<SHA>"]
-         }
-       }
-
-   The runs JSON itself is part of the harvest — meaning it lands AFTER the branch is pushed but BEFORE the routine ends. Two options:
-
-   a) **Write-then-amend** (preferred for slice 1): write the runs JSON locally after step 7, then `git add .harvest/runs/<RUN_TS>.json && git commit --amend --no-edit && git push --force-with-lease origin "$BRANCH"` to fold it into the same commit. This keeps the branch a single-commit PR (cleaner merge).
-
-   b) **Two-commit branch** (alternative): commit the harvest first, push, open PR, then commit the runs JSON as a second commit on the same branch and push again. The PR shows 2 commits.
-
-   Default to (a). If `--amend` or `--force-with-lease` fails (no clean operator override on the routine sandbox), fall through to (b).
-
-9. **Error matrix** (apply mechanically — no judgment). All run-status JSONs landed in this section use the SAME canonical schema as the success path and may carry forward-compatible diagnostic extension fields (`phase`, `error`, `push.fallback_reason`, etc.).
-
-   - **`git push` network failure** (timeout, DNS, transient connection reset): retry the same push once after 30 seconds. If the retry succeeds, continue. If the retry also fails, fall back to MCP `push_files` (procedure below). Annotate `runs/<ts>.json` `push.transport: "mcp-push-files"`, `push.fallback_reason: "git_push_network_failure"`, `push.original_branch: "<BRANCH>"` (so the operator can tell the routine TRIED feature-branch first).
-   - **`git push` returns 403 on feature branch** (A1 of #178 falsified — the proxy auth has changed again or the `acardote` principal has lost feature-branch write): fall back to MCP `push_files`. Annotate `push.transport: "mcp-push-files"`, `push.fallback_reason: "git_push_403_on_feature_branch_a1_falsified"`. Emit `echo "WARN: git push 403 on feature branch — #178 A1 (proxy auth stability) falsified. Falling back to MCP push_files. File evidence on #178." >&2` so the falsification is visible in the routine UI.
+   - **`git push` network failure** (timeout, DNS, transient connection reset): retry the same push once after 30 seconds. If the retry succeeds, continue. If the retry also fails, update local `runs/<RUN_TS>.json` (overwriting the success-shaped one written in step 5) with `ok: false, phase: "commit_push"`, `push.transport: "mcp-push-files"`, `push.fallback_reason: "git_push_network_failure"`, `push.original_branch: "<BRANCH>"` (so the operator can tell the routine TRIED feature-branch first). Re-stage + amend the commit if it already happened locally, then fall back to MCP `push_files`.
+   - **`git push` returns 403 on feature branch** (A1 of #178 falsified — the proxy auth has changed again or the `acardote` principal has lost feature-branch write): update local runs JSON `push.transport: "mcp-push-files"`, `push.fallback_reason: "git_push_403_on_feature_branch_a1_falsified"`. Emit `echo "WARN: git push 403 on feature branch — #178 A1 (proxy auth stability) falsified. Falling back to MCP push_files. File evidence on #178." >&2` so the falsification is visible in the routine UI. Fall back to MCP `push_files`.
    - **`git push` returns "remote branch already exists" or non-fast-forward**: distinguish two sub-cases:
-     - Sub-case A — *same `RUN_TS` retry* (same-session re-run after a partial failure): the branch you're pushing to is your own branch from the prior attempt. Retry with `git push --force-with-lease origin "$BRANCH"` (safe — `--force-with-lease` refuses if the remote has changed under you). If that succeeds, continue. If `--force-with-lease` itself refuses, treat as Sub-case B.
-     - Sub-case B — *unrelated collision* (extremely improbable since `RUN_TS` is second-resolution and the routine waits for completion before allowing another fire): write `runs/<ts>.json` `ok: false, phase: "commit_push", error: "branch_collision_unrelated_runid"`, fall back to MCP `push_files`. Annotate `push.fallback_reason: "branch_collision"`.
-   - **`gh pr create` failure** (auth, rate limit, API 4xx): the branch was already pushed in step 6, so the harvest data IS on GitHub — just not in a PR. Two options, in order:
-     - First, retry `gh pr create` once after 30 seconds.
-     - If retry fails, leave the branch as-is (don't tear it down), write `runs/<ts>.json` `push.transport: "git-feature-branch"`, `push.pr_url: null`, `push.pr_create_error: "<short error>"`. Emit `echo "WARN: branch pushed to $BRANCH but gh pr create failed: <err>. Operator must manually open the PR or merge the branch directly. Surface in final response." >&2`. Continue — the harvest data is durable on the feature branch; merge-via-manual-PR is the operator recovery path. **Do NOT fall back to MCP push_files** in this branch — the data is already on GitHub via `git push`; falling back would duplicate-commit the harvest content under a different transport.
+     - Sub-case A — *same `RUN_TS` retry* (same-LLM-conversation re-execution after a partial failure; NOT a fresh cron fire — those generate new RUN_TS values per step 3): the branch you're pushing to is your own branch from the prior attempt. Retry with `git push --force-with-lease origin "$BRANCH"` (safe — `--force-with-lease` refuses if the remote has changed under you). If that succeeds, continue. If `--force-with-lease` itself refuses, treat as Sub-case B. Note: a same-RUN_TS retry will overwrite the local `runs/<RUN_TS>.json` from the prior attempt — intentional, since this is a same-session retry under operator control.
+     - Sub-case B — *unrelated collision* (extremely improbable since `RUN_TS` is second-resolution and the routine waits for completion before allowing another fire): update runs JSON `ok: false, phase: "commit_push", error: "branch_collision_unrelated_runid"`, fall back to MCP `push_files`. Annotate `push.fallback_reason: "branch_collision"`.
+   - **`gh pr create` "command not found"** (gh CLI not installed in the sandbox): the branch was already pushed in step 8's first command, so the harvest data IS on GitHub. Update runs JSON `push.transport: "git-feature-branch-no-pr"`, `push.pr_create_error: "gh_cli_not_found"`. Surface in final response with the EXACT command the operator can run from their laptop: `gh pr create --repo $VAULT_OWNER/$VAULT_REPO --head $BRANCH --base main --title "harvest $(date -u +%Y-%m-%d) (routine)"`. Do NOT fall back to MCP push_files (data is already on GitHub).
+   - **`gh pr create` auth failure / API error** (auth, rate limit, API 4xx after `gh` is installed): the branch was already pushed, so the harvest IS on GitHub. Retry `gh pr create` once after 30 seconds. If retry fails, leave the branch as-is (don't tear it down), update runs JSON `push.transport: "git-feature-branch-no-pr"`, `push.pr_create_error: "<short error>"`. Emit `echo "WARN: branch pushed to $BRANCH but gh pr create failed: <err>. Operator must manually open the PR or merge the branch directly. Surface in final response with the exact command." >&2`. **Do NOT fall back to MCP push_files** — data is already on GitHub via `git push`; falling back would duplicate-commit under a different transport.
    - **MCP `push_files` fallback path** (triggered by the `git push` failure branches above): see the "MCP `push_files` fallback" section below. The fallback procedure is unchanged from the prior MCP-as-primary implementation (it's verbatim what shipped in #161 / v0.4.2, including the 401-retry-on-demand-pause flow on #166); slice 1 just demotes it from primary to fallback.
 
 10. **In your final user-facing response, surface the PR URL prominently** so the operator can review + merge. Template:
@@ -409,7 +416,7 @@ Triggered only by the error-matrix branches in step 9 that explicitly fall back.
 3. Apply the prior error matrix:
    - **Tool not found / discovery error**: write `runs/<ts>.json` `ok: false, phase: "commit_push", error: "github_mcp_push_files_unavailable"`. The git-push primary already failed; both transports are down. Emit `echo "FATAL: both git-push and github_mcp_push_files unavailable — run-status was written locally but cannot reach the vault." >&2` and exit non-zero.
    - **Transient error (5xx, timeout, rate limit)**: retry once after 30s. On 401-on-retry, jump to the 401 branch.
-   - **401 / token expired (per #166)**: persist deferred batches to `${TMPDIR:-/tmp}/harvest-<ts>.batches.json`, write the partial-run marker, attempt one single-file marker push, prompt the user with the exact text `*Routine paused — GitHub MCP token expired.* Pushed N of M batches successfully...`, pause for 5-min reply on `retry|go|resume`, fall through to FATAL exit if no reply.
+   - **401 / token expired (per #166)**: persist deferred batches to `${TMPDIR:-/tmp}/harvest-<ts>.batches.json`, write the partial-run marker, attempt one single-file marker push, prompt the user with the exact text `*Routine paused — GitHub MCP token expired.* Pushed N of M batches successfully...`, pause for 5-min reply on `retry|go|resume`, fall through to FATAL exit if no reply. **In the slice-1 fallback context**: N=0 if this 401 is the very FIRST MCP call (the `git push` primary failed; the first MCP batch then 401'd before any successful MCP commit). Substitute `Pushed N=0 of M batches via MCP fallback (git-push primary already failed)...` in the user-facing message so the operator isn't misled by an implied partial-MCP-progress state.
    - **Terminal non-401 4xx**: write the runs JSON `ok: false, phase: "commit_push", error: "<MCP error code + first 2000 chars>"`, attempt one single-file runs-only push, exit if that also fails.
 
 The 401-on-demand-pause flow (#166) is the load-bearing reason MCP `push_files` was the primary transport between #161 and #178. With `git push` as primary now, the 401 flow is reached only when BOTH transports fail in the same fire — much narrower failure surface.
@@ -418,7 +425,32 @@ The 401-on-demand-pause flow (#166) is the load-bearing reason MCP `push_files` 
 
 The historical concern (recorded for the MCP-primary era): `push_files`'s `updateRef` step's fast-forward enforcement varies across MCP server builds, which made cross-scheduler racing (routine + launchd both targeting `main`) potentially silently-clobbering.
 
-Under the new feature-branch primary: `git push` to a per-fire feature branch CANNOT race launchd's direct-push-to-main — they target different refs. The PR merge step (slice 2) re-introduces the race surface, but only at merge time (a single small commit, much smaller window than the harvest itself). **The "Choose ONE scheduler" discipline remains load-bearing** for the dedup-state-file race; the branch-collision-on-`main` race is now structurally eliminated for the harvest payload itself.
+Under the new feature-branch primary: the **harvest-payload commit-time** branch-collision-on-`main` race is structurally eliminated — `git push` to a per-fire feature branch CANNOT race launchd's direct-push-to-main since they target different refs. The PR-merge step (slice 2) re-introduces a race surface, but only at merge time and GitHub's merge code path handles the bounded conflict cleanly (fails closed on conflict rather than potentially-clobbering). **The "Choose ONE scheduler" discipline remains load-bearing** for the dedup-state-file race (`.harvest/<source>.json` files) and for the slice-1→slice-2 freshness regression noted below.
+
+### Slice-1→slice-2 freshness regression (per pr-challenger B1 on #180)
+
+The slice-1 stop-at-PR-open boundary creates a real data-availability regression in the slice-1→slice-2 window — not just operator burden. Document this as a known cost and prioritize slice 2 accordingly:
+
+1. **Cutoff-anchor walks stale `runs/*.json`**: the cutoff procedure (steps near line 139) walks `$VAULT/.harvest/runs/*.json` to find the newest `ok: true`. The vault's working tree on the operator's laptop tracks `origin/main`; if the prior fire's PR is unmerged, the laptop-side clone DOES NOT see that fire's runs file. The next fire's anchor lands on an OLDER `ok: true`, re-harvesting the same window. With 12h cadence + 24h operator-merge latency, every fire re-does the prior fire's work.
+
+2. **Dual-scheduler-detection becomes false-negative-by-construction**: the "Choose ONE scheduler" detection lists `runs/*.json` to spot launchd vs routine collisions. With routine-fire runs files on feature branches (not main), launchd activity that overlapped with a routine fire is invisible to the next fire's collision check.
+
+3. **Dedup state divergence**: `.harvest/<source>.json` dedup state files live in the working tree. If fire N+1 starts before fire N's PR merges, fire N+1's dedup state is built from main's stale state and won't see fire N's deduped items. Re-fetches happen; once both PRs merge in some order, the state file ends up in a forensically ambiguous condition.
+
+**Operational implication**: during the slice-1→slice-2 window, the operator MUST merge each harvest PR before the next fire (or accept the regression above). The routine's final user-facing message must surface this clearly so the operator can choose their cadence. Slice 2 of #178 (auto-merge + adversarial review integration) closes this regression by collapsing the window.
+
+### Preflight-abort marker vs feature-branch harvest (per pr-challenger B3 on #180)
+
+Mixed-transport scenario to watch: if fire N's harvest is on an unmerged feature branch and fire N+1's preflight aborts (writing a marker via MCP `push_files` to `main`), then:
+
+- Vault `main` shows fire N+1's `ok: false` preflight-abort marker as the newest runs file.
+- Fire N's harvest content (with its `ok: true` marker) is on a feature branch, invisible to main.
+- The cutoff anchor walks newest-first, skips the `ok: false`, lands on an older `ok: true` (fire N-1's, the most recent merged). The cutoff anchor's correctness is preserved, but the apparent "last harvest" timestamp on main is older than reality.
+
+This is acceptable for the slice-1→slice-2 window (preflight aborts should be rare; the watchdog still catches a STALE main correctly), but during a preflight-abort burst it could mislead anyone debugging. Two mitigations:
+
+- **Slice 1 (now)**: document the scenario here so debuggers don't waste time. Marker pushes stay on MCP `push_files` because a 1-file marker doesn't justify a branch+PR ceremony.
+- **Slice 2 (auto-merge)**: collapses the window — once auto-merge lands, harvest PRs merge within minutes and the mixed-transport hazard window narrows to those minutes.
 
 In your final response, summarize:
 - Which sources fired and what each produced.
