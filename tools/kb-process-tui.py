@@ -46,6 +46,8 @@ Invocation:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import datetime as dt
 import hashlib
 import os
 import re
@@ -183,8 +185,16 @@ def prompt(label: str, default: str = "") -> str:
 # --------------------------------------------------------------------------
 
 
-def render_candidate(memo_path: Path, fm: dict, body: str, idx: int, total: int) -> None:
-    """Clear screen and render one candidate."""
+def render_candidate(
+    memo_path: Path,
+    fm: dict,
+    body: str,
+    idx: int,
+    total: int,
+    prediction: dict | None = None,
+) -> None:
+    """Clear screen and render one candidate. If `prediction` is non-None, render
+    the **Recommendation** block above the action prompt (slice 2 of #183 / #187)."""
     sys.stdout.write(CLEAR)
 
     art_id = memo_path.stem
@@ -211,12 +221,316 @@ def render_candidate(memo_path: Path, fm: dict, body: str, idx: int, total: int)
     # Strip the diff section's leading boilerplate ("**Source memory objects**" etc.)
     # so the user sees the meaningful body fast.
     sys.stdout.write(f"{body.strip()}\n")
+
+    if prediction is not None:
+        # Color-coded by confidence.
+        conf = (prediction.get("confidence") or "?").lower()
+        conf_color = {"high": GREEN, "medium": YELLOW, "low": RED}.get(conf, GREY)
+        action_label = {
+            "a": "approve",
+            "r": "reject",
+            "m": "amend",
+            "?": "unknown",
+        }.get(prediction.get("action", "?"), "unknown")
+        scope_line = f"  scope: {prediction.get('scope', '')}" if prediction.get("scope") else ""
+        reason = (prediction.get("reasoning") or "").strip()
+        late_tag = (
+            f"  {YELLOW}[late-arrival, no pre-flight prediction available]{RESET}"
+            if prediction.get("late_arrival")
+            else ""
+        )
+        err_tag = (
+            f"  {RED}[predict error: {prediction.get('error')}]{RESET}"
+            if prediction.get("error")
+            else ""
+        )
+        sys.stdout.write(
+            f"\n{BOLD}{conf_color}━━━ Recommendation ({conf}) ━━━{RESET}\n"
+            f"  {BOLD}action:{RESET} {action_label} ({prediction.get('action', '?')})\n"
+            f"{scope_line}{('\n' if scope_line else '')}"
+            f"  {DIM}reasoning:{RESET} {reason}{late_tag}{err_tag}\n"
+        )
+
     sys.stdout.write(
         f"\n{DIM}─── {GREEN}(a){RESET}{DIM}pprove   {GREEN}(r){RESET}{DIM}eject   "
         f"{GREEN}(m){RESET}{DIM}amend   {GREEN}(s){RESET}{DIM}kip   "
         f"{GREEN}(c){RESET}{DIM}ommit-page   {GREEN}(q){RESET}{DIM}uit ───{RESET}\n"
     )
     sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# Prediction infrastructure (slice 2 of #183 / #187).
+#
+# Folded-in falsifier mitigations:
+# - F1 prompt-bias: PROMPT below is body-only. NO catalog/editorial-rules
+#   framing — the prediction signal is "fresh-eyes claude reading the
+#   candidate" not "claude predicting what catalog already encoded".
+# - F2 agreed semantics: action_agreed and scope_agreed tracked SEPARATELY
+#   in the TSV. Headline summary shows both.
+# - F3 TSV corruption: reasoning sanitized via `_tsv_safe` (replaces tabs
+#   with single space; literal `\n` for newlines; no other escaping —
+#   stays plain readable in spreadsheets).
+# --------------------------------------------------------------------------
+
+
+PREDICT_PROMPT_TEMPLATE = """You are predicting an action a human reviewer will take on a kb-process candidate memo.
+
+Candidate body (everything between the markers):
+<<<BEGIN_CANDIDATE>>>
+{body}
+<<<END_CANDIDATE>>>
+
+Output EXACTLY four lines in this format and nothing else. No preamble, no markdown:
+
+ACTION: <a|r|m>
+SCOPE: <if action is a or m AND kind is decision, the scope value (e.g. Vera, Atlas, Nexar); otherwise empty>
+CONFIDENCE: <high|medium|low>
+REASONING: <one short sentence — why this action>
+
+Action meanings:
+- a (approve): the candidate is a well-formed durable decision worth landing in kb/decisions.md as-is.
+- r (reject): the candidate is a duplicate of an existing entry, ephemeral / tactical, not formalized (idea/brainstorm), or wrong-layer (e.g. team-cadence content that doesn't belong in always-loaded KB).
+- m (amend): the candidate is mostly right but needs hand-editing before landing (incorrect scope, sensitive content to redact, wording cleanup).
+
+Be conservative on confidence: only "high" when both action and scope are clearly determined by the body alone.
+"""
+
+
+def _tsv_safe(s: str) -> str:
+    """Replace TSV-breaking characters (per F3 of #187). Tabs → single space;
+    newlines → literal `\\n`. Other chars pass through."""
+    if not s:
+        return ""
+    return s.replace("\t", " ").replace("\r\n", "\\n").replace("\n", "\\n")
+
+
+def predict_one(memo_path: Path, body: str, timeout_s: int = 30) -> dict:
+    """Shell out to `claude -p` for one candidate. Returns a dict with:
+        action: 'a'|'r'|'m'|'?'
+        scope: str
+        confidence: 'high'|'medium'|'low'|'?'
+        reasoning: str
+        error: str or None  (set when claude -p failed)
+    """
+    prompt_text = PREDICT_PROMPT_TEMPLATE.format(body=body.strip())
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", prompt_text],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except FileNotFoundError:
+        return {"action": "?", "scope": "", "confidence": "?", "reasoning": "", "error": "claude_cli_not_found"}
+    except subprocess.TimeoutExpired:
+        return {"action": "?", "scope": "", "confidence": "?", "reasoning": "", "error": f"timeout_{timeout_s}s"}
+    if proc.returncode != 0:
+        err = proc.stderr.strip()[:160] or f"rc={proc.returncode}"
+        return {"action": "?", "scope": "", "confidence": "?", "reasoning": "", "error": err}
+
+    out = proc.stdout
+    m_action = re.search(r"^\s*ACTION:\s*([armARM])", out, re.MULTILINE)
+    m_scope = re.search(r"^\s*SCOPE:\s*(.+?)$", out, re.MULTILINE)
+    m_conf = re.search(r"^\s*CONFIDENCE:\s*(high|medium|low)", out, re.IGNORECASE | re.MULTILINE)
+    m_reason = re.search(r"^\s*REASONING:\s*(.+?)$", out, re.MULTILINE)
+
+    if not m_action:
+        return {
+            "action": "?",
+            "scope": "",
+            "confidence": "?",
+            "reasoning": out.strip()[:200],
+            "error": "parse_action_missing",
+        }
+    return {
+        "action": m_action.group(1).lower(),
+        "scope": (m_scope.group(1).strip() if m_scope else "").strip(),
+        "confidence": (m_conf.group(1).lower() if m_conf else "?"),
+        "reasoning": (m_reason.group(1).strip() if m_reason else "").strip(),
+        "error": None,
+    }
+
+
+def claude_cli_probe() -> tuple[bool, str]:
+    """Pre-flight probe for `claude -p` availability (per C3 of #187). Returns
+    (ok, version_or_error)."""
+    try:
+        proc = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return False, "claude_cli_not_found_on_PATH"
+    except subprocess.TimeoutExpired:
+        return False, "version_probe_timeout"
+    if proc.returncode != 0:
+        return False, f"version_probe_rc={proc.returncode}: {proc.stderr.strip()[:120]}"
+    return True, proc.stdout.strip() or proc.stderr.strip() or "version_unknown"
+
+
+def pre_predict_all(memos: list[Path], max_workers: int = 5) -> dict[str, dict]:
+    """Pre-flight predictions for all candidates. Returns {art_id: prediction_dict}.
+
+    Falls back from parallel to serial if the parallel run produces >25% parse
+    errors (suggests rate-limit or auth contention per concern in falsifiers).
+    """
+    bodies: dict[str, tuple[Path, str]] = {}
+    for memo_path in memos:
+        try:
+            _, body = parse_memo_frontmatter(memo_path)
+        except Exception:
+            continue
+        bodies[memo_path.stem] = (memo_path, body)
+
+    sys.stdout.write(f"{DIM}Pre-predicting {len(bodies)} candidates (max {max_workers} parallel)…{RESET}\n")
+    sys.stdout.flush()
+
+    predictions: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(predict_one, mp, body): art_id
+            for art_id, (mp, body) in bodies.items()
+        }
+        done_count = 0
+        for fut in concurrent.futures.as_completed(futures):
+            art_id = futures[fut]
+            try:
+                predictions[art_id] = fut.result()
+            except Exception as exc:
+                predictions[art_id] = {
+                    "action": "?",
+                    "scope": "",
+                    "confidence": "?",
+                    "reasoning": "",
+                    "error": f"future_exc: {exc}",
+                }
+            done_count += 1
+            if done_count % 5 == 0 or done_count == len(bodies):
+                sys.stdout.write(f"{DIM}  predicted {done_count}/{len(bodies)}{RESET}\n")
+                sys.stdout.flush()
+
+    parse_errors = sum(
+        1 for p in predictions.values() if p.get("error", "").startswith("parse_")
+    )
+    parse_rate = parse_errors / max(1, len(predictions))
+    if parse_rate > 0.25 and max_workers > 1:
+        sys.stdout.write(
+            f"{YELLOW}Parse-error rate {parse_rate:.0%} (>25%) on parallel run — "
+            f"retrying serially…{RESET}\n"
+        )
+        # Re-run only the parse-failed ones serially.
+        for art_id, p in list(predictions.items()):
+            if p.get("error", "").startswith("parse_"):
+                mp, body = bodies[art_id]
+                predictions[art_id] = predict_one(mp, body)
+
+    return predictions
+
+
+# --------------------------------------------------------------------------
+# Accuracy log (TSV).
+# --------------------------------------------------------------------------
+
+
+ACCURACY_TSV_HEADER = (
+    "art_id\tpredicted_action\tpredicted_scope\tpredicted_confidence\t"
+    "predicted_reasoning\tuser_action\tuser_scope\taction_agreed\tscope_agreed\tnotes\n"
+)
+
+
+def accuracy_log_path(content_root: Path, run_ts: str) -> Path:
+    return content_root / ".harvest" / f"kb-tui-accuracy-{run_ts}.tsv"
+
+
+def init_accuracy_log(path: Path, claude_version: str, model_hint: str) -> None:
+    """Write TSV with metadata header rows (commented) + the actual column header."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"# kb-tui accuracy log (slice 2 of #183 / #187)\n")
+        f.write(f"# run_ts: {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+        f.write(f"# claude_version: {claude_version}\n")
+        f.write(f"# model_hint: {model_hint}\n")
+        f.write(ACCURACY_TSV_HEADER)
+
+
+def log_accuracy_row(
+    path: Path,
+    art_id: str,
+    prediction: dict | None,
+    user_action: str,
+    user_scope: str,
+    notes: str = "",
+) -> None:
+    pred = prediction or {}
+    p_action = pred.get("action", "")
+    p_scope = pred.get("scope", "")
+    p_conf = pred.get("confidence", "")
+    p_reason = _tsv_safe(pred.get("reasoning", ""))
+    action_agreed = "true" if p_action and p_action == user_action else "false"
+    scope_agreed = (
+        "true"
+        if (p_scope.strip().lower() == user_scope.strip().lower()) and (p_scope or user_scope)
+        else "false"
+    )
+    notes_safe = _tsv_safe(notes)
+    row = (
+        f"{art_id}\t{p_action}\t{p_scope}\t{p_conf}\t{p_reason}\t"
+        f"{user_action}\t{user_scope}\t{action_agreed}\t{scope_agreed}\t{notes_safe}\n"
+    )
+    with path.open("a", encoding="utf-8") as f:
+        f.write(row)
+
+
+def print_accuracy_summary(path: Path) -> None:
+    """Read TSV; print per-action-class + per-confidence agreement rates.
+    Suppress n<5 buckets (per C7 of #187 — statistically meaningless).
+    Mark 5<=n<10 with explicit sample-size warning."""
+    if not path.is_file():
+        return
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or line.startswith("art_id\t"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 10:
+                continue
+            rows.append(parts)
+    if not rows:
+        return
+
+    total = len(rows)
+    action_agreed = sum(1 for r in rows if r[7] == "true")
+    scope_agreed = sum(1 for r in rows if r[8] == "true")
+
+    sys.stdout.write(
+        f"\n{BOLD}━━━ Accuracy summary ({total} candidates) ━━━{RESET}\n"
+        f"  Overall action-agreement: {action_agreed}/{total} "
+        f"({100*action_agreed/total:.0f}%)\n"
+        f"  Overall scope-agreement:  {scope_agreed}/{total} "
+        f"({100*scope_agreed/total:.0f}%)\n"
+    )
+
+    def _bucket_stats(filter_fn, label: str) -> None:
+        bucket = [r for r in rows if filter_fn(r)]
+        n = len(bucket)
+        if n < 5:
+            sys.stdout.write(f"  {label}: n={n} (suppressed; insufficient sample)\n")
+            return
+        agreed = sum(1 for r in bucket if r[7] == "true")
+        warn = f" {YELLOW}(n<10, take with salt){RESET}" if n < 10 else ""
+        sys.stdout.write(f"  {label}: {agreed}/{n} ({100*agreed/n:.0f}%){warn}\n")
+
+    sys.stdout.write(f"\n{DIM}By predicted action:{RESET}\n")
+    for act, name in [("a", "approve"), ("r", "reject"), ("m", "amend")]:
+        _bucket_stats(lambda r, a=act: r[1] == a, f"  predicted={act} ({name})")
+    sys.stdout.write(f"\n{DIM}By confidence:{RESET}\n")
+    for conf in ("high", "medium", "low"):
+        _bucket_stats(lambda r, c=conf: r[3] == c, f"  confidence={conf}")
+    sys.stdout.write(f"\n{DIM}TSV at: {path}{RESET}\n")
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +658,13 @@ def main(argv: list[str]) -> int:
         help="Commit + push after every approved/rejected candidate (slow but safest). "
         "Default: commit only on `c` or at quit.",
     )
+    parser.add_argument(
+        "--predict",
+        action="store_true",
+        help="Slice 2 of #183 / #187: pre-flight LLM predictions for each candidate via "
+        "`claude -p`, render a Recommendation block before the action prompt, and log "
+        "(predicted, actual) pairs to <content_root>/.harvest/kb-tui-accuracy-<RUN_TS>.tsv.",
+    )
     args = parser.parse_args(argv[1:])
 
     cfg = load_config()
@@ -357,12 +678,38 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(f"{GREEN}No unprocessed candidates. Queue is clean.{RESET}\n")
         return 0
 
+    # --------- Slice 2 (#187): predict-mode pre-flight ---------
+    predictions: dict[str, dict] = {}
+    accuracy_log: Path | None = None
+    run_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    if args.predict:
+        ok, version = claude_cli_probe()
+        if not ok:
+            sys.stdout.write(
+                f"{RED}--predict requires `claude` on PATH and authenticated. "
+                f"Probe failed: {version}.{RESET}\n"
+                f"{DIM}Either install / re-auth claude, or run without --predict.{RESET}\n"
+            )
+            return 1
+        sys.stdout.write(f"{DIM}claude version probe: {version}{RESET}\n")
+        # Note: model is whatever `claude -p` defaults to. The TSV header records
+        # the version above; the actual model id can be queried later via
+        # `claude --version --json` if needed for reconciliation.
+        accuracy_log = accuracy_log_path(content_root, run_ts)
+        init_accuracy_log(accuracy_log, version, "claude -p (default model)")
+        predictions = pre_predict_all(memos, max_workers=5)
+        sys.stdout.write(
+            f"{GREEN}Pre-flight predictions complete.{RESET} "
+            f"{DIM}Accuracy log: {accuracy_log}{RESET}\n\n"
+        )
+
     sys.stdout.write(
         f"{BOLD}kb-process-tui{RESET} — walking {total} unprocessed candidates "
         f"in {DIM}{unprocessed}{RESET}\n"
         f"{DIM}Vault: {content_root}{RESET}\n"
         f"{DIM}Method: {method_root}{RESET}\n"
         f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend (s)kip (c)ommit-page (q)uit{RESET}\n"
+        f"{DIM}Predict mode: {'ON' if args.predict else 'off'}{RESET}\n"
         f"\nPress any key to begin.\n"
     )
     getch()
@@ -388,7 +735,21 @@ def main(argv: list[str]) -> int:
             idx += 1
             continue
 
-        render_candidate(memo_path, fm, body, idx + 1, total)
+        # Resolve prediction for this candidate (slice 2 / #187).
+        this_prediction = None
+        if args.predict:
+            this_prediction = predictions.get(memo_path.stem)
+            if this_prediction is None:
+                # Late-arrival: candidate showed up after pre-flight (e.g., kb-scan
+                # fired mid-walk). Per C6 of #187, mark explicitly and do an
+                # on-demand prediction so the operator isn't flying blind.
+                sys.stdout.write(f"{DIM}  on-demand predicting late-arrival {memo_path.stem}…{RESET}\n")
+                sys.stdout.flush()
+                this_prediction = predict_one(memo_path, body)
+                this_prediction["late_arrival"] = True
+                predictions[memo_path.stem] = this_prediction
+
+        render_candidate(memo_path, fm, body, idx + 1, total, prediction=this_prediction)
         key = getch()
         if key == "":
             # EOF on stdin (pr-challenger S5 on #185) — closed pipe or terminal hangup.
@@ -431,6 +792,8 @@ def main(argv: list[str]) -> int:
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied{RESET}: {out}\n")
                 actions_since_commit += 1
+                if accuracy_log:
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "a", scope or "")
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb: decision (via TUI, {art_id})")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
@@ -450,6 +813,8 @@ def main(argv: list[str]) -> int:
             if rc == 0:
                 sys.stdout.write(f"{YELLOW}✓ rejected{RESET}: {out}\n")
                 actions_since_commit += 1
+                if accuracy_log:
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "r", "", notes=reason)
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb-process: reject {art_id} (via TUI)")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
@@ -471,17 +836,20 @@ def main(argv: list[str]) -> int:
                 continue  # re-render same candidate
             # After editing, the user may have added Scope themselves. Prompt anyway
             # in case they didn't (Scope is editorial-required for decisions).
+            m_scope = ""
             if wants_scope:
                 memo_text = memo_path.read_text(encoding="utf-8")
                 if "**Scope:**" in memo_text:
                     # Operator already added Scope inline — don't double-prompt.
-                    pass
+                    # Try to recover the value for the accuracy log.
+                    m = re.search(r"\*\*Scope:\*\*\s*(.+?)$", memo_text, re.MULTILINE)
+                    m_scope = m.group(1).strip() if m else ""
                 else:
-                    scope = prompt("Scope (or empty to apply without)", default=last_scope)
-                    if scope:
-                        injected = inject_scope_into_memo(memo_path, scope)
+                    m_scope = prompt("Scope (or empty to apply without)", default=last_scope)
+                    if m_scope:
+                        injected = inject_scope_into_memo(memo_path, m_scope)
                         if injected:
-                            last_scope = scope
+                            last_scope = m_scope
                         else:
                             sys.stdout.write(
                                 f"{YELLOW}Scope inject failed (diff-block shape mismatch); applying without.{RESET}\n"
@@ -490,6 +858,8 @@ def main(argv: list[str]) -> int:
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied (after amend){RESET}: {out}\n")
                 actions_since_commit += 1
+                if accuracy_log:
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, notes="amended in $EDITOR")
             else:
                 sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
                 sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
@@ -499,6 +869,12 @@ def main(argv: list[str]) -> int:
 
         elif key == "s":
             sys.stdout.write(f"{DIM}skipped (memo stays in .unprocessed/){RESET}\n")
+            if accuracy_log:
+                # Log skip so the prediction's accuracy isn't silently dropped from the
+                # denominator. user_action="s" means "no decision yet"; action_agreed
+                # will be false unless predicted action was also '?' (which it never is
+                # from claude -p's output contract).
+                log_accuracy_row(accuracy_log, art_id, this_prediction, "s", "", notes="skipped")
             idx += 1
 
         elif key == "c":
@@ -560,6 +936,8 @@ def main(argv: list[str]) -> int:
                         if crc != 0:
                             quit_rc = 2
             sys.stdout.write(f"\n{BOLD}Goodbye.{RESET} Remaining unprocessed: {len(list_memos(content_root, 'unprocessed'))}\n")
+            if accuracy_log:
+                print_accuracy_summary(accuracy_log)
             return quit_rc
 
         elif key == "\x03":  # ctrl-c
@@ -595,6 +973,8 @@ def main(argv: list[str]) -> int:
                 final_rc = 2
     else:
         sys.stdout.write(f"\n{BOLD}{GREEN}Queue cleared.{RESET}\n")
+    if accuracy_log:
+        print_accuracy_summary(accuracy_log)
     return final_rc
 
 
