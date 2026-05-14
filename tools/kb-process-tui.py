@@ -757,7 +757,16 @@ Output the amended entry below — preserve the structure (## heading + bullets 
 
 def extract_diff_block_content(memo_text: str) -> str | None:
     """Return the content inside the ```diff ... ``` block with the `+ ` prefix
-    stripped from each line. Returns None if no diff block found or shape wrong."""
+    stripped from each line. Returns None if no diff block found or shape wrong.
+
+    Per pr-reviewer S1 on #190: the trailing `.strip()` normalizes leading/
+    trailing blank-marker lines OUT of the extracted content. This is
+    intentional — claude works better on un-padded content for the amend
+    prompt, and `kb-process.py apply` doesn't depend on padding either. Round-
+    trip preserves the *content* but not necessarily the *blank-line shape*
+    of the original diff block. If you ever need byte-exact round-tripping
+    (e.g., for a diff-display feature), drop the strip and trust the body
+    verbatim."""
     m = _DIFF_BLOCK_RE.search(memo_text)
     if not m:
         return None
@@ -779,7 +788,16 @@ def extract_diff_block_content(memo_text: str) -> str | None:
 
 def splice_amended_back(memo_text: str, amended: str) -> str | None:
     """Replace the ```diff ... ``` block's content with `+ `-prefixed amended
-    lines. Returns the new memo text, or None if no diff block was present."""
+    lines. Returns the new memo text, or None if no diff block was present.
+
+    Assumes EXACTLY ONE ` ```diff ` block per memo (kb-scan invariant). If the
+    invariant ever changes (e.g., kb-scan emits multiple amendment proposals
+    or ADR snippets in one memo), only the FIRST block is spliced — a future
+    scan format change should re-check this function.
+
+    Blank lines in the amended content are written back as bare `+` markers
+    (kb-scan default shape). Per pr-reviewer Nit 1 on #190: this normalizes
+    `""` and `+` to a single form on write-back."""
     m = _DIFF_BLOCK_RE.search(memo_text)
     if not m:
         return None
@@ -889,11 +907,14 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
         "applied_with_editor" — claude amend then $EDITOR, ready for apply
         "cancelled" — memo state rolled back; caller should NOT apply
         "failed" — couldn't complete amend (claude/parse error); memo restored
-      rounds: number of claude amend calls made (>=1 on success; the count
-        captures "rounds = re-instruct iterations + 1" so post-walk analysis
-        can see how many tries it took to land — per pr-challenger F1 on
-        #189, this is the load-bearing metric for "did the prediction track
-        the action through N transforms").
+      rounds: number of `claude -p` amend calls made (INCLUDING retries on
+        parse-failure, per pr-reviewer S3 on #190). A failed-then-retried
+        instruction counts as rounds=2 even though the operator's
+        re-instruct count was 1. The TSV `notes` also captures the final
+        instruction string, so post-walk analysis can disambiguate
+        "retried same instruction after claude error" from "operator
+        re-instructed with different text". Load-bearing for the F1
+        falsifier on #189 (prediction-vs-applied gap across transforms).
       final_instruction: the instruction that produced the applied/cancelled
         state — useful for the accuracy log's `notes` field.
 
@@ -954,10 +975,38 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
             continue
         elif key == "e":
             # Keep the amended state on disk; open $EDITOR for fine-tuning.
-            changed = amend_in_editor(memo_path)
-            if changed:
+            # Per pr-reviewer S2 on #190: distinguish three sub-outcomes from $EDITOR:
+            #   (1) editor saves new content (sha256 changed) → apply with editor
+            #   (2) editor exits cleanly without saving (rc=0, no change) → apply
+            #       claude's amend as-is
+            #   (3) editor aborts with rc!=0 (e.g. vim :cq) → operator intent =
+            #       "back out the amend entirely"; roll back to original + cancel
+            # Inline the subprocess so we can read rc + sha256 separately;
+            # amend_in_editor() conflates (2) and (3) by returning False for both.
+            editor_bin = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+            if not editor_bin:
+                for cand in ("nano", "vim", "vi"):
+                    if shutil.which(cand):
+                        editor_bin = cand
+                        break
+            if not editor_bin:
+                sys.stdout.write(f"{RED}No $EDITOR / $VISUAL and no nano/vim/vi found.{RESET}\n")
+                memo_path.write_text(original_memo_text, encoding="utf-8")
+                return ("cancelled", rounds, instruction)
+            before_hash = hashlib.sha256(memo_path.read_bytes()).digest()
+            editor_rc = subprocess.run(shlex.split(editor_bin) + [str(memo_path)]).returncode
+            after_hash = hashlib.sha256(memo_path.read_bytes()).digest()
+            if editor_rc != 0:
+                sys.stdout.write(
+                    f"{YELLOW}Editor exited with rc={editor_rc} — interpreting as abort; "
+                    f"rolling back memo to pre-amend state.{RESET}\n"
+                )
+                memo_path.write_text(original_memo_text, encoding="utf-8")
+                return ("cancelled", rounds, instruction)
+            if after_hash != before_hash:
+                sys.stdout.write(f"{GREEN}✓ amended in $EDITOR (on top of claude's amend); applying.{RESET}\n")
                 return ("applied_with_editor", rounds, instruction)
-            # If user didn't change anything in editor, treat as "apply amended as-is".
+            sys.stdout.write(f"{DIM}No further $EDITOR changes; applying claude's amend as-is.{RESET}\n")
             return ("applied", rounds, instruction)
         elif key == "c":
             memo_path.write_text(original_memo_text, encoding="utf-8")
@@ -966,6 +1015,7 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
             sys.stdout.write(f"{DIM}(unknown key: {key!r} — apply [a], re-instruct [r], editor [e], cancel [c]){RESET}\n")
             # Roll back to original (same as cancel) and re-prompt.
             memo_path.write_text(original_memo_text, encoding="utf-8")
+            continue  # nit 2 on #190 — explicit continue for readability
 
 
 def apply_memo(method_root: Path, art_id: str) -> tuple[int, str]:
@@ -1053,7 +1103,8 @@ def main(argv: list[str]) -> int:
         f"in {DIM}{unprocessed}{RESET}\n"
         f"{DIM}Vault: {content_root}{RESET}\n"
         f"{DIM}Method: {method_root}{RESET}\n"
-        f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend-via-NL (M)direct-$EDITOR (s)kip (c)ommit-page (q)uit{RESET}\n"
+        f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend-NL (M)amend-$EDITOR (s)kip (c)ommit-page (q)uit{RESET}\n"
+        f"{DIM}  Note: `m` falls back to direct $EDITOR if claude CLI is unavailable.{RESET}\n"
         f"{DIM}Predict mode: {'ON' if args.predict else 'off'}{RESET}\n"
         f"\nPress any key to begin.\n"
     )
@@ -1191,8 +1242,14 @@ def main(argv: list[str]) -> int:
                 )
                 sys.stdout.write(f"{DIM}Press any key to open $EDITOR.{RESET}\n")
                 getch()
-                status_legacy = "applied_with_editor" if amend_in_editor(memo_path) else "cancelled"
-                if status_legacy == "cancelled":
+                # pr-challenger B1 on #190 — must bind `status` on this path, not
+                # just `status_legacy`. Downstream (line ~1291) reads `status`; without
+                # this, the fallback path crashes with UnboundLocalError exactly when
+                # claude auth is expired and the operator falls back to $EDITOR — the
+                # scenario the fallback was added to handle gracefully.
+                if amend_in_editor(memo_path):
+                    status = "applied_with_editor"
+                else:
                     sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
                     getch()
                     continue
@@ -1244,6 +1301,14 @@ def main(argv: list[str]) -> int:
                     else:
                         notes = f"amended via NL (rounds={amend_rounds}): {amend_instr[:120]}"
                     log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes=notes)
+                if args.commit_each:
+                    # pr-challenger S6 on #190 — mirror a/r path so --commit-each
+                    # is honored on amend actions too.
+                    crc, cout = commit_page(method_root, content_root, f"kb: amend (via TUI, {art_id})")
+                    sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
+                    last_commit_rc = crc
+                    if crc == 0:
+                        actions_since_commit = 0
             else:
                 sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
                 sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
@@ -1255,6 +1320,12 @@ def main(argv: list[str]) -> int:
             # Legacy direct-$EDITOR amend (slice 1/2 behavior). Preserved per
             # #189 scope as an escape hatch for power users who want raw edits
             # without going through claude.
+            #
+            # pr-challenger Concern 4 on #190 — snapshot the memo before $EDITOR
+            # so a malformed save (broken diff fence, garbled frontmatter) that
+            # crashes apply_memo can roll back instead of leaving the memo
+            # corrupted in .unprocessed/.
+            m_original_text = memo_path.read_text(encoding="utf-8")
             changed = amend_in_editor(memo_path)
             if not changed:
                 sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
@@ -1278,8 +1349,17 @@ def main(argv: list[str]) -> int:
                 actions_since_commit += 1
                 if accuracy_log:
                     log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes="amended via direct $EDITOR (M key)")
+                if args.commit_each:
+                    # pr-challenger S6 on #190 — m/M paths previously didn't honor
+                    # --commit-each, silently letting actions accumulate. Mirror a/r.
+                    crc, cout = commit_page(method_root, content_root, f"kb: amend (via $EDITOR, {art_id})")
+                    sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
+                    last_commit_rc = crc
+                    if crc == 0:
+                        actions_since_commit = 0
             else:
-                sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
+                sys.stdout.write(f"{RED}✗ apply failed rc={rc} — rolling back memo to pre-$EDITOR state{RESET}:\n{out}\n")
+                memo_path.write_text(m_original_text, encoding="utf-8")
                 sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
                 getch()
                 continue
