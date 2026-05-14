@@ -178,10 +178,18 @@ def prompt_with_source(label: str, default: str = "") -> tuple[str, bool]:
 
     `slice 4 of #183 / #191`: needed by the Scope prompt to distinguish
     `typed` from `default-predicted` / `default-last` in the accuracy TSV.
-    Edge case: if the user types EXACTLY the default value by hand, this
-    function reports `used_default=False` (typed), which is the right
-    semantic — they deliberately keyed it in, even though the result is
-    identical to pressing Enter."""
+
+    Edge cases (per pr-challenger S3 on #192):
+    - If the user types EXACTLY the default value by hand, reports
+      `used_default=False` (typed) — they deliberately keyed it in, even
+      though the result is identical to pressing Enter.
+    - If the user types whitespace only (e.g., spaces), `line.strip()`
+      yields `""`, so reports `used_default=True`. Treated as if they
+      pressed Enter — whitespace-only on a Scope prompt is virtually
+      always a misfire, not a deliberate value, so collapsing to default
+      is the right semantic for the measurement use case here.
+    - On EOF (closed stdin / piped input exhausted): returns
+      `(default, True)`."""
     if default:
         sys.stdout.write(f"{label} [{default}]: ")
     else:
@@ -516,11 +524,16 @@ def scope_default_for_prompt(
     `scope_source` to log. If the operator types a value, the caller
     overrides the source to `SCOPE_SOURCE_TYPED`.
 
-    `slice 4 of #183 / #191`: under `--predict`, the prompt defaults to
-    the predicted scope (operator-gated Enter = accept prediction). When
-    prediction is absent, errored, or has empty scope, falls back to
-    `last_scope` (the previous behavior, preserved for non-predict walks
-    and edge cases)."""
+    `slice 4 of #183 / #191`: when a non-None, non-errored prediction with
+    a non-empty `scope` is supplied, default to the prediction (operator-
+    gated Enter = accept prediction). Otherwise fall back to `last_scope`.
+
+    The `--predict` CLI flag is NOT visible to this function (per pr-reviewer
+    S2 on #192). Whether `--predict` is on is enforced at the call site —
+    callers only pass a non-None `prediction` when `args.predict` is true.
+    If a future refactor passes a constructed prediction dict outside the
+    `--predict` flow, this function will default to it too; that's a
+    deliberate consequence of decoupling the default logic from the flag."""
     pred_scope = ""
     if prediction is not None and not prediction.get("error"):
         pred_scope = (prediction.get("scope") or "").strip()
@@ -633,9 +646,13 @@ def print_accuracy_summary(path: Path) -> None:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 12:
                 continue
-            # Backward-compat (acceptance #7 on #191): pad to 13 cols with
-            # 'unknown' for old TSVs that pre-date the scope_source column.
-            if len(parts) == 12:
+            # Backward-compat (acceptance #7 on #191): pad short rows to
+            # the current expected width with 'unknown' for old TSVs that
+            # pre-date the scope_source column. Per pr-challenger N2 on
+            # #192: tolerate any short width, not just len==12, so future
+            # columns don't IndexError reading slice-4-era TSVs.
+            expected_cols = len(ACCURACY_TSV_HEADER.rstrip("\n").split("\t"))
+            while len(parts) < expected_cols:
                 parts.append("unknown")
             rows.append(parts)
     if not rows:
@@ -653,16 +670,27 @@ def print_accuracy_summary(path: Path) -> None:
     action_agreed = sum(1 for r in acted if r[9] == "true")
     scope_agreed = sum(1 for r in decisions_acted if r[10] == "true")
 
-    # Per slice 4 of #183 / #191: split scope-agreement into deliberate vs
-    # accept-by-default-prediction so the operator can read the headline
-    # without being misled by "Enter on a wrong default" bias.
+    # Per slice 4 of #183 / #191: split scope-agreement by source so the
+    # operator can read the headline without being misled by "Enter on a
+    # wrong default" bias.
+    #
+    # pr-reviewer S1 + pr-challenger B1 on #192: buckets must sum to the
+    # headline `scope_agreed` total. Earlier draft only counted
+    # `typed/inherited-from-memo` and `default-predicted`; `default-last`
+    # and pre-slice-4 legacy (`unknown`) rows fell through and the breakdown
+    # silently undercounted.
+    deliberate_sources = (SCOPE_SOURCE_TYPED, SCOPE_SOURCE_INHERITED_FROM_MEMO)
     scope_agreed_deliberate = sum(
-        1
-        for r in decisions_acted
-        if r[10] == "true" and r[12] in (SCOPE_SOURCE_TYPED, SCOPE_SOURCE_INHERITED_FROM_MEMO)
+        1 for r in decisions_acted if r[10] == "true" and r[12] in deliberate_sources
     )
     scope_agreed_via_default_predicted = sum(
         1 for r in decisions_acted if r[10] == "true" and r[12] == SCOPE_SOURCE_DEFAULT_PREDICTED
+    )
+    scope_agreed_via_default_last = sum(
+        1 for r in decisions_acted if r[10] == "true" and r[12] == SCOPE_SOURCE_DEFAULT_LAST
+    )
+    scope_agreed_legacy_unknown = sum(
+        1 for r in decisions_acted if r[10] == "true" and r[12] == "unknown"
     )
 
     pct = lambda num, den: (f"{100*num/den:.0f}%" if den > 0 else "n/a")
@@ -678,7 +706,14 @@ def print_accuracy_summary(path: Path) -> None:
         f"({pct(scope_agreed, n_decisions)})\n"
         f"    of which deliberate (typed / inherited-from-memo): {scope_agreed_deliberate}\n"
         f"    of which accept-by-default-predicted: {scope_agreed_via_default_predicted}\n"
+        f"    of which accept-by-default-last (no prediction): {scope_agreed_via_default_last}\n"
     )
+    # Only show legacy line when there's anything to report — avoids noise
+    # on pristine post-slice-4 TSVs (the steady state).
+    if scope_agreed_legacy_unknown > 0:
+        sys.stdout.write(
+            f"    of which legacy pre-slice-4 (source unknown): {scope_agreed_legacy_unknown}\n"
+        )
 
     def _bucket_stats(rows_subset, filter_fn, label: str) -> None:
         bucket = [r for r in rows_subset if filter_fn(r)]
@@ -1184,6 +1219,13 @@ def main(argv: list[str]) -> int:
         f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend-NL (M)amend-$EDITOR (s)kip (c)ommit-page (q)uit{RESET}\n"
         f"{DIM}  Note: `m` falls back to direct $EDITOR if claude CLI is unavailable.{RESET}\n"
         f"{DIM}Predict mode: {'ON' if args.predict else 'off'}{RESET}\n"
+        + (
+            f"{DIM}  Scope prompt defaults to the predicted scope (Enter = accept prediction). "
+            f"Falls back to last_scope when prediction empty / errored.{RESET}\n"
+            if args.predict
+            else ""
+        )
+        +
         f"\nPress any key to begin.\n"
     )
     getch()
