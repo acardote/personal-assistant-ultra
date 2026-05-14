@@ -46,8 +46,10 @@ Invocation:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -73,23 +75,35 @@ def memo_dir(content_root: Path, bucket: str) -> Path:
 
 
 def list_memos(content_root: Path, bucket: str = "unprocessed") -> list[Path]:
+    """Sorted list of `art-*.md` memos in the bucket dir. Matching kb-process.py:93
+    pattern (per pr-reviewer S1.1 on #185 — `iterdir` would accept stray *.md files
+    like README.md that don't exist on the kb-process.py apply path)."""
     d = memo_dir(content_root, bucket)
     if not d.is_dir():
         return []
-    return sorted(p for p in d.iterdir() if p.suffix == ".md" and p.is_file())
+    return sorted(d.glob("art-*.md"))
 
 
 def parse_memo_frontmatter(memo_path: Path) -> tuple[dict, str]:
-    """Split on `---` delimiters and parse YAML frontmatter. Returns (fm, body)."""
+    """Split on `---` delimiters and parse YAML frontmatter. Returns (fm, body).
+
+    Matches kb-process.py:96 semantics (per pr-reviewer S1.2 + S1.3 on #185):
+    - Closing fence accepts `\\n---` followed by any line ending or EOF.
+    - Body has leading newlines stripped (lstrip("\\n")).
+    """
     text = memo_path.read_text(encoding="utf-8")
     if not text.startswith("---\n"):
         raise ValueError(f"{memo_path.name}: no frontmatter delimiter")
     rest = text[4:]
-    end = rest.find("\n---\n")
+    end = rest.find("\n---", 0)
     if end < 0:
         raise ValueError(f"{memo_path.name}: unterminated frontmatter")
     fm_text = rest[:end]
-    body = rest[end + 5 :]
+    # Skip past `\n---` plus the line-ending (newline or EOF).
+    after_fence = end + 4
+    if after_fence < len(rest) and rest[after_fence] == "\n":
+        after_fence += 1
+    body = rest[after_fence:].lstrip("\n")
     fm = yaml.safe_load(fm_text) or {}
     if not isinstance(fm, dict):
         raise ValueError(f"{memo_path.name}: frontmatter is not a mapping")
@@ -101,11 +115,14 @@ _KIND_TITLE_RE = re.compile(r"Candidate\s+(person|org|decision|glossary)\s*:", r
 
 def detect_memo_kind(fm: dict) -> str:
     """Return person / org / decision / glossary parsed from the title prefix
-    'Candidate <kind>: <referent>'. Returns empty string if title doesn't match
-    (caller renders it as '?' — kb-process.py apply will raise the actual error)."""
+    'Candidate <kind>: <referent>'. Raises ValueError on no-match — same shape
+    as kb-process.py's version (per pr-challenger S2 on #185, drift-prevention).
+    Caller is responsible for try/except + rendering '?' in the UI."""
     title = str(fm.get("title", ""))
     m = _KIND_TITLE_RE.match(title)
-    return m.group(1).lower() if m else ""
+    if not m:
+        raise ValueError(f"can't detect memo kind from title {title!r}")
+    return m.group(1).lower()
 
 
 def is_drift_candidate(fm: dict) -> bool:
@@ -132,7 +149,9 @@ CLEAR = "\x1b[2J\x1b[H"
 
 
 def getch() -> str:
-    """Read a single raw keystroke from stdin. Restores termios on any exit."""
+    """Read a single raw keystroke from stdin. Restores termios on any exit.
+    Returns '' on EOF (pr-challenger S5 on #185 — closed stdin would otherwise
+    infinite-loop). Caller treats '' as quit."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -170,7 +189,10 @@ def render_candidate(memo_path: Path, fm: dict, body: str, idx: int, total: int)
 
     art_id = memo_path.stem
     title = fm.get("title", "(no title)")
-    kind = detect_memo_kind(fm) or "?"
+    try:
+        kind = detect_memo_kind(fm)
+    except ValueError:
+        kind = "?"
     drift = is_drift_candidate(fm)
     drift_tag = f"{RED}[DRIFT]{RESET} " if drift else ""
 
@@ -211,11 +233,20 @@ def inject_scope_into_memo(memo_path: Path, scope: str) -> bool:
     diff's blank line that separates frontmatter-style bullets from the
     body paragraph.
 
-    Returns True on success, False if the diff block shape isn't matched.
+    Returns True on success, False if the diff block shape isn't matched
+    OR if a Scope line is already present (idempotency short-circuit per
+    pr-reviewer S2 on #185 — survives precondition relaxation in future
+    edits that might otherwise double-inject).
     """
     if not scope:
         return False
     text = memo_path.read_text(encoding="utf-8")
+    # Idempotency: if a Scope line is already present in the diff block,
+    # treat as success without re-injecting. Survives the case where the
+    # operator added Scope in $EDITOR (`m` path) AND then typed a scope
+    # at the prompt (pr-reviewer S3 on #185 — double-injection avoidance).
+    if re.search(r"^\+\s*-\s*\*\*Scope:\*\*", text, re.MULTILINE):
+        return True
     # The diff block looks like:
     #   ```diff
     #   + ## <heading>
@@ -228,7 +259,10 @@ def inject_scope_into_memo(memo_path: Path, scope: str) -> bool:
     #   + <body paragraph>
     #   ```
     # We want to insert `+ - **Scope:** <scope>` after the Source line
-    # and before the blank-line + body. Find the Source line:
+    # and before the blank-line + body. The precondition that the next
+    # line is `+ ` (a blank-marker line) is load-bearing for shape
+    # detection — don't relax without re-checking the idempotency guard
+    # above.
     lines = text.split("\n")
     out: list[str] = []
     injected = False
@@ -249,9 +283,16 @@ def inject_scope_into_memo(memo_path: Path, scope: str) -> bool:
 
 
 def amend_in_editor(memo_path: Path) -> bool:
-    """Open $EDITOR on the memo. Returns True if user saved (file mtime
-    changed), False if cancelled. No curses suspend dance — we're not
-    in a curses screen."""
+    """Open $EDITOR on the memo. Returns True if user saved (content hash
+    changed), False if cancelled. No curses suspend dance — we're not in
+    a curses screen.
+
+    Per pr-reviewer S5 + N5 on #185:
+    - `$EDITOR` is `shlex.split`'d to handle `EDITOR="code --wait"` shapes.
+    - Change detection uses SHA-256 of the file bytes, NOT mtime (mtime
+      has 1-second resolution on most FSes — vim `:wq` within the same
+      second after a single-char edit can leave mtime unchanged).
+    """
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
     if not editor:
         for candidate in ("nano", "vim", "vi"):
@@ -261,9 +302,10 @@ def amend_in_editor(memo_path: Path) -> bool:
     if not editor:
         sys.stdout.write(f"{RED}No $EDITOR / $VISUAL set and no nano/vim/vi found.{RESET}\n")
         return False
-    before = memo_path.stat().st_mtime
-    rc = subprocess.run([editor, str(memo_path)]).returncode
-    after = memo_path.stat().st_mtime
+    before = hashlib.sha256(memo_path.read_bytes()).digest()
+    cmd = shlex.split(editor) + [str(memo_path)]
+    rc = subprocess.run(cmd).returncode
+    after = hashlib.sha256(memo_path.read_bytes()).digest()
     if rc != 0:
         sys.stdout.write(f"{YELLOW}Editor exited with rc={rc}; not applying.{RESET}\n")
         return False
@@ -327,6 +369,7 @@ def main(argv: list[str]) -> int:
 
     last_scope = ""  # remembers the most-recently-used Scope value for fast re-use
     actions_since_commit = 0  # how many a/r we've done since the last commit
+    last_commit_rc = 0  # tracked for B3 — if non-zero, refuse further `c` until manual recovery
     idx = 0
 
     while idx < len(memos):
@@ -346,20 +389,44 @@ def main(argv: list[str]) -> int:
             continue
 
         render_candidate(memo_path, fm, body, idx + 1, total)
-        key = getch().lower()
+        key = getch()
+        if key == "":
+            # EOF on stdin (pr-challenger S5 on #185) — closed pipe or terminal hangup.
+            sys.stdout.write(f"\n{YELLOW}EOF on stdin. {actions_since_commit} actions uncommitted.{RESET}\n")
+            return 130
+        key = key.lower()
 
         art_id = memo_path.stem
 
+        # Scope is editorial-required for decision-kind only (rule #133).
+        # Person/org/glossary candidates don't need it; suppressing the prompt
+        # there saves a keystroke per N1 on #185.
+        try:
+            this_kind = detect_memo_kind(fm)
+        except ValueError:
+            this_kind = ""
+        wants_scope = this_kind == "decision"
+
         if key == "a":
-            scope = prompt("Scope", default=last_scope)
-            if scope:
-                inject_scope_into_memo(memo_path, scope)
-                last_scope = scope
-            else:
-                sys.stdout.write(
-                    f"{YELLOW}No Scope provided — applying without (lint won't enforce, "
-                    f"but editorial rule #133 wants one).{RESET}\n"
-                )
+            if wants_scope:
+                scope = prompt("Scope", default=last_scope)
+                if scope:
+                    injected = inject_scope_into_memo(memo_path, scope)
+                    if not injected:
+                        # B1 on #185 — silent-Scope-drop on parse-miss. Surface explicitly.
+                        sys.stdout.write(
+                            f"{RED}✗ Couldn't inject Scope into memo (diff-block shape didn't match). "
+                            f"Use `m` to edit manually, then apply.{RESET}\n"
+                        )
+                        sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                        getch()
+                        continue  # don't advance — let user amend
+                    last_scope = scope
+                else:
+                    sys.stdout.write(
+                        f"{YELLOW}No Scope provided — applying decision without one "
+                        f"(editorial rule #133 wants one; lint won't refuse but the entry will be substandard).{RESET}\n"
+                    )
             rc, out = apply_memo(method_root, art_id)
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied{RESET}: {out}\n")
@@ -367,7 +434,9 @@ def main(argv: list[str]) -> int:
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb: decision (via TUI, {art_id})")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
-                    actions_since_commit = 0
+                    last_commit_rc = crc
+                    if crc == 0:
+                        actions_since_commit = 0
             else:
                 sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
                 sys.stdout.write(f"{DIM}Press any key to continue (candidate stays in .unprocessed/).{RESET}\n")
@@ -384,7 +453,9 @@ def main(argv: list[str]) -> int:
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb-process: reject {art_id} (via TUI)")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
-                    actions_since_commit = 0
+                    last_commit_rc = crc
+                    if crc == 0:
+                        actions_since_commit = 0
             else:
                 sys.stdout.write(f"{RED}✗ reject failed rc={rc}{RESET}:\n{out}\n")
                 sys.stdout.write(f"{DIM}Press any key to continue.{RESET}\n")
@@ -399,16 +470,22 @@ def main(argv: list[str]) -> int:
                 getch()
                 continue  # re-render same candidate
             # After editing, the user may have added Scope themselves. Prompt anyway
-            # in case they didn't (Scope is editorial-required).
-            scope = prompt("Scope (skip if you added it in $EDITOR)", default=last_scope)
-            if scope and scope != last_scope:
-                inject_scope_into_memo(memo_path, scope)
-                last_scope = scope
-            elif scope:
-                # Re-inject same scope only if not already in the body
+            # in case they didn't (Scope is editorial-required for decisions).
+            if wants_scope:
                 memo_text = memo_path.read_text(encoding="utf-8")
-                if f"**Scope:** {scope}" not in memo_text:
-                    inject_scope_into_memo(memo_path, scope)
+                if "**Scope:**" in memo_text:
+                    # Operator already added Scope inline — don't double-prompt.
+                    pass
+                else:
+                    scope = prompt("Scope (or empty to apply without)", default=last_scope)
+                    if scope:
+                        injected = inject_scope_into_memo(memo_path, scope)
+                        if injected:
+                            last_scope = scope
+                        else:
+                            sys.stdout.write(
+                                f"{YELLOW}Scope inject failed (diff-block shape mismatch); applying without.{RESET}\n"
+                            )
             rc, out = apply_memo(method_root, art_id)
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied (after amend){RESET}: {out}\n")
@@ -427,6 +504,18 @@ def main(argv: list[str]) -> int:
         elif key == "c":
             if actions_since_commit == 0:
                 sys.stdout.write(f"{DIM}Nothing to commit since last commit.{RESET}\n")
+            elif last_commit_rc != 0:
+                # B3 on #185 — refuse to re-attempt after a non-zero commit. Operator must resolve.
+                sys.stdout.write(
+                    f"{RED}Refusing to commit: last commit returned rc={last_commit_rc} "
+                    f"(likely rebase conflict or lint refusal).{RESET}\n"
+                    f"{DIM}Operator action required:\n"
+                    f"  cd {content_root}\n"
+                    f"  git status\n"
+                    f"  git pull --rebase   # resolve any conflicts\n"
+                    f"  git push            # land the resolved state\n"
+                    f"Then run the TUI again to continue. last_commit_rc resets to 0 on next clean commit.{RESET}\n"
+                )
             else:
                 crc, cout = commit_page(
                     method_root,
@@ -434,31 +523,44 @@ def main(argv: list[str]) -> int:
                     f"kb: TUI walk batch ({actions_since_commit} actions, ending at {memos[idx-1].stem if idx > 0 else art_id})",
                 )
                 sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:300]}{RESET}\n")
+                last_commit_rc = crc
                 if crc == 0:
                     actions_since_commit = 0
             sys.stdout.write(f"{DIM}Press any key to continue walking.{RESET}\n")
             getch()
-            # Re-fetch memo list — apply / reject moved things around
+            # Re-fetch memo list — apply / reject moved things around.
+            # B2 on #185: reset idx to 0 against the shrunk list, otherwise the
+            # operator silently skips the candidates that shifted down by N.
             memos = list_memos(content_root, "unprocessed")
-            # Reset idx based on what we already saw — for simplicity, just continue
-            # from the current position; the file-not-found guard at loop top will
-            # skip moved files.
+            idx = 0
 
         elif key == "q":
+            quit_rc = 0
             if actions_since_commit > 0:
-                yn = prompt(
-                    f"You have {actions_since_commit} unc-committed actions. Commit before quit? (y/n)",
-                    default="y",
-                )
-                if yn.lower().startswith("y"):
-                    crc, cout = commit_page(
-                        method_root,
-                        content_root,
-                        f"kb: TUI walk final batch ({actions_since_commit} actions)",
+                if last_commit_rc != 0:
+                    sys.stdout.write(
+                        f"{RED}{actions_since_commit} actions uncommitted; last commit rc={last_commit_rc} "
+                        f"blocked further auto-commit.{RESET}\n"
+                        f"{DIM}Resolve manually (cd {content_root}; git status; pull --rebase; push). "
+                        f"Your applied/rejected actions are already in .processed/.rejected/ on disk.{RESET}\n"
                     )
-                    sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:300]}{RESET}\n")
+                    quit_rc = 2  # pr-reviewer S4 on #185 — surface failure to wrapper / $?
+                else:
+                    yn = prompt(
+                        f"You have {actions_since_commit} uncommitted actions. Commit before quit? (y/n)",
+                        default="y",
+                    )
+                    if yn.lower().startswith("y"):
+                        crc, cout = commit_page(
+                            method_root,
+                            content_root,
+                            f"kb: TUI walk final batch ({actions_since_commit} actions)",
+                        )
+                        sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:300]}{RESET}\n")
+                        if crc != 0:
+                            quit_rc = 2
             sys.stdout.write(f"\n{BOLD}Goodbye.{RESET} Remaining unprocessed: {len(list_memos(content_root, 'unprocessed'))}\n")
-            return 0
+            return quit_rc
 
         elif key == "\x03":  # ctrl-c
             sys.stdout.write(f"\n{YELLOW}Interrupted. {actions_since_commit} actions uncommitted.{RESET}\n")
@@ -470,19 +572,30 @@ def main(argv: list[str]) -> int:
             getch()
 
     # End of memos — auto-commit if anything pending.
+    final_rc = 0
     if actions_since_commit > 0:
-        sys.stdout.write(
-            f"\n{BOLD}End of queue.{RESET} Committing final batch ({actions_since_commit} actions)…\n"
-        )
-        crc, cout = commit_page(
-            method_root,
-            content_root,
-            f"kb: TUI walk final batch ({actions_since_commit} actions)",
-        )
-        sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:300]}{RESET}\n")
+        if last_commit_rc != 0:
+            sys.stdout.write(
+                f"\n{RED}End of queue, but last commit rc={last_commit_rc} blocked further auto-commit. "
+                f"{actions_since_commit} actions are on-disk but not pushed.{RESET}\n"
+                f"{DIM}Resolve manually: cd {content_root}; git status; git pull --rebase; git push.{RESET}\n"
+            )
+            final_rc = 2  # pr-reviewer S4 on #185 — non-zero exit on commit failure
+        else:
+            sys.stdout.write(
+                f"\n{BOLD}End of queue.{RESET} Committing final batch ({actions_since_commit} actions)…\n"
+            )
+            crc, cout = commit_page(
+                method_root,
+                content_root,
+                f"kb: TUI walk final batch ({actions_since_commit} actions)",
+            )
+            sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:300]}{RESET}\n")
+            if crc != 0:
+                final_rc = 2
     else:
         sys.stdout.write(f"\n{BOLD}{GREEN}Queue cleared.{RESET}\n")
-    return 0
+    return final_rc
 
 
 if __name__ == "__main__":
