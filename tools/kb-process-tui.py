@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import difflib
 import hashlib
 import os
 import re
@@ -713,6 +714,260 @@ def amend_in_editor(memo_path: Path) -> bool:
     return after != before
 
 
+# --------------------------------------------------------------------------
+# Natural-language amend flow (slice 3 of #183 / #189).
+#
+# The legacy direct-$EDITOR amend was framed backwards — the user wanted
+# "I instruct, claude edits", not "I edit". This section adds:
+#   - extract_diff_block_content / splice_amended_back: read + write the
+#     ` ```diff ` block from a memo, stripping/re-applying the `+ ` prefix.
+#   - amend_via_claude: shell out with a templated NL prompt + parse
+#     amended text between markers.
+#   - render_amend_preview: show amended text + unified diff vs current,
+#     color-coded.
+#   - run_amend_flow: full interaction loop (prompt → claude → preview →
+#     a/r/e/c). Returns one of "applied" / "applied_with_editor" /
+#     "cancelled" / "failed". Memo state is rolled back to the original
+#     on cancel.
+# --------------------------------------------------------------------------
+
+
+_DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)\n```", re.DOTALL)
+
+
+AMEND_PROMPT_TEMPLATE = """You are amending a kb-process candidate entry per a user instruction. Output ONLY the amended entry between the markers below — no preamble, no explanation, no surrounding markdown fences.
+
+User instruction:
+<<<BEGIN_INSTRUCTION>>>
+{instruction}
+<<<END_INSTRUCTION>>>
+
+Current entry (the raw entry — heading + bullets + body; do NOT include the `+ ` diff prefix in your output, that's applied separately):
+<<<BEGIN_ENTRY>>>
+{current_entry}
+<<<END_ENTRY>>>
+
+Output the amended entry below — preserve the structure (## heading + bullets + body). The amended entry must be a valid kb decision/person/org entry per the editorial rules.
+
+<<<BEGIN_AMENDED>>>
+[your amended entry here]
+<<<END_AMENDED>>>
+"""
+
+
+def extract_diff_block_content(memo_text: str) -> str | None:
+    """Return the content inside the ```diff ... ``` block with the `+ ` prefix
+    stripped from each line. Returns None if no diff block found or shape wrong."""
+    m = _DIFF_BLOCK_RE.search(memo_text)
+    if not m:
+        return None
+    diff_body = m.group(1)
+    lines = diff_body.split("\n")
+    stripped: list[str] = []
+    for line in lines:
+        if line.startswith("+ "):
+            stripped.append(line[2:])
+        elif line == "+":
+            stripped.append("")
+        elif line.strip() == "":
+            stripped.append("")
+        else:
+            # Unexpected shape (no `+ ` prefix) — bail.
+            return None
+    return "\n".join(stripped).strip()
+
+
+def splice_amended_back(memo_text: str, amended: str) -> str | None:
+    """Replace the ```diff ... ``` block's content with `+ `-prefixed amended
+    lines. Returns the new memo text, or None if no diff block was present."""
+    m = _DIFF_BLOCK_RE.search(memo_text)
+    if not m:
+        return None
+    # Re-prefix each line. Blank lines become `+` (matching kb-scan default shape).
+    new_lines: list[str] = []
+    for line in amended.split("\n"):
+        if line == "":
+            new_lines.append("+")
+        else:
+            new_lines.append(f"+ {line}")
+    new_diff_body = "\n".join(new_lines)
+    new_block = f"```diff\n{new_diff_body}\n```"
+    return memo_text[: m.start()] + new_block + memo_text[m.end():]
+
+
+def amend_via_claude(current_entry: str, instruction: str, timeout_s: int = 60) -> tuple[str | None, str | None]:
+    """Shell out to `claude -p` to amend the entry per instruction.
+    Returns (amended_text, error). On success, error is None.
+
+    Per pr-challenger F1-on-#188 stdin handling: subprocess.DEVNULL for stdin
+    to avoid trust-prompt hang."""
+    prompt_text = AMEND_PROMPT_TEMPLATE.format(
+        instruction=instruction.strip(),
+        current_entry=current_entry.strip(),
+    )
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", prompt_text],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except FileNotFoundError:
+        return None, "claude_cli_not_found"
+    except subprocess.TimeoutExpired:
+        return None, f"timeout_{timeout_s}s"
+    if proc.returncode != 0:
+        err = proc.stderr.strip()[:200] or f"rc={proc.returncode}"
+        return None, err
+    # Extract content between <<<BEGIN_AMENDED>>> ... <<<END_AMENDED>>>
+    m = re.search(
+        r"<<<BEGIN_AMENDED>>>\s*\n(.*?)\n\s*<<<END_AMENDED>>>",
+        proc.stdout,
+        re.DOTALL,
+    )
+    if not m:
+        return None, "parse_markers_missing"
+    amended = m.group(1).strip()
+    if not amended:
+        return None, "parse_amended_empty"
+    return amended, None
+
+
+def render_amend_preview(current_entry: str, amended_entry: str) -> None:
+    """Print amended-entry preview + unified diff vs current, color-coded.
+
+    Per pr-challenger Concern 5 on #189 — when >70% of lines change (i.e. it's
+    a rewrite rather than a small edit), the unified diff degenerates to
+    delete-all + add-all noise. In that case, suppress the unified diff and
+    show the amended entry verbatim with a "REWRITE — review carefully" header
+    so the operator's reading attention is on the actual content."""
+    sys.stdout.write(f"\n{BOLD}{CYAN}━━━ Proposed amendment ━━━{RESET}\n\n")
+    sys.stdout.write(f"{amended_entry}\n")
+
+    cur_lines = current_entry.splitlines()
+    amd_lines = amended_entry.splitlines()
+    sm = difflib.SequenceMatcher(None, cur_lines, amd_lines, autojunk=False)
+    similarity = sm.ratio()  # 0.0..1.0; 1.0 = identical
+    rewrite_threshold = 0.30  # below this = >70% turnover
+    if similarity < rewrite_threshold and (len(cur_lines) + len(amd_lines)) >= 6:
+        sys.stdout.write(
+            f"\n{YELLOW}━━ REWRITE detected (line similarity {similarity:.0%}) — "
+            f"unified diff suppressed; review the amended entry above directly ━━{RESET}\n"
+        )
+    else:
+        sys.stdout.write(f"\n{DIM}━━ diff vs current ━━{RESET}\n")
+        diff = difflib.unified_diff(
+            cur_lines,
+            amd_lines,
+            fromfile="current",
+            tofile="amended",
+            lineterm="",
+        )
+        for line in diff:
+            if line.startswith("+") and not line.startswith("+++"):
+                sys.stdout.write(f"{GREEN}{line}{RESET}\n")
+            elif line.startswith("-") and not line.startswith("---"):
+                sys.stdout.write(f"{RED}{line}{RESET}\n")
+            elif line.startswith("@@"):
+                sys.stdout.write(f"{CYAN}{line}{RESET}\n")
+            else:
+                sys.stdout.write(f"{DIM}{line}{RESET}\n")
+    sys.stdout.write(
+        f"\n{DIM}─── {GREEN}(a){RESET}{DIM}pply   {GREEN}(r){RESET}{DIM}e-instruct   "
+        f"{GREEN}(e){RESET}{DIM}dit in $EDITOR   {GREEN}(c){RESET}{DIM}ancel ───{RESET}\n"
+    )
+    sys.stdout.flush()
+
+
+def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
+    """Full amend-flow interaction loop.
+
+    Returns (status, rounds, final_instruction):
+      status:
+        "applied" — claude amend accepted, memo written, ready for apply
+        "applied_with_editor" — claude amend then $EDITOR, ready for apply
+        "cancelled" — memo state rolled back; caller should NOT apply
+        "failed" — couldn't complete amend (claude/parse error); memo restored
+      rounds: number of claude amend calls made (>=1 on success; the count
+        captures "rounds = re-instruct iterations + 1" so post-walk analysis
+        can see how many tries it took to land — per pr-challenger F1 on
+        #189, this is the load-bearing metric for "did the prediction track
+        the action through N transforms").
+      final_instruction: the instruction that produced the applied/cancelled
+        state — useful for the accuracy log's `notes` field.
+
+    Memo state is snapshotted at entry and restored on cancel/fail
+    (pr-challenger F2 on #189 — `c` MUST be a no-op on disk).
+    """
+    original_memo_text = memo_path.read_text(encoding="utf-8")
+    current_entry = extract_diff_block_content(original_memo_text)
+    if current_entry is None:
+        sys.stdout.write(f"{RED}Couldn't extract diff block from memo — falling back to direct $EDITOR.{RESET}\n")
+        return ("failed", 0, "")
+
+    last_instruction = ""
+    rounds = 0
+    while True:
+        instruction = prompt("Amend instruction", default=last_instruction)
+        if not instruction:
+            sys.stdout.write(f"{DIM}Empty instruction — cancelling.{RESET}\n")
+            memo_path.write_text(original_memo_text, encoding="utf-8")
+            return ("cancelled", rounds, last_instruction)
+        last_instruction = instruction
+        rounds += 1
+
+        sys.stdout.write(f"{DIM}Asking claude to amend (timeout 60s)…{RESET}\n")
+        sys.stdout.flush()
+        amended, err = amend_via_claude(current_entry, instruction)
+        if amended is None:
+            sys.stdout.write(f"{RED}Amend failed: {err}{RESET}\n")
+            sys.stdout.write(f"{DIM}Press any key — you can re-instruct or cancel from the prompt.{RESET}\n")
+            getch()
+            # Loop back to re-prompt (give the operator a chance to rephrase).
+            continue
+
+        new_memo_text = splice_amended_back(original_memo_text, amended)
+        if new_memo_text is None:
+            sys.stdout.write(f"{RED}Splice failed (diff block shape unexpected). Falling back to $EDITOR.{RESET}\n")
+            memo_path.write_text(original_memo_text, encoding="utf-8")
+            return ("failed", rounds, instruction)
+
+        # Stage the new memo state to disk so $EDITOR fallback opens on it.
+        memo_path.write_text(new_memo_text, encoding="utf-8")
+        render_amend_preview(current_entry, amended)
+        key = getch()
+        if key == "":
+            sys.stdout.write(f"\n{YELLOW}EOF — rolling back memo state.{RESET}\n")
+            memo_path.write_text(original_memo_text, encoding="utf-8")
+            return ("cancelled", rounds, instruction)
+        key = key.lower()
+
+        if key == "a":
+            return ("applied", rounds, instruction)
+        elif key == "r":
+            # Roll back to original before re-prompting (so next claude call sees
+            # the original entry, not the prior amend's output — that's the user's
+            # mental model: "try a different instruction on the SAME starting
+            # point", not "iteratively refine").
+            memo_path.write_text(original_memo_text, encoding="utf-8")
+            continue
+        elif key == "e":
+            # Keep the amended state on disk; open $EDITOR for fine-tuning.
+            changed = amend_in_editor(memo_path)
+            if changed:
+                return ("applied_with_editor", rounds, instruction)
+            # If user didn't change anything in editor, treat as "apply amended as-is".
+            return ("applied", rounds, instruction)
+        elif key == "c":
+            memo_path.write_text(original_memo_text, encoding="utf-8")
+            return ("cancelled", rounds, instruction)
+        else:
+            sys.stdout.write(f"{DIM}(unknown key: {key!r} — apply [a], re-instruct [r], editor [e], cancel [c]){RESET}\n")
+            # Roll back to original (same as cancel) and re-prompt.
+            memo_path.write_text(original_memo_text, encoding="utf-8")
+
+
 def apply_memo(method_root: Path, art_id: str) -> tuple[int, str]:
     """Shell out to kb-process.py apply. Returns (rc, combined-stderr-stdout)."""
     cmd = [str(method_root / "tools" / "kb-process.py"), "apply", art_id]
@@ -798,7 +1053,7 @@ def main(argv: list[str]) -> int:
         f"in {DIM}{unprocessed}{RESET}\n"
         f"{DIM}Vault: {content_root}{RESET}\n"
         f"{DIM}Method: {method_root}{RESET}\n"
-        f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend (s)kip (c)ommit-page (q)uit{RESET}\n"
+        f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend-via-NL (M)direct-$EDITOR (s)kip (c)ommit-page (q)uit{RESET}\n"
         f"{DIM}Predict mode: {'ON' if args.predict else 'off'}{RESET}\n"
         f"\nPress any key to begin.\n"
     )
@@ -845,7 +1100,11 @@ def main(argv: list[str]) -> int:
             # EOF on stdin (pr-challenger S5 on #185) — closed pipe or terminal hangup.
             sys.stdout.write(f"\n{YELLOW}EOF on stdin. {actions_since_commit} actions uncommitted.{RESET}\n")
             return 130
-        key = key.lower()
+        # Slice 3 of #183 / #189: don't lowercase before the switch — `m` and `M`
+        # are now distinct keys (lowercase = NL amend; uppercase = direct $EDITOR).
+        # For all OTHER keys (a/r/s/c/q), match case-insensitively below.
+        raw_key = key
+        key = key.lower() if key not in ("M",) else key
 
         art_id = memo_path.stem
 
@@ -922,19 +1181,42 @@ def main(argv: list[str]) -> int:
             idx += 1
 
         elif key == "m":
-            changed = amend_in_editor(memo_path)
-            if not changed:
-                sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
+            # Slice 3 of #183 / #189 — natural-language amend flow.
+            # claude amends per operator instruction; preview + a/r/e/c.
+            ok, _ = claude_cli_probe()
+            if not ok:
+                sys.stdout.write(
+                    f"{YELLOW}NL amend requires `claude` on PATH. Falling back to direct $EDITOR "
+                    f"(equivalent to the `M` key). Re-auth claude to use NL amend.{RESET}\n"
+                )
+                sys.stdout.write(f"{DIM}Press any key to open $EDITOR.{RESET}\n")
                 getch()
-                continue  # re-render same candidate
-            # After editing, the user may have added Scope themselves. Prompt anyway
-            # in case they didn't (Scope is editorial-required for decisions).
+                status_legacy = "applied_with_editor" if amend_in_editor(memo_path) else "cancelled"
+                if status_legacy == "cancelled":
+                    sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
+                    getch()
+                    continue
+                amend_rounds = 0
+                amend_instr = "fallback to direct $EDITOR (claude unavailable)"
+            else:
+                status, amend_rounds, amend_instr = run_amend_flow(memo_path)
+                if status == "cancelled":
+                    sys.stdout.write(f"{DIM}Amend cancelled — memo restored to pre-amend state.{RESET}\n")
+                    sys.stdout.write(f"{DIM}Press any key to re-render.{RESET}\n")
+                    getch()
+                    continue
+                if status == "failed":
+                    sys.stdout.write(f"{DIM}Press any key to re-render (memo restored).{RESET}\n")
+                    getch()
+                    continue
+            # status is "applied" or "applied_with_editor" — proceed to scope check + apply.
+            # After NL amend, the operator may have included Scope in the instruction OR
+            # claude may have preserved/added it. Check before prompting (avoid double-prompt
+            # for decisions where scope is already in the amended body).
             m_scope = ""
             if wants_scope:
                 memo_text = memo_path.read_text(encoding="utf-8")
                 if "**Scope:**" in memo_text:
-                    # Operator already added Scope inline — don't double-prompt.
-                    # Try to recover the value for the accuracy log.
                     m = re.search(r"\*\*Scope:\*\*\s*(.+?)$", memo_text, re.MULTILINE)
                     m_scope = m.group(1).strip() if m else ""
                 else:
@@ -952,7 +1234,50 @@ def main(argv: list[str]) -> int:
                 sys.stdout.write(f"{GREEN}✓ applied (after amend){RESET}: {out}\n")
                 actions_since_commit += 1
                 if accuracy_log:
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes="amended in $EDITOR")
+                    # pr-challenger F1 on #189 — track rounds + instruction in notes
+                    # so post-walk analysis can identify rows where the prediction was
+                    # for the pre-amend body but the action reflects an N-round amend.
+                    if status == "applied_with_editor":
+                        notes = f"amended via NL+$EDITOR (rounds={amend_rounds}): {amend_instr[:120]}"
+                    elif amend_rounds == 0:
+                        notes = "amended via direct $EDITOR (legacy fallback)"
+                    else:
+                        notes = f"amended via NL (rounds={amend_rounds}): {amend_instr[:120]}"
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes=notes)
+            else:
+                sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue
+            idx += 1
+
+        elif key == "M":
+            # Legacy direct-$EDITOR amend (slice 1/2 behavior). Preserved per
+            # #189 scope as an escape hatch for power users who want raw edits
+            # without going through claude.
+            changed = amend_in_editor(memo_path)
+            if not changed:
+                sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
+                getch()
+                continue
+            m_scope = ""
+            if wants_scope:
+                memo_text = memo_path.read_text(encoding="utf-8")
+                if "**Scope:**" in memo_text:
+                    m = re.search(r"\*\*Scope:\*\*\s*(.+?)$", memo_text, re.MULTILINE)
+                    m_scope = m.group(1).strip() if m else ""
+                else:
+                    m_scope = prompt("Scope (or empty to apply without)", default=last_scope)
+                    if m_scope:
+                        injected = inject_scope_into_memo(memo_path, m_scope)
+                        if injected:
+                            last_scope = m_scope
+            rc, out = apply_memo(method_root, art_id)
+            if rc == 0:
+                sys.stdout.write(f"{GREEN}✓ applied (after $EDITOR){RESET}: {out}\n")
+                actions_since_commit += 1
+                if accuracy_log:
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes="amended via direct $EDITOR (M key)")
             else:
                 sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
                 sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
