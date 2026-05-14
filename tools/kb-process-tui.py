@@ -244,10 +244,15 @@ def render_candidate(
             if prediction.get("error")
             else ""
         )
+        # B2 on #188 (pr-reviewer): f-strings can't carry a backslash in their
+        # expression part on Python <3.12 (PEP 701). The requires-python header
+        # declares >=3.10; bind the newline outside the f-string so 3.10/3.11
+        # parse cleanly.
+        scope_line_block = f"{scope_line}\n" if scope_line else ""
         sys.stdout.write(
             f"\n{BOLD}{conf_color}━━━ Recommendation ({conf}) ━━━{RESET}\n"
             f"  {BOLD}action:{RESET} {action_label} ({prediction.get('action', '?')})\n"
-            f"{scope_line}{('\n' if scope_line else '')}"
+            f"{scope_line_block}"
             f"  {DIM}reasoning:{RESET} {reason}{late_tag}{err_tag}\n"
         )
 
@@ -298,11 +303,20 @@ Be conservative on confidence: only "high" when both action and scope are clearl
 
 
 def _tsv_safe(s: str) -> str:
-    """Replace TSV-breaking characters (per F3 of #187). Tabs → single space;
-    newlines → literal `\\n`. Other chars pass through."""
+    """Replace TSV-breaking characters (per F3 of #187 + S5 of #188 pr-reviewer).
+    Tabs → single space; \\r\\n + \\n + bare \\r → literal `\\n`; NUL → stripped.
+    Other chars pass through.
+
+    Order matters: handle \\r\\n FIRST so we don't double-substitute \\n then \\r."""
     if not s:
         return ""
-    return s.replace("\t", " ").replace("\r\n", "\\n").replace("\n", "\\n")
+    return (
+        s.replace("\t", " ")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\x00", "")
+    )
 
 
 def predict_one(memo_path: Path, body: str, timeout_s: int = 30) -> dict:
@@ -436,8 +450,9 @@ def pre_predict_all(memos: list[Path], max_workers: int = 5) -> dict[str, dict]:
 
 
 ACCURACY_TSV_HEADER = (
-    "art_id\tpredicted_action\tpredicted_scope\tpredicted_confidence\t"
-    "predicted_reasoning\tuser_action\tuser_scope\taction_agreed\tscope_agreed\tnotes\n"
+    "art_id\tcandidate_kind\tpred_mode\tpredicted_action\tpredicted_scope\t"
+    "predicted_confidence\tpredicted_reasoning\tuser_action\tuser_scope\t"
+    "action_agreed\tscope_agreed\tnotes\n"
 )
 
 
@@ -446,10 +461,11 @@ def accuracy_log_path(content_root: Path, run_ts: str) -> Path:
 
 
 def init_accuracy_log(path: Path, claude_version: str, model_hint: str) -> None:
-    """Write TSV with metadata header rows (commented) + the actual column header."""
+    """Write TSV with metadata header rows (commented) + the actual column header.
+    Static text — no f-string interpolation needed (pr-reviewer N2 on #188)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        f.write(f"# kb-tui accuracy log (slice 2 of #183 / #187)\n")
+        f.write("# kb-tui accuracy log (slice 2 of #183 / #187)\n")
         f.write(f"# run_ts: {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
         f.write(f"# claude_version: {claude_version}\n")
         f.write(f"# model_hint: {model_hint}\n")
@@ -462,32 +478,64 @@ def log_accuracy_row(
     prediction: dict | None,
     user_action: str,
     user_scope: str,
+    candidate_kind: str = "",
     notes: str = "",
 ) -> None:
+    """Append one accuracy row. Per pr-reviewer S2 + S3 + S4 on #188:
+    - scope_agreed is only computed for decision-kind rows (other kinds have no
+      scope to agree about; empty-vs-empty isn't meaningful). For non-decision
+      rows, scope_agreed = "n/a".
+    - All free-text fields (scope + reasoning + notes + user_scope) go through
+      `_tsv_safe`.
+    - `pred_mode` carries pre-flight | on-demand | none so downstream analysis
+      can separate the cohorts."""
     pred = prediction or {}
     p_action = pred.get("action", "")
-    p_scope = pred.get("scope", "")
+    p_scope_raw = pred.get("scope", "") or ""
+    p_scope = _tsv_safe(p_scope_raw)
     p_conf = pred.get("confidence", "")
     p_reason = _tsv_safe(pred.get("reasoning", ""))
+    user_scope_safe = _tsv_safe(user_scope)
+    if prediction is None:
+        pred_mode = "none"
+    elif prediction.get("late_arrival"):
+        pred_mode = "on-demand"
+    else:
+        pred_mode = "pre-flight"
     action_agreed = "true" if p_action and p_action == user_action else "false"
-    scope_agreed = (
-        "true"
-        if (p_scope.strip().lower() == user_scope.strip().lower()) and (p_scope or user_scope)
-        else "false"
-    )
+    if candidate_kind == "decision":
+        scope_agreed = (
+            "true"
+            if p_scope_raw.strip().lower() == user_scope.strip().lower()
+            else "false"
+        )
+    else:
+        scope_agreed = "n/a"
     notes_safe = _tsv_safe(notes)
     row = (
-        f"{art_id}\t{p_action}\t{p_scope}\t{p_conf}\t{p_reason}\t"
-        f"{user_action}\t{user_scope}\t{action_agreed}\t{scope_agreed}\t{notes_safe}\n"
+        f"{art_id}\t{candidate_kind}\t{pred_mode}\t{p_action}\t{p_scope}\t"
+        f"{p_conf}\t{p_reason}\t{user_action}\t{user_scope_safe}\t"
+        f"{action_agreed}\t{scope_agreed}\t{notes_safe}\n"
     )
     with path.open("a", encoding="utf-8") as f:
         f.write(row)
 
 
 def print_accuracy_summary(path: Path) -> None:
-    """Read TSV; print per-action-class + per-confidence agreement rates.
-    Suppress n<5 buckets (per C7 of #187 — statistically meaningless).
-    Mark 5<=n<10 with explicit sample-size warning."""
+    """Read TSV; print accuracy stats over rows where the operator acted
+    (user_action in a/r/m). Skipped rows (user_action == 's') are reported
+    separately so they don't bias the headline action-agreement (pr-reviewer
+    S1 on #188 — predicted_action is never 's', so including skips would force
+    action_agreed=false on every skip and silently depress the headline).
+
+    Column positions (matching ACCURACY_TSV_HEADER):
+      0 art_id   1 candidate_kind   2 pred_mode   3 predicted_action
+      4 predicted_scope   5 predicted_confidence   6 predicted_reasoning
+      7 user_action   8 user_scope   9 action_agreed   10 scope_agreed   11 notes
+
+    Suppression: n<5 buckets show "(suppressed; insufficient sample)".
+    Warning: 5<=n<10 buckets show "(n<10, take with salt)".
+    Scope: only counted against decisions (other kinds carry scope_agreed='n/a')."""
     if not path.is_file():
         return
     rows = []
@@ -496,40 +544,53 @@ def print_accuracy_summary(path: Path) -> None:
             if line.startswith("#") or line.startswith("art_id\t"):
                 continue
             parts = line.rstrip("\n").split("\t")
-            if len(parts) < 10:
+            if len(parts) < 12:
                 continue
             rows.append(parts)
     if not rows:
         return
 
-    total = len(rows)
-    action_agreed = sum(1 for r in rows if r[7] == "true")
-    scope_agreed = sum(1 for r in rows if r[8] == "true")
+    acted = [r for r in rows if r[7] in ("a", "r", "m")]
+    skipped = [r for r in rows if r[7] == "s"]
+    decisions_acted = [r for r in acted if r[1] == "decision"]
 
+    n_total = len(rows)
+    n_acted = len(acted)
+    n_skipped = len(skipped)
+    n_decisions = len(decisions_acted)
+
+    action_agreed = sum(1 for r in acted if r[9] == "true")
+    scope_agreed = sum(1 for r in decisions_acted if r[10] == "true")
+
+    pct = lambda num, den: (f"{100*num/den:.0f}%" if den > 0 else "n/a")
     sys.stdout.write(
-        f"\n{BOLD}━━━ Accuracy summary ({total} candidates) ━━━{RESET}\n"
-        f"  Overall action-agreement: {action_agreed}/{total} "
-        f"({100*action_agreed/total:.0f}%)\n"
-        f"  Overall scope-agreement:  {scope_agreed}/{total} "
-        f"({100*scope_agreed/total:.0f}%)\n"
+        f"\n{BOLD}━━━ Accuracy summary ━━━{RESET}\n"
+        f"  Total candidates seen: {n_total}\n"
+        f"  Acted (a/r/m):         {n_acted}\n"
+        f"  Skipped (s):           {n_skipped}\n"
+        f"  Decision-kind acted:   {n_decisions}\n"
+        f"\n"
+        f"  Action-agreement (acted only): {action_agreed}/{n_acted} ({pct(action_agreed, n_acted)})\n"
+        f"  Scope-agreement (decisions only): {scope_agreed}/{n_decisions} "
+        f"({pct(scope_agreed, n_decisions)})\n"
     )
 
-    def _bucket_stats(filter_fn, label: str) -> None:
-        bucket = [r for r in rows if filter_fn(r)]
+    def _bucket_stats(rows_subset, filter_fn, label: str) -> None:
+        bucket = [r for r in rows_subset if filter_fn(r)]
         n = len(bucket)
         if n < 5:
             sys.stdout.write(f"  {label}: n={n} (suppressed; insufficient sample)\n")
             return
-        agreed = sum(1 for r in bucket if r[7] == "true")
+        agreed = sum(1 for r in bucket if r[9] == "true")
         warn = f" {YELLOW}(n<10, take with salt){RESET}" if n < 10 else ""
         sys.stdout.write(f"  {label}: {agreed}/{n} ({100*agreed/n:.0f}%){warn}\n")
 
-    sys.stdout.write(f"\n{DIM}By predicted action:{RESET}\n")
+    sys.stdout.write(f"\n{DIM}By predicted action (acted only):{RESET}\n")
     for act, name in [("a", "approve"), ("r", "reject"), ("m", "amend")]:
-        _bucket_stats(lambda r, a=act: r[1] == a, f"  predicted={act} ({name})")
-    sys.stdout.write(f"\n{DIM}By confidence:{RESET}\n")
+        _bucket_stats(acted, lambda r, a=act: r[3] == a, f"  predicted={act} ({name})")
+    sys.stdout.write(f"\n{DIM}By confidence (acted only):{RESET}\n")
     for conf in ("high", "medium", "low"):
-        _bucket_stats(lambda r, c=conf: r[3] == c, f"  confidence={conf}")
+        _bucket_stats(acted, lambda r, c=conf: r[5] == c, f"  confidence={conf}")
     sys.stdout.write(f"\n{DIM}TSV at: {path}{RESET}\n")
 
 
@@ -688,7 +749,10 @@ def main(argv: list[str]) -> int:
             sys.stdout.write(
                 f"{RED}--predict requires `claude` on PATH and authenticated. "
                 f"Probe failed: {version}.{RESET}\n"
-                f"{DIM}Either install / re-auth claude, or run without --predict.{RESET}\n"
+                f"{DIM}Concrete recovery (per pr-reviewer S7 on #188):\n"
+                f"  • `which claude` to verify it's on PATH (Claude Code installs to ~/.claude/local/claude or /usr/local/bin/claude depending on installer)\n"
+                f"  • `claude /login` (or your CLI's equivalent) to re-authenticate\n"
+                f"  • Run without --predict if you just want the v1 manual walk\n{RESET}"
             )
             return 1
         sys.stdout.write(f"{DIM}claude version probe: {version}{RESET}\n")
@@ -769,6 +833,9 @@ def main(argv: list[str]) -> int:
         wants_scope = this_kind == "decision"
 
         if key == "a":
+            scope = ""  # B1 on #188 (pr-reviewer) — initialize unconditionally so the
+            # downstream accuracy_log row build (line ~803) doesn't UnboundLocalError on
+            # person/org/glossary candidates where `wants_scope == False`.
             if wants_scope:
                 scope = prompt("Scope", default=last_scope)
                 if scope:
@@ -793,7 +860,7 @@ def main(argv: list[str]) -> int:
                 sys.stdout.write(f"{GREEN}✓ applied{RESET}: {out}\n")
                 actions_since_commit += 1
                 if accuracy_log:
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "a", scope or "")
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "a", scope or "", candidate_kind=this_kind)
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb: decision (via TUI, {art_id})")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
@@ -814,7 +881,7 @@ def main(argv: list[str]) -> int:
                 sys.stdout.write(f"{YELLOW}✓ rejected{RESET}: {out}\n")
                 actions_since_commit += 1
                 if accuracy_log:
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "r", "", notes=reason)
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "r", "", candidate_kind=this_kind, notes=reason)
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb-process: reject {art_id} (via TUI)")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
@@ -859,7 +926,7 @@ def main(argv: list[str]) -> int:
                 sys.stdout.write(f"{GREEN}✓ applied (after amend){RESET}: {out}\n")
                 actions_since_commit += 1
                 if accuracy_log:
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, notes="amended in $EDITOR")
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes="amended in $EDITOR")
             else:
                 sys.stdout.write(f"{RED}✗ apply failed rc={rc}{RESET}:\n{out}\n")
                 sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
@@ -874,7 +941,7 @@ def main(argv: list[str]) -> int:
                 # denominator. user_action="s" means "no decision yet"; action_agreed
                 # will be false unless predicted action was also '?' (which it never is
                 # from claude -p's output contract).
-                log_accuracy_row(accuracy_log, art_id, this_prediction, "s", "", notes="skipped")
+                log_accuracy_row(accuracy_log, art_id, this_prediction, "s", "", candidate_kind=this_kind, notes="skipped")
             idx += 1
 
         elif key == "c":
