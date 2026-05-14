@@ -168,6 +168,28 @@ def getch() -> str:
 def prompt(label: str, default: str = "") -> str:
     """Cooked-mode line input. The raw-mode getch loop yields to readline-
     shaped editing here so the user can backspace / arrow-edit normally."""
+    value, _ = prompt_with_source(label, default)
+    return value
+
+
+def prompt_with_source(label: str, default: str = "") -> tuple[str, bool]:
+    """Same as `prompt` but also returns `used_default`: True if the user
+    accepted the default (empty input or EOF), False if they typed a value.
+
+    `slice 4 of #183 / #191`: needed by the Scope prompt to distinguish
+    `typed` from `default-predicted` / `default-last` in the accuracy TSV.
+
+    Edge cases (per pr-challenger S3 on #192):
+    - If the user types EXACTLY the default value by hand, reports
+      `used_default=False` (typed) — they deliberately keyed it in, even
+      though the result is identical to pressing Enter.
+    - If the user types whitespace only (e.g., spaces), `line.strip()`
+      yields `""`, so reports `used_default=True`. Treated as if they
+      pressed Enter — whitespace-only on a Scope prompt is virtually
+      always a misfire, not a deliberate value, so collapsing to default
+      is the right semantic for the measurement use case here.
+    - On EOF (closed stdin / piped input exhausted): returns
+      `(default, True)`."""
     if default:
         sys.stdout.write(f"{label} [{default}]: ")
     else:
@@ -176,9 +198,11 @@ def prompt(label: str, default: str = "") -> str:
     try:
         line = input("")
     except EOFError:
-        return default
+        return default, True
     line = line.rstrip("\n").strip()
-    return line if line else default
+    if line:
+        return line, False
+    return default, True
 
 
 # --------------------------------------------------------------------------
@@ -476,8 +500,46 @@ def pre_predict_all(memos: list[Path], max_workers: int = 5) -> dict[str, dict]:
 ACCURACY_TSV_HEADER = (
     "art_id\tcandidate_kind\tpred_mode\tpredicted_action\tpredicted_scope\t"
     "predicted_confidence\tpredicted_reasoning\tuser_action\tuser_scope\t"
-    "action_agreed\tscope_agreed\tnotes\n"
+    "action_agreed\tscope_agreed\tnotes\tscope_source\n"
 )
+
+
+# Valid values for the scope_source TSV column (slice 4 of #183 / #191).
+SCOPE_SOURCE_TYPED = "typed"
+SCOPE_SOURCE_DEFAULT_PREDICTED = "default-predicted"
+SCOPE_SOURCE_DEFAULT_LAST = "default-last"
+SCOPE_SOURCE_INHERITED_FROM_MEMO = "inherited-from-memo"
+SCOPE_SOURCE_NA = "n/a"  # non-decision rows, skipped rows, rejects
+
+
+def scope_default_for_prompt(
+    prediction: dict | None,
+    last_scope: str,
+) -> tuple[str, str]:
+    """Compute the Scope-prompt default value + the source it came from.
+
+    Returns `(default_value, source_hint)` where source_hint is one of
+    `SCOPE_SOURCE_DEFAULT_PREDICTED` or `SCOPE_SOURCE_DEFAULT_LAST`. If the
+    operator accepts the default (presses Enter), `source_hint` is the
+    `scope_source` to log. If the operator types a value, the caller
+    overrides the source to `SCOPE_SOURCE_TYPED`.
+
+    `slice 4 of #183 / #191`: when a non-None, non-errored prediction with
+    a non-empty `scope` is supplied, default to the prediction (operator-
+    gated Enter = accept prediction). Otherwise fall back to `last_scope`.
+
+    The `--predict` CLI flag is NOT visible to this function (per pr-reviewer
+    S2 on #192). Whether `--predict` is on is enforced at the call site —
+    callers only pass a non-None `prediction` when `args.predict` is true.
+    If a future refactor passes a constructed prediction dict outside the
+    `--predict` flow, this function will default to it too; that's a
+    deliberate consequence of decoupling the default logic from the flag."""
+    pred_scope = ""
+    if prediction is not None and not prediction.get("error"):
+        pred_scope = (prediction.get("scope") or "").strip()
+    if pred_scope:
+        return pred_scope, SCOPE_SOURCE_DEFAULT_PREDICTED
+    return last_scope, SCOPE_SOURCE_DEFAULT_LAST
 
 
 def accuracy_log_path(content_root: Path, run_ts: str) -> Path:
@@ -507,6 +569,7 @@ def log_accuracy_row(
     user_scope: str,
     candidate_kind: str = "",
     notes: str = "",
+    scope_source: str = SCOPE_SOURCE_NA,
 ) -> None:
     """Append one accuracy row. Per pr-reviewer S2 + S3 + S4 on #188:
     - scope_agreed is only computed for decision-kind rows (other kinds have no
@@ -515,7 +578,14 @@ def log_accuracy_row(
     - All free-text fields (scope + reasoning + notes + user_scope) go through
       `_tsv_safe`.
     - `pred_mode` carries pre-flight | on-demand | none so downstream analysis
-      can separate the cohorts."""
+      can separate the cohorts.
+
+    Per slice 4 of #183 / #191:
+    - `scope_source` provenance for the user-supplied scope:
+      `typed` | `default-predicted` | `default-last` | `inherited-from-memo` |
+      `n/a` (non-decision rows, rejects, skips). Distinguishes deliberate
+      operator input from accept-by-Enter, which slice 2's `scope_agreed`
+      column couldn't tell apart."""
     pred = prediction or {}
     p_action = pred.get("action", "")
     p_scope_raw = pred.get("scope", "") or ""
@@ -539,10 +609,11 @@ def log_accuracy_row(
     else:
         scope_agreed = "n/a"
     notes_safe = _tsv_safe(notes)
+    scope_source_safe = _tsv_safe(scope_source) if scope_source else SCOPE_SOURCE_NA
     row = (
         f"{art_id}\t{candidate_kind}\t{pred_mode}\t{p_action}\t{p_scope}\t"
         f"{p_conf}\t{p_reason}\t{user_action}\t{user_scope_safe}\t"
-        f"{action_agreed}\t{scope_agreed}\t{notes_safe}\n"
+        f"{action_agreed}\t{scope_agreed}\t{notes_safe}\t{scope_source_safe}\n"
     )
     with path.open("a", encoding="utf-8") as f:
         f.write(row)
@@ -559,6 +630,8 @@ def print_accuracy_summary(path: Path) -> None:
       0 art_id   1 candidate_kind   2 pred_mode   3 predicted_action
       4 predicted_scope   5 predicted_confidence   6 predicted_reasoning
       7 user_action   8 user_scope   9 action_agreed   10 scope_agreed   11 notes
+      12 scope_source  (added slice 4 of #183 / #191; rows from older TSVs
+                        without this column degrade to scope_source='unknown')
 
     Suppression: n<5 buckets show "(suppressed; insufficient sample)".
     Warning: 5<=n<10 buckets show "(n<10, take with salt)".
@@ -573,6 +646,14 @@ def print_accuracy_summary(path: Path) -> None:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 12:
                 continue
+            # Backward-compat (acceptance #7 on #191): pad short rows to
+            # the current expected width with 'unknown' for old TSVs that
+            # pre-date the scope_source column. Per pr-challenger N2 on
+            # #192: tolerate any short width, not just len==12, so future
+            # columns don't IndexError reading slice-4-era TSVs.
+            expected_cols = len(ACCURACY_TSV_HEADER.rstrip("\n").split("\t"))
+            while len(parts) < expected_cols:
+                parts.append("unknown")
             rows.append(parts)
     if not rows:
         return
@@ -589,6 +670,29 @@ def print_accuracy_summary(path: Path) -> None:
     action_agreed = sum(1 for r in acted if r[9] == "true")
     scope_agreed = sum(1 for r in decisions_acted if r[10] == "true")
 
+    # Per slice 4 of #183 / #191: split scope-agreement by source so the
+    # operator can read the headline without being misled by "Enter on a
+    # wrong default" bias.
+    #
+    # pr-reviewer S1 + pr-challenger B1 on #192: buckets must sum to the
+    # headline `scope_agreed` total. Earlier draft only counted
+    # `typed/inherited-from-memo` and `default-predicted`; `default-last`
+    # and pre-slice-4 legacy (`unknown`) rows fell through and the breakdown
+    # silently undercounted.
+    deliberate_sources = (SCOPE_SOURCE_TYPED, SCOPE_SOURCE_INHERITED_FROM_MEMO)
+    scope_agreed_deliberate = sum(
+        1 for r in decisions_acted if r[10] == "true" and r[12] in deliberate_sources
+    )
+    scope_agreed_via_default_predicted = sum(
+        1 for r in decisions_acted if r[10] == "true" and r[12] == SCOPE_SOURCE_DEFAULT_PREDICTED
+    )
+    scope_agreed_via_default_last = sum(
+        1 for r in decisions_acted if r[10] == "true" and r[12] == SCOPE_SOURCE_DEFAULT_LAST
+    )
+    scope_agreed_legacy_unknown = sum(
+        1 for r in decisions_acted if r[10] == "true" and r[12] == "unknown"
+    )
+
     pct = lambda num, den: (f"{100*num/den:.0f}%" if den > 0 else "n/a")
     sys.stdout.write(
         f"\n{BOLD}━━━ Accuracy summary ━━━{RESET}\n"
@@ -600,7 +704,16 @@ def print_accuracy_summary(path: Path) -> None:
         f"  Action-agreement (acted only): {action_agreed}/{n_acted} ({pct(action_agreed, n_acted)})\n"
         f"  Scope-agreement (decisions only): {scope_agreed}/{n_decisions} "
         f"({pct(scope_agreed, n_decisions)})\n"
+        f"    of which deliberate (typed / inherited-from-memo): {scope_agreed_deliberate}\n"
+        f"    of which accept-by-default-predicted: {scope_agreed_via_default_predicted}\n"
+        f"    of which accept-by-default-last (no prediction): {scope_agreed_via_default_last}\n"
     )
+    # Only show legacy line when there's anything to report — avoids noise
+    # on pristine post-slice-4 TSVs (the steady state).
+    if scope_agreed_legacy_unknown > 0:
+        sys.stdout.write(
+            f"    of which legacy pre-slice-4 (source unknown): {scope_agreed_legacy_unknown}\n"
+        )
 
     def _bucket_stats(rows_subset, filter_fn, label: str) -> None:
         bucket = [r for r in rows_subset if filter_fn(r)]
@@ -1106,6 +1219,13 @@ def main(argv: list[str]) -> int:
         f"{DIM}Per-candidate keys: (a)pprove (r)eject (m)amend-NL (M)amend-$EDITOR (s)kip (c)ommit-page (q)uit{RESET}\n"
         f"{DIM}  Note: `m` falls back to direct $EDITOR if claude CLI is unavailable.{RESET}\n"
         f"{DIM}Predict mode: {'ON' if args.predict else 'off'}{RESET}\n"
+        + (
+            f"{DIM}  Scope prompt defaults to the predicted scope (Enter = accept prediction). "
+            f"Falls back to last_scope when prediction empty / errored.{RESET}\n"
+            if args.predict
+            else ""
+        )
+        +
         f"\nPress any key to begin.\n"
     )
     getch()
@@ -1170,10 +1290,16 @@ def main(argv: list[str]) -> int:
 
         if key == "a":
             scope = ""  # B1 on #188 (pr-reviewer) — initialize unconditionally so the
-            # downstream accuracy_log row build (line ~803) doesn't UnboundLocalError on
+            # downstream accuracy_log row build doesn't UnboundLocalError on
             # person/org/glossary candidates where `wants_scope == False`.
+            scope_source = SCOPE_SOURCE_NA
             if wants_scope:
-                scope = prompt("Scope", default=last_scope)
+                # Per slice 4 of #183 / #191: under `--predict` with a non-empty
+                # predicted scope, default to the prediction so Enter = accept.
+                # Falls back to last_scope when prediction is absent / errored /
+                # empty (preserves pre-slice-4 behavior on non-predict walks).
+                default_value, default_source = scope_default_for_prompt(this_prediction, last_scope)
+                scope, used_default = prompt_with_source("Scope", default=default_value)
                 if scope:
                     injected = inject_scope_into_memo(memo_path, scope)
                     if not injected:
@@ -1186,17 +1312,22 @@ def main(argv: list[str]) -> int:
                         getch()
                         continue  # don't advance — let user amend
                     last_scope = scope
+                    scope_source = default_source if used_default else SCOPE_SOURCE_TYPED
                 else:
                     sys.stdout.write(
                         f"{YELLOW}No Scope provided — applying decision without one "
                         f"(editorial rule #133 wants one; lint won't refuse but the entry will be substandard).{RESET}\n"
                     )
+                    # Operator pressed Enter on an empty default → log the source of the
+                    # empty default so post-walk analysis can distinguish "prediction was
+                    # empty too" from "operator typed nothing past last_scope".
+                    scope_source = default_source if used_default else SCOPE_SOURCE_TYPED
             rc, out = apply_memo(method_root, art_id)
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied{RESET}: {out}\n")
                 actions_since_commit += 1
                 if accuracy_log:
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "a", scope or "", candidate_kind=this_kind)
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "a", scope or "", candidate_kind=this_kind, scope_source=scope_source)
                 if args.commit_each:
                     crc, cout = commit_page(method_root, content_root, f"kb: decision (via TUI, {art_id})")
                     sys.stdout.write(f"{GREEN if crc == 0 else RED}commit rc={crc}: {cout[:200]}{RESET}\n")
@@ -1271,13 +1402,19 @@ def main(argv: list[str]) -> int:
             # claude may have preserved/added it. Check before prompting (avoid double-prompt
             # for decisions where scope is already in the amended body).
             m_scope = ""
+            m_scope_source = SCOPE_SOURCE_NA
             if wants_scope:
                 memo_text = memo_path.read_text(encoding="utf-8")
                 if "**Scope:**" in memo_text:
                     m = re.search(r"\*\*Scope:\*\*\s*(.+?)$", memo_text, re.MULTILINE)
                     m_scope = m.group(1).strip() if m else ""
+                    m_scope_source = SCOPE_SOURCE_INHERITED_FROM_MEMO
                 else:
-                    m_scope = prompt("Scope (or empty to apply without)", default=last_scope)
+                    # Per slice 4 of #183 / #191: default to predicted scope under --predict
+                    # so Enter = accept the prediction. Same fallback to last_scope otherwise.
+                    default_value, default_source = scope_default_for_prompt(this_prediction, last_scope)
+                    m_scope, used_default = prompt_with_source("Scope (or empty to apply without)", default=default_value)
+                    m_scope_source = default_source if used_default else SCOPE_SOURCE_TYPED
                     if m_scope:
                         injected = inject_scope_into_memo(memo_path, m_scope)
                         if injected:
@@ -1300,7 +1437,7 @@ def main(argv: list[str]) -> int:
                         notes = "amended via direct $EDITOR (legacy fallback)"
                     else:
                         notes = f"amended via NL (rounds={amend_rounds}): {amend_instr[:120]}"
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes=notes)
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes=notes, scope_source=m_scope_source)
                 if args.commit_each:
                     # pr-challenger S6 on #190 — mirror a/r path so --commit-each
                     # is honored on amend actions too.
@@ -1332,13 +1469,17 @@ def main(argv: list[str]) -> int:
                 getch()
                 continue
             m_scope = ""
+            m_scope_source = SCOPE_SOURCE_NA
             if wants_scope:
                 memo_text = memo_path.read_text(encoding="utf-8")
                 if "**Scope:**" in memo_text:
                     m = re.search(r"\*\*Scope:\*\*\s*(.+?)$", memo_text, re.MULTILINE)
                     m_scope = m.group(1).strip() if m else ""
+                    m_scope_source = SCOPE_SOURCE_INHERITED_FROM_MEMO
                 else:
-                    m_scope = prompt("Scope (or empty to apply without)", default=last_scope)
+                    default_value, default_source = scope_default_for_prompt(this_prediction, last_scope)
+                    m_scope, used_default = prompt_with_source("Scope (or empty to apply without)", default=default_value)
+                    m_scope_source = default_source if used_default else SCOPE_SOURCE_TYPED
                     if m_scope:
                         injected = inject_scope_into_memo(memo_path, m_scope)
                         if injected:
@@ -1348,7 +1489,7 @@ def main(argv: list[str]) -> int:
                 sys.stdout.write(f"{GREEN}✓ applied (after $EDITOR){RESET}: {out}\n")
                 actions_since_commit += 1
                 if accuracy_log:
-                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes="amended via direct $EDITOR (M key)")
+                    log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes="amended via direct $EDITOR (M key)", scope_source=m_scope_source)
                 if args.commit_each:
                     # pr-challenger S6 on #190 — m/M paths previously didn't honor
                     # --commit-each, silently letting actions accumulate. Mirror a/r.
