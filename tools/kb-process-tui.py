@@ -326,11 +326,17 @@ def predict_one(memo_path: Path, body: str, timeout_s: int = 30) -> dict:
         confidence: 'high'|'medium'|'low'|'?'
         reasoning: str
         error: str or None  (set when claude -p failed)
+
+    Per pr-challenger #5 on #188: stdin is closed via subprocess.DEVNULL so a
+    first-run trust prompt from `claude` (which would otherwise wait on
+    inherited stdin and hang silently until timeout) instead fails fast with
+    a stderr message the operator can act on.
     """
     prompt_text = PREDICT_PROMPT_TEMPLATE.format(body=body.strip())
     try:
         proc = subprocess.run(
             ["claude", "-p", prompt_text],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -343,11 +349,23 @@ def predict_one(memo_path: Path, body: str, timeout_s: int = 30) -> dict:
         err = proc.stderr.strip()[:160] or f"rc={proc.returncode}"
         return {"action": "?", "scope": "", "confidence": "?", "reasoning": "", "error": err}
 
+    # pr-challenger Blocking 2 on #188 — the previous `\s*` after the label
+    # greedily consumed the trailing newline, then `(.+?)$` happily matched
+    # the NEXT line's content. e.g. `SCOPE: \nCONFIDENCE: high` produced
+    # scope="CONFIDENCE: high" — a structural deflater of the scope-agreement
+    # metric on every reject + non-decision row. Switch to horizontal-only
+    # whitespace via `[ \t]*` so the regex stays inside one line. SCOPE uses
+    # `(.*)` (allows empty) since rejects / non-decisions emit `SCOPE:`-empty;
+    # REASONING uses `(.+?)` since it should never be empty per the prompt.
     out = proc.stdout
-    m_action = re.search(r"^\s*ACTION:\s*([armARM])", out, re.MULTILINE)
-    m_scope = re.search(r"^\s*SCOPE:\s*(.+?)$", out, re.MULTILINE)
-    m_conf = re.search(r"^\s*CONFIDENCE:\s*(high|medium|low)", out, re.IGNORECASE | re.MULTILINE)
-    m_reason = re.search(r"^\s*REASONING:\s*(.+?)$", out, re.MULTILINE)
+    m_action = re.search(r"^[ \t]*ACTION:[ \t]*([armARM])", out, re.MULTILINE)
+    m_scope = re.search(r"^[ \t]*SCOPE:[ \t]*(.*)$", out, re.MULTILINE)
+    m_conf = re.search(
+        r"^[ \t]*CONFIDENCE:[ \t]*(high|medium|low)",
+        out,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m_reason = re.search(r"^[ \t]*REASONING:[ \t]*(.+?)$", out, re.MULTILINE)
 
     if not m_action:
         return {
@@ -426,18 +444,23 @@ def pre_predict_all(memos: list[Path], max_workers: int = 5) -> dict[str, dict]:
                 sys.stdout.write(f"{DIM}  predicted {done_count}/{len(bodies)}{RESET}\n")
                 sys.stdout.flush()
 
-    parse_errors = sum(
-        1 for p in predictions.values() if p.get("error", "").startswith("parse_")
-    )
-    parse_rate = parse_errors / max(1, len(predictions))
-    if parse_rate > 0.25 and max_workers > 1:
+    # pr-challenger Blocking 4 on #188 — broaden retry trigger. Most likely
+    # rate-limit / auth-contention errors arrive as `timeout_<N>s` or as
+    # `rc=N: <stderr>`, not as `parse_*`. The previous trigger missed both.
+    retryable_prefixes = ("parse_", "timeout_", "rc=", "future_exc")
+    def _is_retryable(p: dict) -> bool:
+        err = p.get("error") or ""
+        return err.startswith(retryable_prefixes)
+
+    retryable_count = sum(1 for p in predictions.values() if _is_retryable(p))
+    retryable_rate = retryable_count / max(1, len(predictions))
+    if retryable_rate > 0.25 and max_workers > 1:
         sys.stdout.write(
-            f"{YELLOW}Parse-error rate {parse_rate:.0%} (>25%) on parallel run — "
-            f"retrying serially…{RESET}\n"
+            f"{YELLOW}Retryable-error rate {retryable_rate:.0%} (>25%) on parallel run — "
+            f"retrying the failed subset serially…{RESET}\n"
         )
-        # Re-run only the parse-failed ones serially.
         for art_id, p in list(predictions.items()):
-            if p.get("error", "").startswith("parse_"):
+            if _is_retryable(p):
                 mp, body = bodies[art_id]
                 predictions[art_id] = predict_one(mp, body)
 
@@ -457,7 +480,10 @@ ACCURACY_TSV_HEADER = (
 
 
 def accuracy_log_path(content_root: Path, run_ts: str) -> Path:
-    return content_root / ".harvest" / f"kb-tui-accuracy-{run_ts}.tsv"
+    """Per pr-challenger #7 on #188 — include pid in the filename so two TUI
+    sessions started in the same second don't truncate each other via the
+    `open("w")` in init_accuracy_log."""
+    return content_root / ".harvest" / f"kb-tui-accuracy-{run_ts}-pid{os.getpid()}.tsv"
 
 
 def init_accuracy_log(path: Path, claude_version: str, model_hint: str) -> None:
