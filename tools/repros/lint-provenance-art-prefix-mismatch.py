@@ -28,6 +28,7 @@ the fix end-to-end with one command.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import shutil
@@ -52,6 +53,8 @@ def _build_fixture(vault: Path) -> str:
     Returns the art-id used for the fixture."""
     art_uuid = str(uuid.uuid4())
     art_id = f"art-{art_uuid}"
+    today = dt.date.today().isoformat()  # pr-reviewer nit: no hardcoded dates.
+    yyyymmdd = today.replace("-", "")
 
     # Minimal vault skeleton: .assistant.local.json + kb/ + projects/
     (vault / "kb").mkdir(parents=True, exist_ok=True)
@@ -60,7 +63,7 @@ def _build_fixture(vault: Path) -> str:
     _write(vault / "kb" / "decisions.md", "# Decisions\n")
 
     # Project slug per ADR-0003 Amendment 1: <YYYYMMDD>-<name>-<4hex>
-    proj_slug = f"20260514-repro-{art_uuid[:4]}"
+    proj_slug = f"{yyyymmdd}-repro-{art_uuid[:4]}"
     proj = vault / "projects" / proj_slug
     proj.mkdir(parents=True, exist_ok=True)
     _write(
@@ -68,8 +71,8 @@ def _build_fixture(vault: Path) -> str:
         "---\n"
         f"project_id: {proj_slug}\n"
         "status: active\n"
-        "created_at: 2026-05-14\n"
-        "last_active: 2026-05-14\n"
+        f"created_at: {today}\n"
+        f"last_active: {today}\n"
         "---\n\n"
         "# Repro project\n",
     )
@@ -82,7 +85,7 @@ def _build_fixture(vault: Path) -> str:
         f"id: {art_id}\n"
         "kind: memo\n"
         f"project_id: {proj_slug}\n"
-        "created_at: 2026-05-14\n"
+        f"created_at: {today}\n"
         "produced_by:\n"
         "  session_id: repro-session\n"
         "  model: claude-opus-4-7\n"
@@ -90,7 +93,7 @@ def _build_fixture(vault: Path) -> str:
         "  sources_cited:\n"
         f"    - art://{art_id}\n"  # the offending self-reference
         "title: \"Repro memo\"\n"
-        "audience: [\"#193 reviewer\"]\n"
+        "audience: [\"repro\"]\n"
         "---\n\n"
         "# Repro memo\n\n"
         "This memo's sources_cited contains a self-reference to its own art-id.\n"
@@ -101,30 +104,19 @@ def _build_fixture(vault: Path) -> str:
 
 
 def _run_lint(vault: Path) -> tuple[int, str, str]:
-    """Run lint-provenance.py --require-vault against the fixture vault.
-    Returns (returncode, stdout, stderr)."""
-    # Point lint at the fixture via .assistant.local.json at the method root.
-    config = REPO_ROOT / ".assistant.local.json"
-    original_config_text = config.read_text(encoding="utf-8") if config.is_file() else None
-    try:
-        config.write_text(
-            json.dumps({"paths": {"content_root": str(vault)}}, indent=2),
-            encoding="utf-8",
-        )
-        r = subprocess.run(
-            [str(LINT), "--require-vault"],
-            capture_output=True,
-            text=True,
-        )
-        return r.returncode, r.stdout, r.stderr
-    finally:
-        if original_config_text is None:
-            try:
-                config.unlink()
-            except FileNotFoundError:
-                pass
-        else:
-            config.write_text(original_config_text, encoding="utf-8")
+    """Run lint-provenance.py --require-vault --content-root <vault>.
+
+    Per pr-challenger B1 + pr-reviewer on #195: uses the `--content-root`
+    CLI flag added in this same PR so the repro doesn't have to mutate the
+    method repo's `.assistant.local.json`. The previous design's signal-
+    safety hole (SIGTERM/SIGKILL skipping finally, concurrent invocations
+    racing the config file) is gone — no shared mutable state to corrupt."""
+    r = subprocess.run(
+        [str(LINT), "--require-vault", "--content-root", str(vault)],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode, r.stdout, r.stderr
 
 
 def main() -> int:
@@ -138,41 +130,52 @@ def main() -> int:
         art_id = _build_fixture(vault)
         rc, stdout, stderr = _run_lint(vault)
 
-    # Today (pre-fix): lint exits non-zero AND stdout-or-stderr contains
-    # TARGET_VIOLATION on the self-referencing fixture. That's the bug.
-    # (lint-provenance writes violations to stderr; we check both streams
-    # to be robust across version drift.)
     combined = stdout + "\n" + stderr
-    has_target_violation = TARGET_VIOLATION in combined
-    if rc != 0 and has_target_violation:
-        # Find the exact violation line for evidence.
-        violation_lines = [
-            line for line in combined.splitlines() if TARGET_VIOLATION in line and art_id in line
-        ]
+    # Per pr-challenger S2 on #195: tighten the falsifier match. Find the
+    # specific violation line that mentions BOTH the target kind AND our
+    # fixture's art_id (so unrelated rules firing the same kind on a
+    # different fixture artefact can't masquerade as our bug).
+    target_lines = [
+        line for line in combined.splitlines()
+        if TARGET_VIOLATION in line and f"art://{art_id}" in line
+    ]
+    bug_fingerprint_present = len(target_lines) >= 1
+
+    if rc != 0 and bug_fingerprint_present:
         print("BUG REPRODUCED")
         print(f"  fixture art-id: {art_id}")
         print(f"  lint exit code: {rc}")
-        if violation_lines:
-            print(f"  violation: {violation_lines[0].strip()}")
-        else:
-            # The violation fired but we couldn't find the exact line — still
-            # the bug, but the evidence is less precise. Surface tails.
-            print("  (couldn't isolate the exact violation line; showing tails)")
-            for line in combined.splitlines()[-5:]:
-                print(f"  | {line}")
+        print(f"  violation: {target_lines[0].strip()}")
+        if len(target_lines) > 1:
+            # Multiple hits on the same fingerprint shouldn't happen on a
+            # minimal fixture; surface them as a heads-up.
+            print(f"  (unexpected: {len(target_lines)} matching lines)")
         return 0
 
-    if rc == 0:
-        print("BUG GONE — lint is clean on the self-referencing fixture")
+    if not bug_fingerprint_present:
+        # Per pr-challenger S3 on #195: BUG GONE covers any clean outcome
+        # where the targeted violation is absent — even if lint emits an
+        # unrelated warning on the fixture (rc != 0 for a different
+        # reason). Otherwise C3 would have to land "lint exits 0 on the
+        # fixture" in addition to fixing the prefix mismatch — an
+        # over-constraint that the script shouldn't enforce.
+        print("BUG GONE — targeted violation absent on the self-referencing fixture")
+        print(f"  fixture art-id: {art_id}")
+        print(f"  lint exit code: {rc}")
+        if rc != 0:
+            # Surface what lint DID complain about, so the operator can
+            # tell whether C3's fix is clean or shifted to a new problem.
+            tail = "\n".join(combined.splitlines()[-10:])
+            print(f"  lint output (tail):\n{tail}")
         print("  Falsifier F1 of #193 fired: bug does not exist as described,")
-        print("  OR the fix in C3 has landed and this script flipped to its")
-        print("  post-fix mode. Verify by inspecting recent commits to")
-        print("  tools/lint-provenance.py.")
+        print("  OR the fix in C3 has landed.")
         return 1
 
-    # lint failed but for a different violation than the one we're testing
+    # Should be unreachable: bug_fingerprint_present is True but rc == 0.
+    # That would mean lint reported the target violation as a non-error,
+    # which is shape-shifting we should surface for operator review.
     print(
-        f"REPRO MECHANISM BROKEN: lint exited {rc} but TARGET_VIOLATION not in stdout/stderr",
+        f"REPRO MECHANISM BROKEN: target violation present in output but lint exited {rc}",
         file=sys.stderr,
     )
     print(f"  fixture art-id: {art_id}", file=sys.stderr)
