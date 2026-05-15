@@ -55,18 +55,25 @@ PRODUCED_BY_RE = re.compile(
 # Canonical source forms per ADR-0003 (with art:// added in Amendment 1).
 #
 # Per #199 / C1 (#200): `kb#<heading>` accepts the literal KB heading text —
-# spaces, punctuation, em-dashes are all fine. The old shape `kb#[\w\-]+`
-# rejected the natural human-and-agent shape (every Vera vision memo carried
-# `kb#Phase 1 is Atlas 2.0, Vera is Phase 2` and similar). No tool resolves
-# `kb#` references programmatically today, so loosening the shape doesn't
-# break any consumer; it aligns the lint with how humans actually write.
+# spaces, punctuation, em-dashes, and unicode chars (accented, CJK, emoji)
+# are all fine. The old shape `kb#[\w\-]+` rejected the natural human-and-
+# agent shape (every Vera vision memo carried `kb#Phase 1 is Atlas 2.0,
+# Vera is Phase 2` and similar). No tool resolves `kb#` references
+# programmatically today (verified via grep on `tools/` + skills + docs),
+# so loosening the shape doesn't break any consumer; it aligns the lint
+# with how humans actually write.
 #
-# The first char after `#` must be non-whitespace (else `kb#` alone or
-# `kb# X` would match — degenerate empty / leading-space shapes). The body
-# is everything up to end-of-line.
+# The first AND last chars of the body must be non-whitespace (so `kb#` /
+# `kb# X` / `kb#X ` all refuse — degenerate empty, leading-space, and
+# trailing-space shapes). Per pr-challenger #3 on #202: refusing trailing
+# whitespace removes a copy-paste / sloppy-edit footgun at zero cost.
+#
+# Future-resolver contract: if/when an assembled-KB resolver lands per
+# ADR-0003 line 96 (aspirational), it must accept the permissive body
+# shape this lint emits — single non-whitespace OR `\S<body>\S`.
 CANONICAL_SOURCE_RE = re.compile(
     r"^(?:"
-    r"kb#\S[^\n]*"                     # kb#heading-text (literal, may include spaces/punctuation)
+    r"kb#\S(?:[^\n]*\S)?"              # kb#heading-text (literal; refuses leading/trailing ws)
     r"|mem://[\w\-]+"                  # mem://<memory-id>
     r"|art://[\w\-]+"                  # art://<art-uuid> (per Amendment 1)
     r"|https?://\S+"                   # bare URL
