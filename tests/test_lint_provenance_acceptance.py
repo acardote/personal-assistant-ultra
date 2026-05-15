@@ -46,6 +46,8 @@ Tests:
   T38 — empty drift_candidate value fails (closes fail-open from review).
   T39 — non-bool drift_candidate value fails distinctly.
   T40 — drift_candidate: true on non-memo kind fails (kind=memo scope).
+  T41 — `art://art-<uuid>` shape tolerated alongside the ADR-canonical
+        `art://<uuid>` (regression for #193 / C3 / #196).
 """
 
 from __future__ import annotations
@@ -570,7 +572,7 @@ def test_193_art_prefixed_uri_body_tolerated():
         assert "artefact-dangling-art-ref" not in r.stderr, (
             f"no dangling-art-ref expected\nstderr: {r.stderr}"
         )
-    print("  T29 PASS — #193 art://art-<id> tolerated (in addition to ADR-canonical art://<id>)")
+    print("  T41 PASS — #193 art://art-<id> tolerated (in addition to ADR-canonical art://<id>)")
 
 
 def test_flat_resolves_project_uuid():

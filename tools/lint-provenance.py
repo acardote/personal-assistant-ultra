@@ -65,6 +65,23 @@ CANONICAL_SOURCE_RE = re.compile(
 # `## <heading>` capture (ATX-style only; KB files don't use Setext).
 H2_RE = re.compile(r"^##\s+(?P<title>\S.*?)\s*$", re.MULTILINE)
 
+
+def _normalize_art_uri_body(uri_body: str) -> str:
+    """Strip a leading `art-` prefix from an `art://` URI body so the lookup
+    against `known_artefact_uuids` (keyed by bare uuid) matches both shapes:
+
+    - `art://<uuid>` — ADR-0003 canonical, what `kb-drift-scan` / `kb-process`
+      emit. Body is already bare; this is a no-op.
+    - `art://art-<uuid>` — hand-authored shape (e.g. Vera vision memos that
+      surfaced #193). Strip the redundant `art-` to recover the bare uuid.
+
+    Per #193 / C3 (#196). Real UUIDs cannot legitimately begin with the
+    literal `art-` (only `a` is hex among `a`/`r`/`t`), so the strip is
+    safe by uuid-shape invariant."""
+    if uri_body.startswith("art-"):
+        return uri_body[len("art-"):]
+    return uri_body
+
 # Date markers across the three KB files: decisions.md uses `**Date:**`; people.md
 # / org.md use `**Last verified:**`. Either qualifies as the date for grandfathering.
 DATE_RE = re.compile(
@@ -627,12 +644,7 @@ def _validate_drift_fields(
                 ),
             ))
         elif known_artefact_uuids is not None:
-            # Per #193 / C3: tolerate both bare-uuid (ADR-0003 canonical) and
-            # `art-`-prefixed URI bodies. See the sources_cited ref-check above
-            # for the rationale.
-            ref_uuid = aff_s[len("art://"):]
-            if ref_uuid.startswith("art-"):
-                ref_uuid = ref_uuid[len("art-"):]
+            ref_uuid = _normalize_art_uri_body(aff_s[len("art://"):])
             if ref_uuid not in known_artefact_uuids:
                 out.append(Violation(
                     path=path,
@@ -707,18 +719,8 @@ def _validate_produced_by_dict(
                 continue
             # Dangling-art-ref check (#98): art://<uuid> must resolve to a
             # known artefact in the vault. Skip when no index passed.
-            #
-            # Per #193 / C3: tolerate both `art://<uuid>` (ADR-0003 canonical
-            # shape) AND `art://art-<uuid>` (the shape some hand-authored
-            # memos use — e.g. Vera vision memos). The index is keyed by
-            # bare uuid; strip a leading `art-` from the URI body if present
-            # so both shapes resolve. Filename-construction in the error
-            # message uses the bare uuid so it matches what `_collect_artefact_uuids`
-            # actually looks for (`art-<uuid>.<ext>`).
             if isinstance(src, str) and src.startswith("art://") and known_artefact_uuids is not None:
-                ref_uuid = src[len("art://"):]
-                if ref_uuid.startswith("art-"):
-                    ref_uuid = ref_uuid[len("art-"):]
+                ref_uuid = _normalize_art_uri_body(src[len("art://"):])
                 if ref_uuid not in known_artefact_uuids:
                     out.append(Violation(
                         path=path,
