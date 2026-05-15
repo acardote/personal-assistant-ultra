@@ -12,7 +12,7 @@ A Claude Code skill implementing the three-layer memory architecture defined in 
 This skill operates against **two repos**:
 
 - **Method repo** (`acardote/personal-assistant-ultra`): code, schemas, prompts, ADRs, **`kb/glossary.md`** (canonical project terms). The skill itself lives here.
-- **Content vault** (`getnexar/acardote-pa-vault`): your real `memory/`, `kb/{people,org,decisions}.md`, `.harvest/` state, `raw/`. Per-checkout location resolved from `<method-root>/.assistant.local.json`'s `paths.content_root`.
+- **Content vault** (`acardote/acardote-pa-vault`): your real `memory/`, `kb/{people,org,decisions}.md`, `.harvest/` state, `raw/`. Per-checkout location resolved from `<method-root>/.assistant.local.json`'s `paths.content_root`.
 
 Tools resolve paths via `tools/_config.py`. When `.assistant.local.json` is missing or malformed, tools emit a LOUD stderr warning and fall back to the method root (OK for fixtures/tests; **NOT OK for real harvest** — it's the F1 pollution path #12 was scoped to close). Setup: copy `.assistant.local.json.example` → `.assistant.local.json` and edit `paths.content_root` to point at your vault checkout. End-to-end setup walkthrough lives in [#14](https://github.com/acardote/personal-assistant-ultra/issues/14)'s deliverables (`docs/setup.md` + `tools/bootstrap.py`).
 

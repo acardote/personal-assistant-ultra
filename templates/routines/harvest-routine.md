@@ -38,7 +38,7 @@ When you create the routine via `/schedule`, configure it as below.
 Two `git_repository` sources, in this order:
 
 1. `https://github.com/acardote/personal-assistant-ultra` (method repo — contains `.claude/skills/personal-assistant/SKILL.md`, `tools/compress.py`, schemas, prompts). Same for every user.
-2. `https://github.com/<your-org>/<your-vault>` (content vault — destination for memory objects, KB, harvest state). **This is your private vault — replace with your own.** The author's example for reference: `https://github.com/getnexar/acardote-pa-vault`.
+2. `https://github.com/<your-org>/<your-vault>` (content vault — destination for memory objects, KB, harvest state). **This is your private vault — replace with your own.** The author's example for reference: `https://github.com/acardote/acardote-pa-vault`.
 
 The routine workspace clones both. The vault is the git-write target.
 
@@ -73,7 +73,7 @@ Run the personal-assistant scheduled harvest.
 
 Two repos are linked to this routine:
 - METHOD: acardote/personal-assistant-ultra (cloned to your workspace)
-- VAULT:  getnexar/acardote-pa-vault (cloned to your workspace)
+- VAULT:  acardote/acardote-pa-vault (cloned to your workspace)
 
 Identify the workspace paths. Use `find` constrained to known workspace roots, NOT the whole filesystem:
 
@@ -502,7 +502,7 @@ Procedure:
                BLOCKING_FOUND=false
            fi
 
-   e. **If `BLOCKING_FOUND=false` — set auto-merge** (the `--auto` flag merges when required checks pass; on `getnexar/acardote-pa-vault` per #182 there are NO required checks today, so the merge happens immediately on a clean PR — the poll covers the case where checks get added in the future):
+   e. **If `BLOCKING_FOUND=false` — set auto-merge** (the `--auto` flag merges when required checks pass; on `acardote/acardote-pa-vault` per #182 there are NO required checks today, so the merge happens immediately on a clean PR — the poll covers the case where checks get added in the future):
 
            gh pr merge "$PR_URL" --auto --squash --delete-branch
 
@@ -552,10 +552,10 @@ Procedure:
    - **MCP `push_files` fallback path** (triggered by the `git push` failure branches above): see the "MCP `push_files` fallback" section below. The fallback procedure is unchanged from the prior MCP-as-primary implementation (it's verbatim what shipped in #161 / v0.4.2, including the 401-retry-on-demand-pause flow on #166); slice 1 just demotes it from primary to fallback.
    - **Agent tool unavailable during step 10** (subagent_type not resolvable / Agent tool not attached BEFORE the subagent begins executing — per the disambiguation rule in step 10(h)): skip the review entirely. Set `BLOCKING_FOUND=false` (no review at all — operator owns). Update local runs JSON `push.auto_merge: "skipped_no_agent"`. Emit `echo "WARN: Agent tool unavailable in this fire — adversarial review skipped, PR left open for manual review. File evidence on #181." >&2`. **Do NOT auto-merge an unreviewed PR** even though `BLOCKING_FOUND=false` — skip step 10(e) entirely; leave PR open. Surface in final response.
    - **Subagent timeout or runtime error during step 10** (per step 10(h): subagent BEGAN executing but failed to return cleanly): treat as `BLOCKING_FOUND=true` (fail-safe — don't auto-merge what wasn't fully reviewed). Update runs JSON `push.auto_merge: "blocked_by_review_failure"`, `push.failed_agent: "pr-reviewer"` or `"pr-challenger"`. Post a PR comment noting which subagent failed and why so the operator has context.
-   - **`gh pr merge --auto` returns "auto-merge is not allowed for this repository"** (vault's `allow_auto_merge: false` — empirically validated false on `getnexar/acardote-pa-vault` pre-slice-2; if you see this error after #182 lands, the operator-side config flipped back): branch SYNCHRONOUSLY without entering the poll. Leave PR open. Update runs JSON `push.auto_merge: "not_eligible"`, `push.not_eligible_reason: "allow_auto_merge_disabled_on_repo"`. Surface in final response with the operator-recovery command: `gh api -X PATCH /repos/$VAULT_OWNER/$VAULT_REPO --field allow_auto_merge=true`.
+   - **`gh pr merge --auto` returns "auto-merge is not allowed for this repository"** (vault's `allow_auto_merge: false` — empirically validated false on `acardote/acardote-pa-vault` pre-slice-2; if you see this error after #182 lands, the operator-side config flipped back): branch SYNCHRONOUSLY without entering the poll. Leave PR open. Update runs JSON `push.auto_merge: "not_eligible"`, `push.not_eligible_reason: "allow_auto_merge_disabled_on_repo"`. Surface in final response with the operator-recovery command: `gh api -X PATCH /repos/$VAULT_OWNER/$VAULT_REPO --field allow_auto_merge=true`.
    - **`gh pr merge --auto` returns "not eligible for auto-merge"** (branch protection requires checks/reviews `--auto` can't satisfy autonomously — possibly an updated branch protection rule or a required reviewer outside the routine's principal): branch SYNCHRONOUSLY without entering the poll. Leave PR open. Update runs JSON `push.auto_merge: "not_eligible"`, `push.not_eligible_reason: "<gh stderr first line, e.g. required-check-not-passing>"`. Surface in the final response so the operator knows what to satisfy. Per #181 Q5 — the operator agreed to handle this case manually.
    - **Merge-conflict-on-main** (step 10(e)'s poll detects `mergeable=CONFLICTING`): another fire / launchd raced. Leave PR open. Update runs JSON `push.auto_merge: "merge_conflict"`. Surface in final response with a one-line "operator: rebase the branch on origin/main and retry the merge" hint.
-   - **Auto-merge poll timeout** (50min of polling without `mergedAt` becoming non-null AND `mergeable != CONFLICTING`): leave the `--auto` flag set (the merge will happen when required checks eventually pass — though on `getnexar/acardote-pa-vault` today there are NO required checks, so this branch effectively never fires for the current vault config; the path exists for future hardening). Update runs JSON `push.auto_merge: "pending"`, `push.merge_poll_timed_out: true`. Surface: "Auto-merge set but did not complete within 50min — merge will happen autonomously when checks pass. PR: $PR_URL".
+   - **Auto-merge poll timeout** (50min of polling without `mergedAt` becoming non-null AND `mergeable != CONFLICTING`): leave the `--auto` flag set (the merge will happen when required checks eventually pass — though on `acardote/acardote-pa-vault` today there are NO required checks, so this branch effectively never fires for the current vault config; the path exists for future hardening). Update runs JSON `push.auto_merge: "pending"`, `push.merge_poll_timed_out: true`. Surface: "Auto-merge set but did not complete within 50min — merge will happen autonomously when checks pass. PR: $PR_URL".
 
 12. **In your final user-facing response, surface the OUTCOME of step 10** so the operator knows whether to act:
 
