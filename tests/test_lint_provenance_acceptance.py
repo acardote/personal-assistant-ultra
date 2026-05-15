@@ -48,6 +48,12 @@ Tests:
   T40 — drift_candidate: true on non-memo kind fails (kind=memo scope).
   T41 — `art://art-<uuid>` shape tolerated alongside the ADR-canonical
         `art://<uuid>` (regression for #193 / C3 / #196).
+  T42 — `kb#<heading>` accepts literal heading text with spaces, punctuation,
+        em-dashes, unicode (regression for #199 / C1 / #200).
+  T43 — `kb#`-shaped degenerate forms (`kb#`, `kb# X`, `kb`, etc.) refused.
+  T44 — `kb#X<trailing-whitespace>` refused at the regex level (YAML strips
+        trailing whitespace before lint sees it, so this tests the
+        defense-in-depth on direct-dict code paths).
 """
 
 from __future__ import annotations
@@ -598,6 +604,108 @@ def test_flat_resolves_project_uuid():
     print("  T28 PASS — flat artefact resolves art://<project-uuid>")
 
 
+def test_199_kb_heading_literal_text_accepted():
+    """Regression for #199 / C1 (#200): `kb#<heading>` accepts the literal
+    heading text — spaces, punctuation, em-dashes are all canonical. The
+    old shape `kb#[\\w\\-]+` rejected the natural human + agent form (every
+    Vera vision memo carried `kb#Phase 1 is Atlas 2.0, Vera is Phase 2`
+    and similar). No tool resolves `kb#` references programmatically; the
+    lint just verifies shape. Widening aligns lint with how people write."""
+    valid_headings = [
+        "kb#simple",                                                  # slug-shape (back-compat)
+        "kb#Phase 1 is Atlas 2.0, Vera is Phase 2",                   # spaces, digits, comma, period
+        "kb#Core value props — Vera (Atlas v2.0) + BADAS",            # em-dash, parens
+        "kb#Atlas exposes all its data sources via MCP",              # spaces only
+        "kb#Vera (Atlas v2.0) becomes unified hub for live + historical",  # mixed
+        "kb#x",                                                       # single char body
+        "kb#Phase ❶ — Vera",                                          # unicode (per pr-challenger #1 on #202)
+        "kb#Atlas#2.0-priorities",                                    # body contains `#` (real KB headings can)
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-kb-shapes.md").write_text(
+            _project_artefact_md(
+                "20260507-test-aaaa", "kb-shapes", "20260507-test-aaaa",
+                sources=valid_headings,
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, (
+            f"all literal kb# heading shapes should be canonical\nstderr: {r.stderr}"
+        )
+        assert "not canonical" not in r.stderr, (
+            f"no non-canonical-source violations expected\nstderr: {r.stderr}"
+        )
+    print(f"  T42 PASS — #199 kb# literal heading text accepted ({len(valid_headings)} shape variants)")
+
+
+def test_199_kb_heading_degenerate_shapes_refused():
+    """Regression for #199 / C1 (#200) F2: the widened regex must still
+    refuse degenerate shapes — `kb#` alone, `kb# X` (whitespace right after
+    the `#`), and the bare `kb` (no `#`)."""
+    # YAML loader strips trailing whitespace from scalar values, so trailing-
+    # whitespace cases (`kb#X `, `kb#X\t`) cannot be exercised through the
+    # YAML fixture path — they get normalized to `kb#X` before the lint sees
+    # them. The regex still refuses them as defense-in-depth for any code
+    # path that bypasses YAML normalization (e.g., direct dict construction);
+    # see the direct-regex test `test_199_kb_regex_refuses_trailing_ws` below.
+    bad_headings = [
+        "kb#",                # no body
+        "kb# X",              # leading whitespace after #
+        "kb#\tX",             # leading tab after #
+        "kb",                 # no # at all
+        "kb#   ",             # only whitespace body
+    ]
+    for bad in bad_headings:
+        with tempfile.TemporaryDirectory() as td:
+            method, vault = make_fixture(Path(td))
+            proj = _project_dirs(vault, "20260507-test-aaaa")
+            (proj / "artefacts" / "memo" / "art-bad-kb.md").write_text(
+                _project_artefact_md(
+                    "20260507-test-aaaa", "bad-kb", "20260507-test-aaaa",
+                    sources=[bad],
+                ),
+                encoding="utf-8",
+            )
+            r = run_lint(method)
+            assert r.returncode == 1, (
+                f"degenerate kb# shape {bad!r} should refuse but lint exited "
+                f"{r.returncode}\nstderr: {r.stderr}"
+            )
+            assert "not canonical" in r.stderr, (
+                f"expected non-canonical-source violation for {bad!r}\n"
+                f"stderr: {r.stderr}"
+            )
+    print("  T43 PASS — #199 degenerate kb# shapes refused (5 cases)")
+
+
+def test_199_kb_regex_refuses_trailing_ws():
+    """Direct-regex test for trailing-whitespace refusal (per pr-challenger #2
+    on #202). YAML strips trailing whitespace from scalar values before the
+    lint sees them, so this case can't be exercised through the fixture path.
+    But the regex itself defends against it for any future code path that
+    bypasses YAML normalization."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "lint_provenance",
+        PROJ / "tools" / "lint-provenance.py",
+    )
+    lint_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lint_mod)
+    CANON = lint_mod.CANONICAL_SOURCE_RE
+    # Trailing whitespace must refuse.
+    assert not CANON.match("kb#X "), "trailing space should refuse"
+    assert not CANON.match("kb#X\t"), "trailing tab should refuse"
+    assert not CANON.match("kb#X Y  "), "trailing double-space should refuse"
+    # But valid shapes still pass.
+    assert CANON.match("kb#X"), "single char should accept"
+    assert CANON.match("kb#X Y"), "internal space should accept"
+    assert CANON.match("kb#Atlas exposes data via MCP"), "production shape should accept"
+    print("  T44 PASS — #199 regex refuses trailing whitespace (3 cases) + accepts internal whitespace")
+
+
 def test_malformed_project_slug_fails():
     """Per #99: hand-rolled project directory names that don't match
     `<YYYYMMDD>-<short-name>-<4hex>` are refused. Several malformed shapes
@@ -923,6 +1031,9 @@ if __name__ == "__main__":
     test_self_reference_passes()
     test_193_art_prefixed_uri_body_tolerated()
     test_flat_resolves_project_uuid()
+    test_199_kb_heading_literal_text_accepted()
+    test_199_kb_heading_degenerate_shapes_refused()
+    test_199_kb_regex_refuses_trailing_ws()
     test_malformed_project_slug_fails()
     test_dot_prefixed_dirs_exempt_from_slug_check()
     test_drift_candidate_well_formed_passes()
