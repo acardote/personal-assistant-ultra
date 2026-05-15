@@ -200,7 +200,7 @@ Empirical rules harvested from `/personal-assistant kb-process` walk sessions. E
 - `- **Trigger**:` observable condition on a kb-scan-emitted candidate (one bullet, single paragraph).
 - `- **Action**:` one of `approve`, `reject as <category>`, `amend <field>: <value>` (one bullet, single paragraph).
 - `- **Reasoning**:` one line explaining why the rule is load-bearing (one bullet, single paragraph).
-- `- **Example**:` a verifiable reference — commit SHA in `getnexar/acardote-pa-vault` (preferred) OR art-uuid under `<content_root>/artefacts/memo/.rejected/` (one bullet, single paragraph).
+- `- **Example**:` a verifiable reference — commit SHA in `acardote/acardote-pa-vault` (preferred) OR art-uuid under `<content_root>/artefacts/memo/.rejected/` (one bullet, single paragraph).
 
 **Parser regex contract (for slice 2)**: rules begin with `^### Rule \d+:` and each field bullet begins with `^- \*\*(Trigger|Action|Reasoning|Example)\*\*:`. The field regex is **scoped to lines between successive `### Rule N:` headings only** — pre-existing `- **Trigger**:` lines in this document's `## In-session triggers` section (rules 67–82, outside any `### Rule N:` heading) are NOT part of the catalog and MUST be ignored by slice 2's parser. Multi-paragraph fields are NOT allowed — keep each field to one paragraph so the parser can tokenize on the next `- **` boundary. Example fields MAY contain multiple comma-separated refs in one paragraph (e.g., "commit `c82f768`; commit `705a847`") — slice 3's classifier MUST split on `;` or `,` boundaries.
 
@@ -221,14 +221,14 @@ Empirical rules harvested from `/personal-assistant kb-process` walk sessions. E
 - **Trigger**: source memo is a Granola note tagged with the daily-huddle pattern (`product-team-daily-huddle-*`, or any Granola note whose title contains `product team huddle`) AND body covers a product/pricing/indexing decision AND body does NOT explicitly mention Atlas surfaces (MCP, data sources, ordering flow). Reference memo from 2026-05-12: `mem-60438256-0519-4a6b-b442-2cf96a873132`.
 - **Action**: `amend Scope: Vera`.
 - **Reasoning**: kb-scan defaults this source to "Atlas" or "Nexar-wide"; user-corrected to Vera against this memo (commit `fd08f9f`). Rule 9 takes precedence if the trigger also matches an `org-update`.
-- **Example**: commit `fd08f9f` in `getnexar/acardote-pa-vault` (composite risk indices, Atlas → Vera amendment, scope explicitly named in the produced_by comment).
+- **Example**: commit `fd08f9f` in `acardote/acardote-pa-vault` (composite risk indices, Atlas → Vera amendment, scope explicitly named in the produced_by comment).
 
 ### Rule 2: Disambiguate pricing direction
 
 - **Trigger**: candidate title or body mentions "<vendor> pricing unchanged", "<vendor> integration pricing", or "pricing to/from <vendor>" without naming WHICH party pays whom.
 - **Action**: `amend body: name pricing direction explicitly (one of "<vendor>→customers" or "Nexar→<vendor>"); also update the heading to reflect the direction`.
 - **Reasoning**: the same English phrase covers two opposite commercial decisions; the user's intent is always one direction, never both. Rule 5 takes precedence if the candidate is exploratory rather than a committed price.
-- **Example**: commit `802856b` in `getnexar/acardote-pa-vault` (Axon's customer-facing pricing, amended from generic "Axon integration pricing"; same commit also archives Rule 6's `art-6c8a7f9d` rejection, so cross-reference Rule 6 when auditing).
+- **Example**: commit `802856b` in `acardote/acardote-pa-vault` (Axon's customer-facing pricing, amended from generic "Axon integration pricing"; same commit also archives Rule 6's `art-6c8a7f9d` rejection, so cross-reference Rule 6 when auditing).
 
 ### Rule 3: Reject ephemeral event/booth/demo prep
 
@@ -242,7 +242,7 @@ Empirical rules harvested from `/personal-assistant kb-process` walk sessions. E
 - **Trigger**: candidate body is about a single message/note/email to a single person, with no underlying durable policy named.
 - **Action**: `reject as ephemeral`.
 - **Reasoning**: one-off communications are not decisions; the policy behind them is. The user MAY override this rule mid-review by reframing the candidate around a durable stance (e.g., "decline Waylens re-engagement" → "do not re-engage Waylens, durable stance"); when that happens, the override is the rule that fires, not this one. Rule 4 ships its default action only.
-- **Example**: commit `4d041cb` in `getnexar/acardote-pa-vault` (Waylens "soft note" — landed only after the user-reframed "do not re-engage Waylens" durable stance replaced the per-note framing; the produced_by comment on the landed entry documents the reframe).
+- **Example**: commit `4d041cb` in `acardote/acardote-pa-vault` (Waylens "soft note" — landed only after the user-reframed "do not re-engage Waylens" durable stance replaced the per-note framing; the produced_by comment on the landed entry documents the reframe).
 
 ### Rule 5: Reject ideas and brainstorms
 
@@ -263,42 +263,42 @@ Empirical rules harvested from `/personal-assistant kb-process` walk sessions. E
 - **Trigger**: candidate title or body names a quarterly goal (`Q<N> goal`, `quarterly goal`, `this quarter's commitment`).
 - **Action**: `amend Expires: end of Q<N> (or until quarterly goals refresh)`.
 - **Reasoning**: Q-goals expire by definition; `Expires: never` is structurally wrong-shaped for them.
-- **Example**: commit `00fe30f` in `getnexar/acardote-pa-vault` (MoD business case validation as Q-goal, amended `never` → `end of Q2`).
+- **Example**: commit `00fe30f` in `acardote/acardote-pa-vault` (MoD business case validation as Q-goal, amended `never` → `end of Q2`).
 
 ### Rule 8: Launch-dated decisions get bounded Expires
 
 - **Trigger**: candidate title contains a target launch window (`launches end of June`, `GA early August`, `<feature> launch <date>`).
 - **Action**: `amend Expires: at launch (~<date>)`.
 - **Reasoning**: launch decisions self-expire at launch; `Expires: never` overstates durability.
-- **Example**: commit `6d3a6f3` in `getnexar/acardote-pa-vault` (CartTag launches end of June / beginning of July 2026, amended to `at launch (~2026-07)`).
+- **Example**: commit `6d3a6f3` in `acardote/acardote-pa-vault` (CartTag launches end of June / beginning of July 2026, amended to `at launch (~2026-07)`).
 
 ### Rule 9: Reject Nexar products mistakenly extracted as external orgs
 
 - **Trigger**: candidate kind is `org-update` AND the referent is a Nexar product (Vera, Atlas, CartTag, BADAS, MoD, Guardian Mode, Atlas 2.0, etc.).
 - **Action**: `reject as wrong-layer`.
 - **Reasoning**: kb-scan surfaces product names as nouns and sometimes extracts them as external partner orgs; this poisons `<content_root>/kb/org.md` retrieval.
-- **Example**: commit `6e27d3c` in `getnexar/acardote-pa-vault` (Vera-as-org candidate `art-f451c201-dfdd-4b62-b342-469e0c503dfa`, rejected with user reason "Vera is one thing — Nexar product").
+- **Example**: commit `6e27d3c` in `acardote/acardote-pa-vault` (Vera-as-org candidate `art-f451c201-dfdd-4b62-b342-469e0c503dfa`, rejected with user reason "Vera is one thing — Nexar product").
 
 ### Rule 10: Correct Nauto/merged-entity CEO to Zach
 
 - **Trigger**: candidate body names anyone other than Zach (commonly: Eran) as the post-merger Nauto/Nexar CEO.
 - **Action**: `amend body: replace named CEO with "Zach"` (matching the landed convention in `<content_root>/kb/decisions.md`; full surname is in `<content_root>/kb/people.md` but the decision entries are first-name-only).
 - **Reasoning**: kb-scan misattributes the Nauto founder Eran to the CEO role; Zach is the named CEO of the merged entity. Verifiable in `<content_root>/kb/people.md` heading.
-- **Example**: commit `3630094` in `getnexar/acardote-pa-vault` (Nauto merger plan, user-corrected Eran → Zach during the 2026-05-12 walk).
+- **Example**: commit `3630094` in `acardote/acardote-pa-vault` (Nauto merger plan, user-corrected Eran → Zach during the 2026-05-12 walk).
 
 ### Rule 11: Internal product announcements happen at NLM
 
 - **Trigger**: candidate body names "upcoming conference", "next big event", or another external venue as the announcement channel for an internal Nexar product / spin-out / org change.
 - **Action**: `amend body: replace external-venue mention with "NLM (Nexar all-hands meeting)"`.
 - **Reasoning**: internal-facing announcements happen at NLM by Nexar convention; kb-scan defaults to external venues. Slice-1 evidence is N=1 (single Mithran example); rule retracts if the next walk produces a counter-example.
-- **Example**: commit `93b1151` in `getnexar/acardote-pa-vault` (Mithran spin-out, user-corrected announcement venue to NLM).
+- **Example**: commit `93b1151` in `acardote/acardote-pa-vault` (Mithran spin-out, user-corrected announcement venue to NLM).
 
 ### Rule 12: Disambiguate heat-map type (opt-in vs coverage)
 
 - **Trigger**: candidate body about "Nexar opt-in heat maps to Axon" (or similar partner data delivery) without naming the heat-map TYPE.
 - **Action**: `amend body: replace "opt-in heat maps" with "opt-in or coverage heat maps"`.
 - **Reasoning**: two heat-map types exist; kb-scan defaults to "opt-in" only and loses the coverage variant. Slice-1 evidence is N=1 (single Axon heat-map example); rule retracts if the next walk produces a counter-example or the Axon partnership scope evolves.
-- **Example**: commit `35986fa` in `getnexar/acardote-pa-vault` (heat maps to Axon, user-amended to opt-in OR coverage).
+- **Example**: commit `35986fa` in `acardote/acardote-pa-vault` (heat maps to Axon, user-amended to opt-in OR coverage).
 
 ---
 
