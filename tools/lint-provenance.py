@@ -123,8 +123,27 @@ ISO8601_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:[.,]
 
 REQUIRED_FRONTMATTER_KEYS = {"id", "kind", "created_at", "produced_by", "title"}
 REQUIRED_PRODUCED_BY_KEYS = {"session_id", "query", "model", "sources_cited"}
+# Per #198 / C1 (#201): `source-pin` is a transient artefact wrapping
+# upstream content awaiting canonical `mem://` promotion (see ADR-0003
+# Amendment 2). Schema differs from the default in two ways:
+#
+# - REQUIRED_FRONTMATTER_KEYS_SOURCE_PIN adds top-level `upstream:` (a map
+#   carrying at least a `kind:` subfield, plus kind-specific id fields like
+#   `granola_meeting_id`). Top-level placement (not under produced_by) keeps
+#   the lint's single-level-nested-map parser happy AND splits semantics
+#   cleanly: `upstream` is about what the artefact wraps; `produced_by` is
+#   about how it was made.
+# - REQUIRED_PRODUCED_BY_KEYS_SOURCE_PIN drops `sources_cited` — the
+#   upstream IS the provenance; no separate sources list applies.
+REQUIRED_FRONTMATTER_KEYS_SOURCE_PIN = REQUIRED_FRONTMATTER_KEYS | {"upstream"}
+REQUIRED_PRODUCED_BY_KEYS_SOURCE_PIN = {"session_id", "query", "model"}
 
-VALID_KINDS = {"analysis", "plan", "draft", "report", "export", "memo"}
+VALID_KINDS = {"analysis", "plan", "draft", "report", "export", "memo", "source-pin"}
+# Per #198 / C1 (#201): `source-pin` is a transient artefact kind wrapping
+# upstream content (granola meeting, slack thread, etc.) before the harvest
+# pipeline mints a canonical `mem://` id for it. See ADR-0003 Amendment 2.
+# Distinct from `memo` (agent-produced compression) — carries an `upstream:`
+# frontmatter block instead of standard `sources_cited:` provenance.
 
 # Project slug shape per ADR-0003 Amendment 1: <YYYYMMDD>-<short-name>-<4hex>.
 # Short-name must start AND end alphanumeric (matches tools/project.py).
@@ -495,7 +514,15 @@ def check_artefact_md(
             message="markdown artefact must start with YAML frontmatter delimited by ---",
         ))
         return out
-    missing = REQUIRED_FRONTMATTER_KEYS - fm.keys()
+    # Per #198 / C1 (#201): source-pin kind requires top-level `upstream:`
+    # in addition to the standard keys. See REQUIRED_FRONTMATTER_KEYS_SOURCE_PIN.
+    fm_kind = fm.get("kind", "")
+    fm_required = (
+        REQUIRED_FRONTMATTER_KEYS_SOURCE_PIN
+        if isinstance(fm_kind, str) and fm_kind == "source-pin"
+        else REQUIRED_FRONTMATTER_KEYS
+    )
+    missing = fm_required - fm.keys()
     if missing:
         out.append(Violation(
             path=path,
@@ -542,8 +569,40 @@ def check_artefact_md(
             message="produced_by must be a YAML map",
         ))
         return out
-    out.extend(_validate_produced_by_dict(path, pb, known_artefact_uuids=known_artefact_uuids))
+    out.extend(_validate_produced_by_dict(path, pb, kind=kind, known_artefact_uuids=known_artefact_uuids))
+    if isinstance(kind, str) and kind == "source-pin":
+        out.extend(_validate_source_pin_upstream(path, fm))
     out.extend(_validate_drift_fields(path, fm, known_artefact_uuids=known_artefact_uuids))
+    return out
+
+
+def _validate_source_pin_upstream(path: Path, fm: dict) -> list[Violation]:
+    """Validate the top-level `upstream:` field on `kind: source-pin` artefacts.
+    Per #198 / C1 (#201) + ADR-0003 Amendment 2: must be a YAML map with at
+    least a `kind:` subfield (e.g., granola_note, slack_thread). Subfields
+    beyond `kind` are kind-specific (granola_meeting_id, slack_message_ts,
+    etc.) and not validated here — the lint validates shape, not upstream
+    resolution."""
+    out: list[Violation] = []
+    upstream = fm.get("upstream")
+    if upstream is None:
+        # Already covered by REQUIRED_FRONTMATTER_KEYS_SOURCE_PIN missing-keys.
+        return out
+    if not isinstance(upstream, dict):
+        out.append(Violation(
+            path=path,
+            line=1,
+            kind="artefact-malformed-upstream",
+            message="upstream must be a YAML map (source-pin kind)",
+        ))
+        return out
+    if not isinstance(upstream.get("kind"), str) or not upstream.get("kind"):
+        out.append(Violation(
+            path=path,
+            line=1,
+            kind="artefact-upstream-missing-kind",
+            message="upstream missing required `kind` subfield (e.g., granola_note, slack_thread)",
+        ))
     return out
 
 
@@ -696,6 +755,7 @@ def _validate_produced_by_dict(
     path: Path,
     pb: dict,
     *,
+    kind: str = "",
     known_artefact_uuids: set[str] | None = None,
 ) -> list[Violation]:
     """Shared validator for produced_by dicts (Markdown frontmatter + sidecar JSON).
@@ -704,9 +764,18 @@ def _validate_produced_by_dict(
     (project tier + flat tier). When passed, `art://<uuid>` references in
     sources_cited are checked for resolution — dangling refs fail the lint
     (per #98). When None (e.g., per-file invocation outside the vault walk),
-    the dangling-check is skipped."""
+    the dangling-check is skipped.
+
+    Per #198 / C1 (#201): `kind` selects the required-key set:
+    - `source-pin` requires `upstream:` block (transient artefact wrapping
+      upstream content) instead of `sources_cited:`.
+    - All other kinds require `sources_cited:` (the standard agent-produced
+      shape).
+    See ADR-0003 Amendment 2."""
     out: list[Violation] = []
-    pb_missing = REQUIRED_PRODUCED_BY_KEYS - pb.keys()
+    is_source_pin = (kind == "source-pin")
+    required = REQUIRED_PRODUCED_BY_KEYS_SOURCE_PIN if is_source_pin else REQUIRED_PRODUCED_BY_KEYS
+    pb_missing = required - pb.keys()
     if pb_missing:
         out.append(Violation(
             path=path,
@@ -714,6 +783,10 @@ def _validate_produced_by_dict(
             kind="artefact-produced-by-missing-keys",
             message=f"produced_by missing required keys: {sorted(pb_missing)}",
         ))
+    # source-pin: no `sources_cited` required (upstream IS the provenance).
+    # Top-level `upstream:` validation lives in `_validate_source_pin_upstream`.
+    if is_source_pin:
+        return out
     sources = pb.get("sources_cited", [])
     if not isinstance(sources, list) or not sources:
         out.append(Violation(

@@ -332,3 +332,47 @@ KB contributions (people, org, decisions, glossary) **do not become project-scop
 - **F6 (ambiguous current-project)**: If a turn lands an artefact in the wrong project because `PA_PROJECT_ID` was inherited from a stale session, retract — the explicit-resume-only design didn't actually scope the env var per-session.
 - **F7 (slug collision in practice)**: If a real cross-machine slug collision occurs in production within the first 90 days, retract — the 4-hex suffix wasn't sufficient and we need a stronger scheme (machine-id, content-hash, or fail-on-conflict).
 - **F8 (path-based artefact references slip past lint)**: If an agent-produced artefact lands with a filesystem path in `sources_cited` instead of `art://<uuid>` and the lint exits clean, retract — the canonical-source enforcement isn't binding.
+
+## Amendment 2 — `source-pin` artefact kind (2026-05-15)
+
+**Surfaced by**: #198 (closed in C1 / #201). The Vera vision memo project (`projects/20260514-vera-vision-memo-3f31/`) needed to pin a Granola meeting summary as a citable source before the nightly harvest produced a canonical `mem://` id. The existing kinds (`memo`, `analysis`, etc.) all assume agent-produced compression of upstream content; none captured the "transient wrapper around upstream content, awaiting canonical promotion" semantic. Hand-authoring tried `kind: source-pin` with `kind`-vs-directory-vs-taxonomy disagreement; this Amendment resolves the disagreement by binding `source-pin` as a real kind.
+
+### `source-pin` — pre-harvest snapshot of upstream content
+
+A `source-pin` artefact wraps an upstream content piece (Granola meeting, Slack thread, Gmail thread, etc.) that hasn't yet been ingested by the harvest pipeline. The artefact exists so other project artefacts can cite the source via `art://<uuid>` before the canonical `mem://` reference is available. When harvest lands the canonical memory object, the cite-site can be swapped — the `source-pin` artefact remains as a provenance record of the pre-harvest period.
+
+Distinct from `memo`:
+- `memo` is **agent-produced compression** (`produced_by.sources_cited[]` is the provenance — what the agent read to write it).
+- `source-pin` is **the upstream content itself, pinned as a citable artefact** (`upstream:` is the provenance — what was pinned).
+
+### Schema
+
+Required frontmatter keys (in addition to the standard `id`, `kind`, `created_at`, `produced_by`, `title`):
+
+- `upstream:` (top-level map): identifies what was pinned. Required subfields:
+  - `kind:` — one of `granola_note`, `slack_thread`, `gmail_thread`, `web_page`, `file_attachment` (open enum; lint validates non-empty string, not the value set).
+  - Kind-specific id fields (`granola_meeting_id`, `slack_message_ts`, `gmail_message_id`, `url`, `file_path`, etc.) — not lint-validated; the upstream-resolution check is downstream of the lint.
+
+Relaxed in `produced_by`:
+- `sources_cited:` is NOT required (the upstream block IS the provenance).
+- `session_id`, `query`, `model` are still required (who pinned it, with what intent).
+
+### Lifecycle
+
+- **Transient**: a `source-pin` is expected to live for less than 14 days. Once harvest mints the canonical `mem://` for the upstream content, downstream cite-sites swap `art://<source-pin-id>` to `mem://<memory-id>`. The `source-pin` artefact itself is NOT deleted (it remains as a provenance record); but new references should use the canonical form.
+- **Promotion-resilient**: like other artefacts, `id` is content-addressable. Once minted, the `art://<source-pin-id>` reference is stable; cross-references survive directory moves.
+
+### Directory layout
+
+`source-pin` artefacts live at `<content_root>/projects/<slug>/artefacts/source-pin/art-<uuid>.md` (project-scoped) or `<content_root>/artefacts/source-pin/art-<uuid>.<ext>` (flat tier). Same `art-<uuid>.<ext>` filename convention as other kinds. Directory name matches the kind (per the existing convention `artefacts/<kind>/`).
+
+### Lint behavior
+
+`tools/lint-provenance.py:VALID_KINDS` includes `source-pin`. For `kind: source-pin`:
+- Top-level `upstream:` must be a YAML map with a non-empty `kind:` subfield.
+- `produced_by.sources_cited` is NOT required.
+- All other artefact-shape rules (project_id check, `id:` field matching filename stem, frontmatter parseability) apply unchanged.
+
+### Falsifiers (added to original list)
+
+- **F9 (source-pin sprawl)**: If a project accumulates more than 10 `source-pin` artefacts that are not superseded by `mem://` references after 60 days, retract — the harvest pipeline isn't actually promoting them, OR the kind is being mis-used as a permanent attachment shape. The 14-day lifecycle expectation is the discriminator.

@@ -54,6 +54,13 @@ Tests:
   T44 — `kb#X<trailing-whitespace>` refused at the regex level (YAML strips
         trailing whitespace before lint sees it, so this tests the
         defense-in-depth on direct-dict code paths).
+  T45 — `source-pin` kind accepted with `upstream:` block in produced_by
+        (regression for #198 / C1 / #201).
+  T46 — `source-pin` missing `upstream:` block refused.
+  T47 — `source-pin` with malformed `upstream:` (not a dict / missing `kind`
+        subfield) refused.
+  T48 — `source-pin` kind in wrong directory (artefacts/memo/) tolerated
+        today; documents the gap until strict kind-vs-dir cross-check lands.
 """
 
 from __future__ import annotations
@@ -604,6 +611,148 @@ def test_flat_resolves_project_uuid():
     print("  T28 PASS — flat artefact resolves art://<project-uuid>")
 
 
+def test_198_source_pin_kind_accepted_with_upstream():
+    """Regression for #198 / C1 (#201): `source-pin` is a valid artefact kind
+    carrying an `upstream:` block in produced_by instead of `sources_cited:`.
+    Used for pre-harvest snapshots of upstream content (granola meetings,
+    slack threads) awaiting canonical `mem://` promotion. See ADR-0003
+    Amendment 2."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "source-pin").mkdir()
+        (proj / "artefacts" / "source-pin" / "art-pin-001.md").write_text(
+            "---\n"
+            "id: art-pin-001\n"
+            "kind: source-pin\n"
+            "project_id: 20260507-test-aaaa\n"
+            "created_at: 2026-05-15\n"
+            "title: \"Pinned upstream snapshot\"\n"
+            "upstream:\n"
+            "  kind: granola_note\n"
+            "  granola_meeting_id: 25d38b46-7574-404b-b5b2-fcc2d17be67d\n"
+            "  date: 2026-05-14T10:05:00+01:00\n"
+            "produced_by:\n"
+            "  session_id: aaaaaaaa\n"
+            "  query: \"pin granola meeting before harvest lands the canonical mem\"\n"
+            "  model: claude-opus-4-7\n"
+            "---\n\n"
+            "# Pinned upstream snapshot\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, (
+            f"source-pin with upstream block should pass\nstderr: {r.stderr}"
+        )
+    print("  T45 PASS — #198 source-pin kind accepted with upstream block")
+
+
+def test_198_source_pin_refuses_missing_upstream():
+    """`source-pin` artefact without a top-level `upstream:` block
+    must fail — F2 on #201."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "source-pin").mkdir()
+        (proj / "artefacts" / "source-pin" / "art-pin-bad.md").write_text(
+            "---\n"
+            "id: art-pin-bad\n"
+            "kind: source-pin\n"
+            "project_id: 20260507-test-aaaa\n"
+            "created_at: 2026-05-15\n"
+            "title: \"Bad source-pin missing upstream\"\n"
+            "produced_by:\n"
+            "  session_id: aaaaaaaa\n"
+            "  query: \"missing upstream\"\n"
+            "  model: claude-opus-4-7\n"
+            "---\n\n"
+            "# Bad source-pin\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1, (
+            f"source-pin without upstream should fail\nstderr: {r.stderr}"
+        )
+        assert "upstream" in r.stderr, (
+            f"expected upstream-related violation\nstderr: {r.stderr}"
+        )
+    print("  T46 PASS — #198 source-pin without upstream block refused")
+
+
+def test_198_source_pin_refuses_malformed_upstream():
+    """`source-pin` with an `upstream:` field that isn't a dict, or missing
+    `kind:` subfield, must fail."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "source-pin").mkdir()
+        # upstream is a string, not a dict
+        (proj / "artefacts" / "source-pin" / "art-pin-malformed.md").write_text(
+            "---\n"
+            "id: art-pin-malformed\n"
+            "kind: source-pin\n"
+            "project_id: 20260507-test-aaaa\n"
+            "created_at: 2026-05-15\n"
+            "title: \"Malformed upstream\"\n"
+            "upstream: \"not-a-dict\"\n"
+            "produced_by:\n"
+            "  session_id: aaaaaaaa\n"
+            "  query: \"malformed upstream\"\n"
+            "  model: claude-opus-4-7\n"
+            "---\n\n"
+            "body\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 1, (
+            f"source-pin with non-dict upstream should fail\nstderr: {r.stderr}"
+        )
+        assert "malformed-upstream" in r.stderr or "upstream must be" in r.stderr, (
+            f"expected malformed-upstream violation\nstderr: {r.stderr}"
+        )
+    print("  T47 PASS — #198 source-pin with non-dict upstream refused")
+
+
+def test_198_source_pin_in_wrong_directory_fails():
+    """A `kind: source-pin` artefact placed in `artefacts/memo/` (wrong
+    directory) should fail the lint via the directory-walk: only files
+    in a VALID_KINDS directory are indexed, but the kind-vs-directory
+    mismatch isn't currently checked (the lint walks dir-by-kind). This
+    test locks in expected behavior so a future strict-mode kind-dir
+    cross-check can build on it."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        # kind: source-pin BUT in artefacts/memo/. With no kind-vs-dir
+        # cross-check, the lint should still accept (today). This test
+        # documents that behavior. Strict check is a future tightening.
+        (proj / "artefacts" / "memo" / "art-misplaced-pin.md").write_text(
+            "---\n"
+            "id: art-misplaced-pin\n"
+            "kind: source-pin\n"
+            "project_id: 20260507-test-aaaa\n"
+            "created_at: 2026-05-15\n"
+            "title: \"Misplaced source-pin\"\n"
+            "upstream:\n"
+            "  kind: granola_note\n"
+            "produced_by:\n"
+            "  session_id: aaaaaaaa\n"
+            "  query: \"misplaced\"\n"
+            "  model: claude-opus-4-7\n"
+            "---\n\n"
+            "body\n",
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        # Today: passes (kind is valid, frontmatter is valid, only check is
+        # directory walk which finds the file in `artefacts/memo/`).
+        assert r.returncode == 0, (
+            f"source-pin in artefacts/memo/ tolerated today (no kind-dir cross-check)\n"
+            f"stderr: {r.stderr}"
+        )
+    print("  T48 PASS — #198 source-pin in wrong dir documented (no strict-mode cross-check today)")
+
+
 def test_199_kb_heading_literal_text_accepted():
     """Regression for #199 / C1 (#200): `kb#<heading>` accepts the literal
     heading text — spaces, punctuation, em-dashes are all canonical. The
@@ -1031,6 +1180,10 @@ if __name__ == "__main__":
     test_self_reference_passes()
     test_193_art_prefixed_uri_body_tolerated()
     test_flat_resolves_project_uuid()
+    test_198_source_pin_kind_accepted_with_upstream()
+    test_198_source_pin_refuses_missing_upstream()
+    test_198_source_pin_refuses_malformed_upstream()
+    test_198_source_pin_in_wrong_directory_fails()
     test_199_kb_heading_literal_text_accepted()
     test_199_kb_heading_degenerate_shapes_refused()
     test_199_kb_regex_refuses_trailing_ws()
