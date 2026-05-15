@@ -46,6 +46,8 @@ Tests:
   T38 — empty drift_candidate value fails (closes fail-open from review).
   T39 — non-bool drift_candidate value fails distinctly.
   T40 — drift_candidate: true on non-memo kind fails (kind=memo scope).
+  T41 — `art://art-<uuid>` shape tolerated alongside the ADR-canonical
+        `art://<uuid>` (regression for #193 / C3 / #196).
 """
 
 from __future__ import annotations
@@ -538,6 +540,41 @@ def test_self_reference_passes():
     print("  T27 PASS — self-referential art:// passes")
 
 
+def test_193_art_prefixed_uri_body_tolerated():
+    """Regression for #193 / C3 (#196): the ref-check tolerates `art://art-<uuid>`
+    URI bodies (with the redundant `art-` prefix) in addition to the canonical
+    `art://<uuid>` shape from ADR-0003. Some hand-authored memos (e.g. the
+    Vera vision memos that surfaced this bug) use the `art-`-prefixed form.
+
+    Pre-fix, the index was keyed on bare uuid but the ref-check did NOT strip
+    the `art-` prefix from URI bodies — so `art://art-<uuid>` always missed
+    the index. Post-fix, both `:706` (sources_cited) and `:630`
+    (affects_decision) strip a leading `art-` before lookup.
+
+    Mirrors `tools/repros/lint-provenance-art-prefix-mismatch.py` semantics
+    in a durable test. T22 covers the canonical bare-uuid shape; T29 covers
+    the `art-`-prefixed shape — both must resolve."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        (proj / "artefacts" / "memo" / "art-c193-target.md").write_text(
+            _project_artefact_md(
+                "20260507-test-aaaa", "c193-target", "20260507-test-aaaa",
+                sources=["art://art-c193-target"],  # `art-`-prefixed self-ref
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, (
+            f"art://art-<id> self-reference should resolve (tolerance fix)\n"
+            f"stderr: {r.stderr}"
+        )
+        assert "artefact-dangling-art-ref" not in r.stderr, (
+            f"no dangling-art-ref expected\nstderr: {r.stderr}"
+        )
+    print("  T41 PASS — #193 art://art-<id> tolerated (in addition to ADR-canonical art://<id>)")
+
+
 def test_flat_resolves_project_uuid():
     """Cross-tier resolution works in BOTH directions: a flat artefact citing
     art://<project-tier-uuid> must resolve too."""
@@ -884,6 +921,7 @@ if __name__ == "__main__":
     test_dangling_art_ref_fails()
     test_flat_artefact_resolves_art_ref()
     test_self_reference_passes()
+    test_193_art_prefixed_uri_body_tolerated()
     test_flat_resolves_project_uuid()
     test_malformed_project_slug_fails()
     test_dot_prefixed_dirs_exempt_from_slug_check()

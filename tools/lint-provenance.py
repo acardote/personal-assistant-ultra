@@ -65,6 +65,23 @@ CANONICAL_SOURCE_RE = re.compile(
 # `## <heading>` capture (ATX-style only; KB files don't use Setext).
 H2_RE = re.compile(r"^##\s+(?P<title>\S.*?)\s*$", re.MULTILINE)
 
+
+def _normalize_art_uri_body(uri_body: str) -> str:
+    """Strip a leading `art-` prefix from an `art://` URI body so the lookup
+    against `known_artefact_uuids` (keyed by bare uuid) matches both shapes:
+
+    - `art://<uuid>` — ADR-0003 canonical, what `kb-drift-scan` / `kb-process`
+      emit. Body is already bare; this is a no-op.
+    - `art://art-<uuid>` — hand-authored shape (e.g. Vera vision memos that
+      surfaced #193). Strip the redundant `art-` to recover the bare uuid.
+
+    Per #193 / C3 (#196). Real UUIDs cannot legitimately begin with the
+    literal `art-` (only `a` is hex among `a`/`r`/`t`), so the strip is
+    safe by uuid-shape invariant."""
+    if uri_body.startswith("art-"):
+        return uri_body[len("art-"):]
+    return uri_body
+
 # Date markers across the three KB files: decisions.md uses `**Date:**`; people.md
 # / org.md use `**Last verified:**`. Either qualifies as the date for grandfathering.
 DATE_RE = re.compile(
@@ -627,7 +644,7 @@ def _validate_drift_fields(
                 ),
             ))
         elif known_artefact_uuids is not None:
-            ref_uuid = aff_s[len("art://"):]
+            ref_uuid = _normalize_art_uri_body(aff_s[len("art://"):])
             if ref_uuid not in known_artefact_uuids:
                 out.append(Violation(
                     path=path,
@@ -703,7 +720,7 @@ def _validate_produced_by_dict(
             # Dangling-art-ref check (#98): art://<uuid> must resolve to a
             # known artefact in the vault. Skip when no index passed.
             if isinstance(src, str) and src.startswith("art://") and known_artefact_uuids is not None:
-                ref_uuid = src[len("art://"):]
+                ref_uuid = _normalize_art_uri_body(src[len("art://"):])
                 if ref_uuid not in known_artefact_uuids:
                     out.append(Violation(
                         path=path,
@@ -833,6 +850,13 @@ def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
             if not name.startswith("art-") or name.endswith(".provenance.json"):
                 continue
             # Strip "art-" and the file extension to get the uuid.
+            # Index is keyed by bare uuid per ADR-0003 (resolver scans
+            # for `art-<uuid>.<ext>` from the URI body, so the URI body
+            # itself is bare-uuid). Ref-check sites strip a leading
+            # `art-` prefix from the URI body before lookup, tolerating
+            # both `art://<uuid>` and `art://art-<uuid>` shapes (the
+            # latter is what some hand-authored memos use, e.g. Vera
+            # vision memos — see #193 / C3).
             stem = path.stem  # filename without final extension
             if not stem.startswith("art-"):
                 continue
