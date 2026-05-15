@@ -832,12 +832,20 @@ def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
             name = path.name
             if not name.startswith("art-") or name.endswith(".provenance.json"):
                 continue
-            # Strip "art-" and the file extension to get the uuid.
+            # Per #193 / C3: key the index by the FULL `art-<uuid>` stem,
+            # not the bare uuid. The ref-check at line 706 extracts the
+            # URI body via `src[len("art://"):]` which preserves the
+            # `art-` prefix; matching index key shape removes the
+            # prefix-mismatch false-positive that has flagged every
+            # valid `art://art-<uuid>` self-reference as dangling.
+            #
+            # The convention `art://art-<uuid>` matches the `id:` field
+            # in every artefact frontmatter (e.g. `id: art-c4aca38f-...`)
+            # — index, ref, and id are all `art-<uuid>` shape now.
             stem = path.stem  # filename without final extension
             if not stem.startswith("art-"):
                 continue
-            art_uuid = stem[len("art-"):]
-            index.setdefault(art_uuid, []).append(path)
+            index.setdefault(stem, []).append(path)
     return index
 
 

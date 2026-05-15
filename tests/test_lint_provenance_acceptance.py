@@ -428,7 +428,7 @@ def test_art_canonical_source_accepted():
         # Create the referencing artefact.
         (proj / "artefacts" / "memo" / "art-uses-art-ref.md").write_text(
             _project_artefact_md("20260507-test-aaaa", "uses-art-ref", "20260507-test-aaaa",
-                                  sources=["art://orig-123", "kb#some-heading"]),
+                                  sources=["art://art-orig-123", "kb#some-heading"]),
             encoding="utf-8",
         )
         r = run_lint(method)
@@ -511,7 +511,7 @@ def test_flat_artefact_resolves_art_ref():
         (proj / "artefacts" / "memo" / "art-references-flat.md").write_text(
             _project_artefact_md(
                 "20260507-test-aaaa", "references-flat", "20260507-test-aaaa",
-                sources=["art://flat-target"],
+                sources=["art://art-flat-target"],
             ),
             encoding="utf-8",
         )
@@ -522,20 +522,58 @@ def test_flat_artefact_resolves_art_ref():
 
 def test_self_reference_passes():
     """An artefact citing its own art:// uuid should resolve cleanly — the
-    index includes self. derived_from / cycle patterns rely on this."""
+    index includes self. derived_from / cycle patterns rely on this.
+
+    Regression for #193 / C3 (#196): the URI body shape is `art-<uuid>`
+    (matches the file's `id:` field and the production vault convention).
+    Pre-fix, the lint indexed by bare uuid `cycle` but the ref-check
+    extracted `art-cycle`, producing a false dangling-art-ref. Post-fix,
+    index and ref both share the `art-<uuid>` shape and resolve cleanly."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
         proj = _project_dirs(vault, "20260507-test-aaaa")
         (proj / "artefacts" / "memo" / "art-cycle.md").write_text(
             _project_artefact_md(
                 "20260507-test-aaaa", "cycle", "20260507-test-aaaa",
-                sources=["art://cycle"],
+                sources=["art://art-cycle"],
             ),
             encoding="utf-8",
         )
         r = run_lint(method)
         assert r.returncode == 0, f"self-ref should resolve\n{r.stderr}"
-    print("  T27 PASS — self-referential art:// passes")
+    print("  T27 PASS — self-referential art:// passes (regression for #193 / C3)")
+
+
+def test_193_art_prefix_shape_resolves_against_index():
+    """Regression for #193 / C3 (#196): the lint's artefact-uuid index must
+    key on the full `art-<uuid>` stem so URIs of shape `art://art-<uuid>`
+    (the production convention, matching the `id:` field) resolve cleanly.
+
+    Pre-fix, the index keyed on the bare uuid while the ref-check kept the
+    `art-` prefix from the URI body — every valid self-reference looked
+    dangling. Mirrors the C1 repro `tools/repros/lint-provenance-art-prefix-mismatch.py`
+    semantics in a durable test."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        proj = _project_dirs(vault, "20260507-test-aaaa")
+        # Production-shape memo: id includes the art- prefix; sources_cited
+        # uses `art://art-<id>` (the shape the Vera vision memos used).
+        (proj / "artefacts" / "memo" / "art-c193-target.md").write_text(
+            _project_artefact_md(
+                "20260507-test-aaaa", "c193-target", "20260507-test-aaaa",
+                sources=["art://art-c193-target"],  # self-ref, production shape
+            ),
+            encoding="utf-8",
+        )
+        r = run_lint(method)
+        assert r.returncode == 0, (
+            f"art://art-<id> self-reference should resolve under #193's fix\n"
+            f"stderr: {r.stderr}"
+        )
+        assert "artefact-dangling-art-ref" not in r.stderr, (
+            f"no dangling-art-ref expected\nstderr: {r.stderr}"
+        )
+    print("  T29 PASS — #193 production-shape art://art-<id> resolves")
 
 
 def test_flat_resolves_project_uuid():
@@ -553,7 +591,7 @@ def test_flat_resolves_project_uuid():
         (vault / "artefacts" / "memo" / "art-flat-ref.md").write_text(
             "---\nid: art-flat-ref\nkind: memo\ncreated_at: 2026-06-01T10:00:00Z\n"
             "title: t\nproduced_by:\n  session_id: aaaaaaaa\n  query: x\n  model: m\n"
-            "  sources_cited:\n    - art://proj-target\n---\nbody",
+            "  sources_cited:\n    - art://art-proj-target\n---\nbody",
             encoding="utf-8",
         )
         r = run_lint(method)
@@ -658,7 +696,7 @@ def test_drift_candidate_well_formed_passes():
             _drift_memo_md(
                 "drift-candidate",
                 drift_candidate="true",
-                affects_decision="art://source-decision",
+                affects_decision="art://art-source-decision",
                 drift_claim="Decision X says Y, but recent memory N indicates Z.",
                 drift_confidence="high",
                 sources=["mem://mem-abc", "kb#decision-x"],
@@ -683,7 +721,7 @@ def test_drift_candidate_missing_required_fails():
             _drift_memo_md(
                 "incomplete",
                 drift_candidate="true",
-                affects_decision="art://source",
+                affects_decision="art://art-source",
                 drift_confidence="medium",
             ),
             encoding="utf-8",
@@ -775,7 +813,7 @@ def test_drift_confidence_invalid_value_fails():
             _drift_memo_md(
                 "bad-conf",
                 drift_candidate="true",
-                affects_decision="art://source",
+                affects_decision="art://art-source",
                 drift_claim="claim",
                 drift_confidence="extreme",  # invalid
             ),
@@ -884,6 +922,7 @@ if __name__ == "__main__":
     test_dangling_art_ref_fails()
     test_flat_artefact_resolves_art_ref()
     test_self_reference_passes()
+    test_193_art_prefix_shape_resolves_against_index()
     test_flat_resolves_project_uuid()
     test_malformed_project_slug_fails()
     test_dot_prefixed_dirs_exempt_from_slug_check()
