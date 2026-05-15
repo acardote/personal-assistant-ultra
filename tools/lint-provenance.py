@@ -53,9 +53,20 @@ PRODUCED_BY_RE = re.compile(
 )
 
 # Canonical source forms per ADR-0003 (with art:// added in Amendment 1).
+#
+# Per #199 / C1 (#200): `kb#<heading>` accepts the literal KB heading text —
+# spaces, punctuation, em-dashes are all fine. The old shape `kb#[\w\-]+`
+# rejected the natural human-and-agent shape (every Vera vision memo carried
+# `kb#Phase 1 is Atlas 2.0, Vera is Phase 2` and similar). No tool resolves
+# `kb#` references programmatically today, so loosening the shape doesn't
+# break any consumer; it aligns the lint with how humans actually write.
+#
+# The first char after `#` must be non-whitespace (else `kb#` alone or
+# `kb# X` would match — degenerate empty / leading-space shapes). The body
+# is everything up to end-of-line.
 CANONICAL_SOURCE_RE = re.compile(
     r"^(?:"
-    r"kb#[\w\-]+"                      # kb#heading-slug
+    r"kb#\S[^\n]*"                     # kb#heading-text (literal, may include spaces/punctuation)
     r"|mem://[\w\-]+"                  # mem://<memory-id>
     r"|art://[\w\-]+"                  # art://<art-uuid> (per Amendment 1)
     r"|https?://\S+"                   # bare URL
