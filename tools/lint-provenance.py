@@ -783,9 +783,36 @@ def _validate_produced_by_dict(
             kind="artefact-produced-by-missing-keys",
             message=f"produced_by missing required keys: {sorted(pb_missing)}",
         ))
-    # source-pin: no `sources_cited` required (upstream IS the provenance).
+    # source-pin: `sources_cited` is NOT required (upstream IS the provenance).
     # Top-level `upstream:` validation lives in `_validate_source_pin_upstream`.
+    # However, if a source-pin author copies a memo template and ends up with
+    # `sources_cited:` present-but-malformed (empty list, non-list), don't
+    # silently tolerate it — validate the shape when present, even if it's
+    # optional (per pr-reviewer #3 on PR #203).
     if is_source_pin:
+        if "sources_cited" in pb:
+            sources = pb.get("sources_cited", [])
+            if not isinstance(sources, list):
+                out.append(Violation(
+                    path=path,
+                    line=1,
+                    kind="artefact-malformed-sources",
+                    message="produced_by.sources_cited must be a list (got non-list value)",
+                ))
+            # Empty list is fine on source-pin — upstream block carries the
+            # provenance. Non-canonical entries WHEN PRESENT are still violations.
+            elif sources:
+                for src in sources:
+                    if not isinstance(src, str) or not CANONICAL_SOURCE_RE.match(src):
+                        out.append(Violation(
+                            path=path,
+                            line=1,
+                            kind="artefact-non-canonical-source",
+                            message=(
+                                f"sources_cited entry {src!r} not canonical "
+                                f"(need kb#heading | mem://<id> | art://<id> | https://...)"
+                            ),
+                        ))
         return out
     sources = pb.get("sources_cited", [])
     if not isinstance(sources, list) or not sources:
@@ -879,6 +906,11 @@ def check_artefact_export(
                     f"directory {expected_project_id!r}"
                 ),
             ))
+    # Per pr-reviewer + pr-challenger on PR #203: source-pin is markdown-only
+    # per ADR-0003 Amendment 2 — no export sidecars exist for kind=source-pin.
+    # If that ever changes, thread `kind=` through this call to route to the
+    # source-pin produced_by schema; today the default standard path is correct
+    # because every export artefact has `kind: export`.
     out.extend(_validate_produced_by_dict(sidecar, data, known_artefact_uuids=known_artefact_uuids))
     return out
 

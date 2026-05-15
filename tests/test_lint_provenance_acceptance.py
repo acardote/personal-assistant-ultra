@@ -60,7 +60,8 @@ Tests:
   T47 — `source-pin` with malformed `upstream:` (not a dict / missing `kind`
         subfield) refused.
   T48 — `source-pin` kind in wrong directory (artefacts/memo/) tolerated
-        today; documents the gap until strict kind-vs-dir cross-check lands.
+        today (no strict kind-vs-dir cross-check); test name reflects
+        what's locked in — passes-today, tighten-later.
 """
 
 from __future__ import annotations
@@ -713,13 +714,19 @@ def test_198_source_pin_refuses_malformed_upstream():
     print("  T47 PASS — #198 source-pin with non-dict upstream refused")
 
 
-def test_198_source_pin_in_wrong_directory_fails():
-    """A `kind: source-pin` artefact placed in `artefacts/memo/` (wrong
-    directory) should fail the lint via the directory-walk: only files
-    in a VALID_KINDS directory are indexed, but the kind-vs-directory
-    mismatch isn't currently checked (the lint walks dir-by-kind). This
-    test locks in expected behavior so a future strict-mode kind-dir
-    cross-check can build on it."""
+def test_198_source_pin_in_wrong_directory_tolerated_today():
+    """Per pr-reviewer #1 on PR #203: name now matches assertion.
+
+    A `kind: source-pin` artefact placed in `artefacts/memo/` (wrong
+    directory) currently passes lint — the kind-vs-directory mismatch
+    isn't cross-checked. The lint walks dir-by-kind (only files in a
+    VALID_KINDS directory are processed), and within a kind dir the
+    frontmatter's own `kind:` is validated against VALID_KINDS but not
+    against the parent directory's name.
+
+    This test LOCKS IN that today's behavior is "tolerated" so a future
+    strict-mode kind-vs-dir cross-check has a known starting point. See
+    the follow-up child filed under #198 for the strict-check work."""
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
         proj = _project_dirs(vault, "20260507-test-aaaa")
@@ -750,7 +757,7 @@ def test_198_source_pin_in_wrong_directory_fails():
             f"source-pin in artefacts/memo/ tolerated today (no kind-dir cross-check)\n"
             f"stderr: {r.stderr}"
         )
-    print("  T48 PASS — #198 source-pin in wrong dir documented (no strict-mode cross-check today)")
+    print("  T48 PASS — #198 source-pin in wrong dir tolerated today (no strict-mode cross-check yet)")
 
 
 def test_199_kb_heading_literal_text_accepted():
@@ -1183,7 +1190,7 @@ if __name__ == "__main__":
     test_198_source_pin_kind_accepted_with_upstream()
     test_198_source_pin_refuses_missing_upstream()
     test_198_source_pin_refuses_malformed_upstream()
-    test_198_source_pin_in_wrong_directory_fails()
+    test_198_source_pin_in_wrong_directory_tolerated_today()
     test_199_kb_heading_literal_text_accepted()
     test_199_kb_heading_degenerate_shapes_refused()
     test_199_kb_regex_refuses_trailing_ws()

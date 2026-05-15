@@ -361,10 +361,13 @@ Relaxed in `produced_by`:
 
 - **Transient**: a `source-pin` is expected to live for less than 14 days. Once harvest mints the canonical `mem://` for the upstream content, downstream cite-sites swap `art://<source-pin-id>` to `mem://<memory-id>`. The `source-pin` artefact itself is NOT deleted (it remains as a provenance record); but new references should use the canonical form.
 - **Promotion-resilient**: like other artefacts, `id` is content-addressable. Once minted, the `art://<source-pin-id>` reference is stable; cross-references survive directory moves.
+- **Supersession metadata**: a `source-pin` MAY carry an optional `superseded_by: mem://<memory-id>` frontmatter field, set when the harvest pipeline mints the canonical memory object. This field is the mechanical record that F9's "60-day unsuperseded" metric reads from. Today the field is optional and lint-tolerated; future tooling computing the sprawl metric reads from this field (or falls back to "older than 60 days regardless of supersession" if absent). Authors and harvest tooling SHOULD set this field at promotion time; un-promoted source-pins may leave it `null`.
 
 ### Directory layout
 
-`source-pin` artefacts live at `<content_root>/projects/<slug>/artefacts/source-pin/art-<uuid>.md` (project-scoped) or `<content_root>/artefacts/source-pin/art-<uuid>.<ext>` (flat tier). Same `art-<uuid>.<ext>` filename convention as other kinds. Directory name matches the kind (per the existing convention `artefacts/<kind>/`).
+`source-pin` artefacts live at `<content_root>/projects/<slug>/artefacts/source-pin/art-<uuid>.md` (project-scoped) or `<content_root>/artefacts/source-pin/art-<uuid>.md` (flat tier). Same `art-<uuid>.md` filename convention as other kinds. Directory name matches the kind (per the existing convention `artefacts/<kind>/`).
+
+**Markdown-only (no export sidecars)**: source-pin is restricted to Markdown frontmatter — there is no `.provenance.json` sidecar variant for this kind. The lint's export-sidecar validator currently routes via directory name (`artefacts/export/`); since source-pin lives in its own directory, the question doesn't arise. If a future use case demands binary source-pin content (e.g., screenshot attachments), that's an extension requiring an ADR amendment + lint plumbing change, not a permitted variant of today's schema.
 
 ### Lint behavior
 
