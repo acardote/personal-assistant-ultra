@@ -940,9 +940,39 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="check only method-side rules (glossary), skip vault — for method-repo CI",
     )
+    p.add_argument(
+        "--content-root",
+        metavar="PATH",
+        default=None,
+        help=(
+            "override vault content_root (skips .assistant.local.json). Intended "
+            "for repro scripts and tests that need a sandboxed vault — production "
+            "callers should rely on the config file."
+        ),
+    )
     args = p.parse_args(argv)
 
-    cfg = load_config(require_explicit_content_root=False)
+    # Per pr-reviewer + pr-challenger on #195 (closer #194 of #193): when the
+    # caller supplied `--content-root`, skip the .assistant.local.json
+    # lookup entirely. Avoids the spurious "config fallback" warning + lets
+    # repro scripts and tests sandbox the lint without touching shared
+    # config files. The override is treated as an authoritative vault
+    # (`config_source = "cli-override"`), not a fallback.
+    if args.content_root:
+        from dataclasses import replace
+        # Construct a minimal config without invoking load_config (which
+        # would otherwise emit the fallback warning).
+        method_root_path = Path(__file__).resolve().parent.parent
+        override = Path(args.content_root).expanduser().resolve()
+        from _config import Config as _Config
+        cfg = _Config(
+            method_root=method_root_path,
+            content_root=override,
+            config_source="cli-override",
+            config_path=method_root_path / ".assistant.local.json",
+        )
+    else:
+        cfg = load_config(require_explicit_content_root=False)
     method_root = cfg.method_root
 
     violations: list[Violation] = []
