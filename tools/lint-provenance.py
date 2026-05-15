@@ -627,7 +627,12 @@ def _validate_drift_fields(
                 ),
             ))
         elif known_artefact_uuids is not None:
+            # Per #193 / C3: tolerate both bare-uuid (ADR-0003 canonical) and
+            # `art-`-prefixed URI bodies. See the sources_cited ref-check above
+            # for the rationale.
             ref_uuid = aff_s[len("art://"):]
+            if ref_uuid.startswith("art-"):
+                ref_uuid = ref_uuid[len("art-"):]
             if ref_uuid not in known_artefact_uuids:
                 out.append(Violation(
                     path=path,
@@ -702,8 +707,18 @@ def _validate_produced_by_dict(
                 continue
             # Dangling-art-ref check (#98): art://<uuid> must resolve to a
             # known artefact in the vault. Skip when no index passed.
+            #
+            # Per #193 / C3: tolerate both `art://<uuid>` (ADR-0003 canonical
+            # shape) AND `art://art-<uuid>` (the shape some hand-authored
+            # memos use — e.g. Vera vision memos). The index is keyed by
+            # bare uuid; strip a leading `art-` from the URI body if present
+            # so both shapes resolve. Filename-construction in the error
+            # message uses the bare uuid so it matches what `_collect_artefact_uuids`
+            # actually looks for (`art-<uuid>.<ext>`).
             if isinstance(src, str) and src.startswith("art://") and known_artefact_uuids is not None:
                 ref_uuid = src[len("art://"):]
+                if ref_uuid.startswith("art-"):
+                    ref_uuid = ref_uuid[len("art-"):]
                 if ref_uuid not in known_artefact_uuids:
                     out.append(Violation(
                         path=path,
@@ -832,20 +847,19 @@ def _collect_artefact_uuids(art_dir: Path) -> dict[str, list[Path]]:
             name = path.name
             if not name.startswith("art-") or name.endswith(".provenance.json"):
                 continue
-            # Per #193 / C3: key the index by the FULL `art-<uuid>` stem,
-            # not the bare uuid. The ref-check at line 706 extracts the
-            # URI body via `src[len("art://"):]` which preserves the
-            # `art-` prefix; matching index key shape removes the
-            # prefix-mismatch false-positive that has flagged every
-            # valid `art://art-<uuid>` self-reference as dangling.
-            #
-            # The convention `art://art-<uuid>` matches the `id:` field
-            # in every artefact frontmatter (e.g. `id: art-c4aca38f-...`)
-            # — index, ref, and id are all `art-<uuid>` shape now.
+            # Strip "art-" and the file extension to get the uuid.
+            # Index is keyed by bare uuid per ADR-0003 (resolver scans
+            # for `art-<uuid>.<ext>` from the URI body, so the URI body
+            # itself is bare-uuid). Ref-check sites strip a leading
+            # `art-` prefix from the URI body before lookup, tolerating
+            # both `art://<uuid>` and `art://art-<uuid>` shapes (the
+            # latter is what some hand-authored memos use, e.g. Vera
+            # vision memos — see #193 / C3).
             stem = path.stem  # filename without final extension
             if not stem.startswith("art-"):
                 continue
-            index.setdefault(stem, []).append(path)
+            art_uuid = stem[len("art-"):]
+            index.setdefault(art_uuid, []).append(path)
     return index
 
 
