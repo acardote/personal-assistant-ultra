@@ -117,6 +117,60 @@ tools/route.py "what's the latest on Acko launch certification?"
 
 This runs the multi-agent router (advisor + adversarial critic + optional specialist) over your KB + retrieved memory objects.
 
+## Working on multiple projects in parallel
+
+By default, every Claude Code session you launch from the method-repo checkout writes to the single canonical content vault declared in `.assistant.local.json`. Two concurrent sessions on the same vault will serialize on the git working tree (one's commit blocks the other) or step on each other's untracked / staged state.
+
+The `scripts/pa-session` helper (per [#214](https://github.com/acardote/personal-assistant-ultra/issues/214)) gives each project its own vault worktree at `<vault>/.pa-worktrees/<short>/` on branch `project/<short>`, routes the session to that worktree via the `PA_CONTENT_ROOT` env var, and isolates per-project commits / `.harvest/` / `.pa-active-project.json` state. Two concurrent sessions on different `<short>` slugs do not collide.
+
+### Lifecycle
+
+```
+# Start a new project. First run also adds /.pa-worktrees/ to <vault>/.gitignore
+# (committed on main) so the worktrees don't show up as untracked in the canonical
+# vault's `git status`. Pass --auto to skip the confirmation prompt.
+scripts/pa-session new q3-strategy "draft of the Q3 strategy doc"
+
+# Pause: just exit claude. The worktree + branch + .pa-active-project.json persist.
+
+# Resume: re-launches claude pointed at the existing worktree.
+scripts/pa-session resume q3-strategy
+
+# Enumerate sessions you have on disk. Default filter --status active --format table
+# sorted by last_active desc. --status archived / all, --format json also supported.
+scripts/pa-session list
+
+# Close: archive the project (project.md status flip), commit the archive flip on the
+# project branch, optionally merge back to main, and remove the worktree.
+scripts/pa-session close q3-strategy --merge        # merge project/q3-strategy → main, then remove worktree
+scripts/pa-session close q3-strategy --keep-branch  # leave branch standalone (e.g. sensitive projects); remove worktree only
+
+# Helpers:
+scripts/pa-session path q3-strategy    # print absolute worktree path (for shell composition)
+scripts/pa-session doctor              # self-check: gitignore entry, registered worktrees, orphan dirs, missing scaffolds
+```
+
+### What the helper sets up under the hood
+
+For `pa-session new q3-strategy "...":`
+1. First-run only: appends `/.pa-worktrees/` to `<vault>/.gitignore` and commits on main.
+2. `git -C <vault> worktree add .pa-worktrees/q3-strategy -b project/q3-strategy`.
+3. Calls `PA_CONTENT_ROOT=<vault>/.pa-worktrees/q3-strategy tools/project.py new q3-strategy "..."` to scaffold the project + write `.pa-active-project.json` inside the worktree.
+4. `os.execvpe("claude", env={... PA_CONTENT_ROOT=<wt> ...})` — the session inherits the env-routed content_root.
+
+For `pa-session resume`/`new` the spawned `claude` session reads `PA_CONTENT_ROOT` via `tools/_config.py:load_config()` and routes every path-resolving tool (`tools/project.py`, `tools/lint-provenance.py`, `tools/route.py`, etc.) to the worktree.
+
+### Env vars exposed
+
+- **`PA_CONTENT_ROOT`** — when set, `tools/_config.py:load_config()` honors this as the session's content_root, ignoring `.assistant.local.json`. The helper sets this on your behalf; you can also set it manually for ad-hoc routing.
+- **`PA_QUIET=1`** — suppresses the `[pa] content_root via PA_CONTENT_ROOT = <path>` stderr breadcrumb. Useful for non-interactive runs (tests, scripts).
+- **`PA_PROJECT_ID`** — set by `tools/project.py new` / `resume` on stdout (as a shell-source line). The skill activation contract reads this for per-turn project context.
+
+### When NOT to use the helper
+
+- Single-project workflows: if you only ever have one project active at a time, the canonical-vault flow remains the simplest path. Just `claude` from the method-repo root and `tools/project.py new` as before.
+- Sensitive / one-off projects whose artefacts must never merge to the canonical vault: use `pa-session close --keep-branch`. The branch retains the history on disk but main never sees it.
+
 ## When things go wrong
 
 - **`.assistant.local.json` not found warning**: tools fall back to the method root with a loud stderr banner. That's OK for fixtures; NOT OK for real harvest. Re-run bootstrap to create the config.

@@ -16,6 +16,8 @@ This skill operates against **two repos**:
 
 Tools resolve paths via `tools/_config.py`. When `.assistant.local.json` is missing or malformed, tools emit a LOUD stderr warning and fall back to the method root (OK for fixtures/tests; **NOT OK for real harvest** — it's the F1 pollution path #12 was scoped to close). Setup: copy `.assistant.local.json.example` → `.assistant.local.json` and edit `paths.content_root` to point at your vault checkout. End-to-end setup walkthrough lives in [#14](https://github.com/acardote/personal-assistant-ultra/issues/14)'s deliverables (`docs/setup.md` + `tools/bootstrap.py`).
 
+Per [#214](https://github.com/acardote/personal-assistant-ultra/issues/214) (A+D), `_config.py` also honors a `PA_CONTENT_ROOT` env var when set: that takes precedence over `.assistant.local.json` and lets a session route to a vault worktree (e.g. `<vault>/.pa-worktrees/<short>/`) for concurrent multi-project work. The `scripts/pa-session` helper wraps the worktree + scaffold + launch flow. Everything described below (`<content_root>` placeholders, the activation contract's project check, artefact paths) resolves naturally to the env-routed root when a session is launched via the helper — no per-tool special-casing.
+
 ## What "always in context" means here
 
 The layer-3 knowledge base is the assistant's ground truth on the user, the user's org, the user's durable decisions, and project-specific terms. It must be loaded on every invocation.
