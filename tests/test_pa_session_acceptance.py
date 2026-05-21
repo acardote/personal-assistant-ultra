@@ -243,6 +243,54 @@ def test_doctor_clean():
         assert "FAIL" not in r.stdout
 
 
+def test_reopen_after_keep_branch_close():
+    """T14 — close --keep-branch + reopen + resume round-trip works end-to-end (#221)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        run_helper(method, "new", "qproj", "p1", "--auto", "--no-launch")
+        wt = vault / ".pa-worktrees" / "qproj"
+        # Commit scaffold so close doesn't trip dirty-state refusal.
+        subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=t", "add", "-A"],
+                       cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=t", "commit",
+                        "-m", "scaffold"], cwd=wt, check=True, capture_output=True)
+        run_helper(method, "close", "qproj", "--keep-branch")
+        assert not wt.is_dir()
+        r = run_helper(method, "reopen", "qproj", "--no-launch")
+        assert "recreated worktree" in r.stderr, r.stderr
+        assert wt.is_dir(), "worktree should be recreated"
+        proj_dirs = [p for p in (wt / "projects").iterdir() if p.is_dir()]
+        assert len(proj_dirs) == 1
+        text = (proj_dirs[0] / "project.md").read_text(encoding="utf-8")
+        assert "status: active" in text, text
+        assert "archived_at:" not in text, "archived_at should be dropped"
+        assert (wt / ".pa-active-project.json").is_file()
+        # Round-trip: resume should now succeed.
+        r2 = run_helper(method, "resume", "qproj", "--no-launch")
+        assert r2.returncode == 0
+
+
+def test_reopen_refuses_existing_worktree():
+    """T15 — reopen of a project whose worktree already exists refuses with collision message (F1 of #222)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, _vault = make_fixture(Path(td))
+        run_helper(method, "new", "qproj", "p1", "--auto", "--no-launch")
+        r = run_helper(method, "reopen", "qproj", "--no-launch", expect_rc=None)
+        assert r.returncode != 0
+        assert "already exists" in r.stderr, r.stderr
+        assert "pa-session resume qproj" in r.stderr, r.stderr
+
+
+def test_reopen_refuses_missing_branch():
+    """T16 — reopen with no project/<short> branch refuses with manual-recovery message (F5 of #222)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, _vault = make_fixture(Path(td))
+        r = run_helper(method, "reopen", "nothere", "--no-launch", expect_rc=None)
+        assert r.returncode != 0
+        assert "does not exist locally" in r.stderr, r.stderr
+        assert "git" in r.stderr and "worktree add" in r.stderr, r.stderr
+
+
 def test_doctor_finds_orphan():
     """T13 — doctor reports orphan when a .pa-worktrees/* dir is not git-registered."""
     with tempfile.TemporaryDirectory() as td:

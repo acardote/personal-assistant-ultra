@@ -151,11 +151,18 @@ def surgical_update_frontmatter(text: str, updates: dict) -> str:
 
     This preserves nested maps/lists like `produced_by: { session_id, query,
     model, sources_cited }` verbatim — the lossy parse_frontmatter would drop
-    them, destroying provenance on every promote/copy/archive."""
+    them, destroying provenance on every promote/copy/archive.
+
+    Per #221's `cmd_reopen` need: setting an update value to `None` deletes the
+    key (and any nested block it owned). A `None` for a key that isn't present
+    is a no-op. This lets archive ↔ reopen symmetrically add and drop the
+    `archived_at` field via the same helper."""
     if not text.startswith("---\n"):
         # No frontmatter — synthesize one. Updates are flat by contract.
         out = ["---"]
         for k, v in updates.items():
+            if v is None:
+                continue  # delete-of-missing is a no-op
             out.append(f"{k}:" if v == "" else f"{k}: {v}")
         out.append("---")
         return "\n".join(out) + "\n" + text
@@ -191,22 +198,31 @@ def surgical_update_frontmatter(text: str, updates: dict) -> str:
 
         if key in keys_remaining:
             new_val = keys_remaining.pop(key)
-            out_lines.append(f"{key}:" if new_val == "" else f"{key}: {new_val}")
-            i += 1
-            # If the existing value was empty AND followed by indented lines,
-            # those were the OLD nested block — drop them (we replaced with a
-            # scalar). For the use cases in this tool (overwriting project_id,
-            # last_active, status, archived_at, derived_from, id), the new
-            # value is always scalar so dropping the old nested block is safe.
-            if existing_val == "":
-                while i < len(lines) and lines[i].startswith((" ", "\t")):
-                    i += 1
+            if new_val is None:
+                # Delete: skip emitting this key, and drop any nested block it owned.
+                i += 1
+                if existing_val == "":
+                    while i < len(lines) and lines[i].startswith((" ", "\t")):
+                        i += 1
+            else:
+                out_lines.append(f"{key}:" if new_val == "" else f"{key}: {new_val}")
+                i += 1
+                # If the existing value was empty AND followed by indented lines,
+                # those were the OLD nested block — drop them (we replaced with a
+                # scalar). For the use cases in this tool (overwriting project_id,
+                # last_active, status, archived_at, derived_from, id), the new
+                # value is always scalar so dropping the old nested block is safe.
+                if existing_val == "":
+                    while i < len(lines) and lines[i].startswith((" ", "\t")):
+                        i += 1
         else:
             out_lines.append(line)
             i += 1
 
-    # Append any keys that didn't already exist.
+    # Append any keys that didn't already exist (skipping deletes-of-missing).
     for k, v in keys_remaining.items():
+        if v is None:
+            continue
         out_lines.append(f"{k}:" if v == "" else f"{k}: {v}")
 
     return "---\n" + "\n".join(out_lines) + closing_and_body
@@ -554,6 +570,46 @@ def cmd_archive(args, cfg) -> int:
     return 0
 
 
+def cmd_reopen(args, cfg) -> int:
+    """Inverse of `cmd_archive` (per #221). Flips status: archived → active,
+    drops `archived_at`, re-writes the active-project pointer for this content
+    root. Refuses if the project is already active (symmetry with archive's
+    refusal-against-already-archived isn't enforced today but the spirit is the
+    same: this operation has a precondition on current state).
+
+    Does NOT touch the worktree / branch / git state — that's pa-session's job.
+    This command handles the filesystem-level state contract only.
+    """
+    slug = find_slug(cfg.content_root, args.slug)
+    if not slug:
+        print(f"no project matching {args.slug!r}", file=sys.stderr)
+        return 1
+
+    project_md = project_dir(cfg.content_root, slug) / "project.md"
+    if not project_md.is_file():
+        print(f"{project_md} not found", file=sys.stderr)
+        return 1
+
+    text = project_md.read_text(encoding="utf-8")
+    # Inspect current status to refuse a no-op reopen (F6 of #222).
+    fm, _body = parse_frontmatter(text)
+    if fm.get("status") == "active":
+        print(f"already active: {slug}", file=sys.stderr)
+        return 1
+
+    project_md.write_text(
+        surgical_update_frontmatter(text, {"status": "active", "archived_at": None}),
+        encoding="utf-8",
+    )
+
+    # Re-set the active pointer for this content root.
+    write_state(cfg.content_root, slug)
+
+    print(f"reopened: {slug}")
+    print(f"export PA_PROJECT_ID={slug}")
+    return 0
+
+
 def find_artefact(content_root: Path, art_uuid: str) -> Path | None:
     """Locate an artefact by UUID. Walks projects/*/artefacts/<kind>/ + flat
     artefacts/<kind>/. Returns the body file (not the sidecar) if found. None
@@ -770,6 +826,13 @@ def main(argv=None) -> int:
     p_archive = sub.add_parser("archive", help="flip status to archived")
     p_archive.add_argument("slug")
     p_archive.set_defaults(func=cmd_archive)
+
+    p_reopen = sub.add_parser(
+        "reopen",
+        help="inverse of archive: flip status → active, drop archived_at, re-set active pointer (per #221)",
+    )
+    p_reopen.add_argument("slug")
+    p_reopen.set_defaults(func=cmd_reopen)
 
     p_promote = sub.add_parser("promote", help="move flat artefact into project")
     p_promote.add_argument("art_uuid")

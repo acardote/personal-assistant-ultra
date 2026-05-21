@@ -132,6 +132,57 @@ def test_archive_clears_state_if_active():
     print("  T4 PASS — archive flips status + clears state")
 
 
+def test_reopen_archive_round_trip():
+    """T4a — archive → reopen restores status: active, drops archived_at, re-sets active pointer (#221)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        run(method, "new", "x", "i")
+        slug = get_active_slug(vault)
+        run(method, "archive", slug)
+        text_archived = (vault / "projects" / slug / "project.md").read_text(encoding="utf-8")
+        assert "status: archived" in text_archived
+        assert "archived_at:" in text_archived
+        # Round-trip.
+        r = run(method, "reopen", slug)
+        assert "reopened:" in r.stdout, r.stdout
+        text_reopened = (vault / "projects" / slug / "project.md").read_text(encoding="utf-8")
+        assert "status: active" in text_reopened, text_reopened
+        assert "archived_at:" not in text_reopened, "archived_at should be dropped"
+        # Active pointer restored.
+        assert (vault / ".pa-active-project.json").is_file()
+        assert get_active_slug(vault) == slug
+    print("  T4a PASS — archive → reopen round-trip restores active state")
+
+
+def test_reopen_refuses_already_active():
+    """T4b — reopen of a project that's already status: active refuses (F6 of #222)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        run(method, "new", "x", "i")
+        slug = get_active_slug(vault)
+        r = run(method, "reopen", slug, expect_rc=None)
+        assert r.returncode != 0, "reopen against active project should refuse"
+        assert "already active" in r.stderr, r.stderr
+    print("  T4c PASS — reopen of already-active project refuses")
+
+
+def test_reopen_archive_reopen_archive_cycle():
+    """T4c — second archive after reopen behaves identically to first (no residual state)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        run(method, "new", "x", "i")
+        slug = get_active_slug(vault)
+        run(method, "archive", slug)
+        run(method, "reopen", slug)
+        run(method, "archive", slug)
+        text = (vault / "projects" / slug / "project.md").read_text(encoding="utf-8")
+        assert "status: archived" in text
+        assert "archived_at:" in text
+        assert text.count("status:") == 1, "duplicate status: line in frontmatter"
+        assert text.count("archived_at:") == 1, "duplicate archived_at: line"
+    print("  T4d PASS — archive → reopen → archive cycle is clean (no residual frontmatter)")
+
+
 def test_status_reports_active():
     with tempfile.TemporaryDirectory() as td:
         method, vault = make_fixture(Path(td))
@@ -623,6 +674,9 @@ if __name__ == "__main__":
     test_project_md_is_clean()
     test_list_filters_archived()
     test_archive_clears_state_if_active()
+    test_reopen_archive_round_trip()
+    test_reopen_refuses_already_active()
+    test_reopen_archive_reopen_archive_cycle()
     test_status_reports_active()
     test_clear_removes_state()
     test_promote_moves_flat_artefact()

@@ -145,6 +145,13 @@ scripts/pa-session list
 scripts/pa-session close q3-strategy --merge        # merge project/q3-strategy → main, then remove worktree
 scripts/pa-session close q3-strategy --keep-branch  # leave branch standalone (e.g. sensitive projects); remove worktree only
 
+# Reopen a project that was closed with --keep-branch (the branch is still present
+# locally). Recreates the worktree from project/<short>, flips status back to active,
+# drops archived_at, re-sets .pa-active-project.json, commits the un-archive flip,
+# and launches claude. Refuses if the worktree already exists OR if the branch was
+# deleted (the --merge close case — refusal message surfaces the manual recovery).
+scripts/pa-session reopen q3-strategy
+
 # Helpers:
 scripts/pa-session path q3-strategy    # print absolute worktree path (for shell composition)
 scripts/pa-session doctor              # self-check: gitignore entry, registered worktrees, orphan dirs, missing scaffolds

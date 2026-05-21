@@ -243,6 +243,82 @@ def cmd_new(args, vault: Path) -> int:
     return 0  # unreachable
 
 
+def cmd_reopen(args, vault: Path) -> int:
+    """Inverse of `cmd_close --keep-branch` (per #221). Recreates the worktree
+    from the existing `project/<short>` branch, flips frontmatter status back
+    to active, re-writes the active pointer, commits the un-archive flip, then
+    exec's claude. Refuses on:
+    - worktree already at <vault>/.pa-worktrees/<short>/ (collision)
+    - branch project/<short> doesn't exist locally (the --merge close case;
+      manual recovery path surfaced in the refusal message)."""
+    validate_short(args.short)
+    wt_path = worktree_path(vault, args.short)
+    if wt_path.is_dir():
+        sys.exit(
+            f"pa-session: worktree at {wt_path} already exists. "
+            f"Run `pa-session resume {args.short}` if you meant to enter the existing session."
+        )
+    branch = f"project/{args.short}"
+    branch_check = run_git(
+        "branch", "--list", branch, cwd=vault, capture=True
+    ).stdout
+    if not branch_check.strip():
+        sys.exit(
+            f"pa-session: branch {branch!r} does not exist locally. This usually "
+            f"means the project was closed via `--merge`, which deletes the "
+            f"branch after merging to main. Manual recovery:\n"
+            f"  git -C {vault} worktree add -b {branch} .pa-worktrees/{args.short} main\n"
+            f"  # then edit projects/<slug>/project.md: status: archived -> active, drop archived_at\n"
+            f"  # then re-run `pa-session resume {args.short}`"
+        )
+
+    (vault / WORKTREES_SUBDIR).mkdir(exist_ok=True)
+    run_git("worktree", "add", str(wt_path), branch, cwd=vault)
+    print(
+        f"pa-session: recreated worktree at {wt_path} on branch {branch}",
+        file=sys.stderr,
+    )
+
+    slug, _fm = find_worktree_project(wt_path)
+    if slug is None:
+        sys.exit(
+            f"pa-session: worktree at {wt_path} has no projects/*/project.md scaffold. "
+            f"This is unexpected — the branch should carry the project history."
+        )
+
+    env = {**os.environ, "PA_CONTENT_ROOT": str(wt_path), "PA_QUIET": "1"}
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(METHOD_ROOT / "tools" / "project.py"),
+            "reopen",
+            args.short,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(f"pa-session: project.py reopen failed (rc={r.returncode})")
+    sys.stderr.write(r.stdout)
+
+    status_after_reopen = run_git("status", "--porcelain", cwd=wt_path, capture=True).stdout
+    if status_after_reopen.strip():
+        run_git("add", "-A", cwd=wt_path)
+        run_git("commit", "-m", f"reopen: {args.short}", cwd=wt_path)
+
+    if args.no_launch:
+        print(
+            f"pa-session: --no-launch set; to launch:\n  PA_CONTENT_ROOT={wt_path} claude",
+            file=sys.stderr,
+        )
+        return 0
+    env = {**os.environ, "PA_CONTENT_ROOT": str(wt_path)}
+    os.execvpe("claude", ["claude"], env)
+    return 0  # unreachable
+
+
 def cmd_resume(args, vault: Path) -> int:
     validate_short(args.short)
     wt_path = worktree_path(vault, args.short)
@@ -449,6 +525,14 @@ def main() -> int:
     p_resume.add_argument("short")
     p_resume.add_argument("--no-launch", action="store_true")
     p_resume.set_defaults(func=cmd_resume)
+
+    p_reopen = sub.add_parser(
+        "reopen",
+        help="Recreate worktree from existing project/<short> branch, flip status → active, launch claude (per #221).",
+    )
+    p_reopen.add_argument("short")
+    p_reopen.add_argument("--no-launch", action="store_true")
+    p_reopen.set_defaults(func=cmd_reopen)
 
     p_path = sub.add_parser("path", help="Print absolute worktree path.")
     p_path.add_argument("short")
