@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""pa-session — per-project session helper for personal-assistant-ultra (C3 of #214).
+
+Each project lives in a vault worktree at <vault>/.pa-worktrees/<short>/ on branch
+project/<short>. The helper routes the launched claude session to that worktree via
+the PA_CONTENT_ROOT env var (the routing primitive added in C2).
+
+Verbs:
+  new <short> "<intent>"    Worktree + project scaffold + launch claude.
+  resume <short>            Re-launch claude pointed at existing worktree.
+  list [--status ...]       Enumerate pa-worktrees + project state.
+  close <short> --merge|--keep-branch [--force]   Archive + remove worktree.
+  path <short>              Print absolute worktree path.
+  doctor                    Self-check: gitignore, registered worktrees, orphans.
+
+Reads canonical vault from .assistant.local.json via _config.py with use_env=False
+so the helper finds the canonical vault even when invoked from an env-routed session.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+METHOD_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(METHOD_ROOT / "tools"))
+import _config  # noqa: E402
+
+WORKTREES_SUBDIR = ".pa-worktrees"
+GITIGNORE_ENTRY = "/.pa-worktrees/"
+SHORT_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$")
+
+
+def canonical_vault() -> Path:
+    cfg = _config.load_config(use_env=False)
+    if cfg.config_source != "file":
+        sys.exit(
+            "pa-session: requires .assistant.local.json with paths.content_root "
+            f"(canonical vault). Current resolution: {cfg.config_source}"
+        )
+    return cfg.content_root
+
+
+def validate_short(short: str) -> None:
+    if not SHORT_RE.fullmatch(short) or len(short) > 30:
+        sys.exit(
+            f"pa-session: invalid short name {short!r} "
+            "(lowercase alphanumeric + hyphens, ≤30 chars)"
+        )
+
+
+def worktree_path(vault: Path, short: str) -> Path:
+    return vault / WORKTREES_SUBDIR / short
+
+
+def run_git(*args: str, cwd: Path, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    r = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=capture,
+        text=True,
+    )
+    if check and r.returncode != 0:
+        if capture:
+            sys.stderr.write(r.stderr or "")
+        sys.exit(f"pa-session: git {' '.join(args)} failed (rc={r.returncode})")
+    return r
+
+
+def ensure_gitignore_entry(vault: Path, *, auto: bool) -> None:
+    """Ensure /.pa-worktrees/ is in <vault>/.gitignore. Commit to main if missing."""
+    gitignore = vault / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+    if any(line.strip() == GITIGNORE_ENTRY for line in existing.splitlines()):
+        return
+    if not auto and sys.stdin.isatty():
+        ans = input(
+            f"pa-session: append {GITIGNORE_ENTRY!r} to {gitignore} and commit on main? [y/N] "
+        )
+        if ans.strip().lower() not in ("y", "yes"):
+            sys.exit("pa-session: aborted (no .gitignore change)")
+    head_branch = run_git(
+        "rev-parse", "--abbrev-ref", "HEAD", cwd=vault, capture=True
+    ).stdout.strip()
+    if head_branch != "main":
+        sys.exit(
+            f"pa-session: canonical vault is on branch {head_branch!r}, expected 'main'. "
+            "Switch to main and re-run, or add the .gitignore entry manually."
+        )
+    new_content = existing
+    if new_content and not new_content.endswith("\n"):
+        new_content += "\n"
+    new_content += GITIGNORE_ENTRY + "\n"
+    gitignore.write_text(new_content, encoding="utf-8")
+    run_git("add", ".gitignore", cwd=vault)
+    run_git(
+        "commit",
+        "-m",
+        "infra: ignore /.pa-worktrees/ (pa-session helper output)",
+        cwd=vault,
+    )
+    print(
+        f"pa-session: added {GITIGNORE_ENTRY!r} to {gitignore} and committed on main.",
+        file=sys.stderr,
+    )
+
+
+def existing_worktree_records(vault: Path) -> dict[str, dict]:
+    """Parse `git worktree list --porcelain`. Returns {worktree-path: {branch, head}}."""
+    r = run_git("worktree", "list", "--porcelain", cwd=vault, capture=True)
+    out: dict[str, dict] = {}
+    cur: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            if cur and "path" in cur:
+                out[cur["path"]] = {"branch": cur.get("branch", ""), "head": cur.get("head", "")}
+            cur = {"path": line[len("worktree "):]}
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch "):].removeprefix("refs/heads/")
+    if cur and "path" in cur:
+        out[cur["path"]] = {"branch": cur.get("branch", ""), "head": cur.get("head", "")}
+    return out
+
+
+def project_md_frontmatter(project_md: Path) -> dict:
+    """Minimal flat-YAML parser for project.md frontmatter. project.py writes flat keys
+    (id, title, intent, status, started_at, last_active, archived_at), so a lightweight
+    line parser is sufficient. Quoted values handled."""
+    if not project_md.is_file():
+        return {}
+    text = project_md.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return {}
+    end = text.find("---", 3)
+    if end < 0:
+        return {}
+    block = text[3:end].strip("\n")
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if ":" not in line or line.startswith(" ") or line.startswith("\t"):
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip()
+        if v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def find_worktree_project(wt: Path) -> tuple[str | None, dict]:
+    """Find the (slug, frontmatter) of the project inside the worktree's projects/ dir.
+
+    Returns (None, {}) if no project found."""
+    projects = wt / "projects"
+    if not projects.is_dir():
+        return None, {}
+    for child in sorted(projects.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        md = child / "project.md"
+        if md.is_file():
+            return child.name, project_md_frontmatter(md)
+    return None, {}
+
+
+# Verb handlers ---------------------------------------------------------------
+
+
+def cmd_new(args, vault: Path) -> int:
+    validate_short(args.short)
+    ensure_gitignore_entry(vault, auto=args.auto)
+    (vault / WORKTREES_SUBDIR).mkdir(exist_ok=True)
+    wt_path = worktree_path(vault, args.short)
+    branch = f"project/{args.short}"
+
+    wts = existing_worktree_records(vault)
+    if str(wt_path) in wts:
+        existing_branch = wts[str(wt_path)].get("branch", "")
+        if existing_branch and existing_branch != branch:
+            sys.exit(
+                f"pa-session: worktree at {wt_path} is on branch {existing_branch!r}, "
+                f"expected {branch!r}"
+            )
+        print(
+            f"pa-session: worktree already present at {wt_path}, branch {branch}",
+            file=sys.stderr,
+        )
+    else:
+        existing_branches = run_git(
+            "branch", "--list", branch, cwd=vault, capture=True
+        ).stdout
+        if existing_branches.strip():
+            run_git("worktree", "add", str(wt_path), branch, cwd=vault)
+        else:
+            run_git("worktree", "add", str(wt_path), "-b", branch, cwd=vault)
+        print(
+            f"pa-session: created worktree at {wt_path} on branch {branch}",
+            file=sys.stderr,
+        )
+
+    existing_slug, _ = find_worktree_project(wt_path)
+    if existing_slug is None:
+        env = {**os.environ, "PA_CONTENT_ROOT": str(wt_path), "PA_QUIET": "1"}
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(METHOD_ROOT / "tools" / "project.py"),
+                "new",
+                args.short,
+                args.intent,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr)
+            sys.exit(f"pa-session: project.py new failed (rc={r.returncode})")
+        sys.stderr.write(r.stdout)
+    else:
+        print(
+            f"pa-session: project {existing_slug} already scaffolded in {wt_path}, "
+            "skipping scaffold",
+            file=sys.stderr,
+        )
+
+    if args.no_launch:
+        print(
+            f"pa-session: --no-launch set; to launch:\n  PA_CONTENT_ROOT={wt_path} claude",
+            file=sys.stderr,
+        )
+        return 0
+    env = {**os.environ, "PA_CONTENT_ROOT": str(wt_path)}
+    os.execvpe("claude", ["claude"], env)
+    return 0  # unreachable
+
+
+def cmd_resume(args, vault: Path) -> int:
+    validate_short(args.short)
+    wt_path = worktree_path(vault, args.short)
+    if not wt_path.is_dir():
+        sys.exit(
+            f"pa-session: no worktree at {wt_path}. "
+            f"Run `pa-session new {args.short} '<intent>'` first."
+        )
+    wts = existing_worktree_records(vault)
+    if str(wt_path) not in wts:
+        sys.exit(
+            f"pa-session: {wt_path} exists but is not a git-registered worktree (orphan). "
+            "Run `pa-session doctor`."
+        )
+    if args.no_launch:
+        print(f"  PA_CONTENT_ROOT={wt_path} claude", file=sys.stderr)
+        return 0
+    env = {**os.environ, "PA_CONTENT_ROOT": str(wt_path)}
+    os.execvpe("claude", ["claude"], env)
+    return 0  # unreachable
+
+
+def cmd_path(args, vault: Path) -> int:
+    validate_short(args.short)
+    wt_path = worktree_path(vault, args.short)
+    print(str(wt_path))
+    return 0
+
+
+def cmd_list(args, vault: Path) -> int:
+    wts = existing_worktree_records(vault)
+    rows: list[tuple[str, str, str, str, str]] = []
+    pa_wt_root = (vault / WORKTREES_SUBDIR).resolve()
+    for wt_str, info in wts.items():
+        wt = Path(wt_str).resolve()
+        try:
+            wt.relative_to(pa_wt_root)
+        except ValueError:
+            continue
+        short = wt.name
+        branch = info.get("branch", "")
+        _, fm = find_worktree_project(wt)
+        last_active = fm.get("last_active", "?")
+        status = fm.get("status", "?")
+        if args.status != "all" and status != args.status:
+            continue
+        rel = wt.relative_to(vault).as_posix() if wt.is_relative_to(vault) else str(wt)
+        rows.append((short, branch, last_active, status, rel))
+    rows.sort(key=lambda r: r[2], reverse=True)
+    if args.format == "json":
+        out = [
+            {
+                "short": r[0],
+                "branch": r[1],
+                "last_active": r[2],
+                "status": r[3],
+                "worktree": str(vault / r[4]),
+            }
+            for r in rows
+        ]
+        print(json.dumps(out, indent=2))
+    else:
+        headers = ("SHORT", "BRANCH", "LAST_ACTIVE", "STATUS", "WORKTREE")
+        if rows:
+            widths = [
+                max(len(h), *(len(r[i]) for r in rows))
+                for i, h in enumerate(headers)
+            ]
+        else:
+            widths = [len(h) for h in headers]
+        line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+        print(line)
+        for r in rows:
+            print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)))
+    return 0
+
+
+def cmd_close(args, vault: Path) -> int:
+    validate_short(args.short)
+    wt_path = worktree_path(vault, args.short)
+    if not wt_path.is_dir():
+        sys.exit(f"pa-session: no worktree at {wt_path}")
+
+    # Check clean BEFORE archive flip so we don't sweep unrelated dirty state into our commit.
+    r = run_git("status", "--porcelain", cwd=wt_path, capture=True)
+    if r.stdout.strip() and not args.force:
+        sys.exit(
+            f"pa-session: worktree at {wt_path} has uncommitted changes:\n"
+            f"{r.stdout}"
+            "Commit/stash or re-run with --force."
+        )
+
+    # Archive the project (flips status, clears active-state in the worktree).
+    env = {**os.environ, "PA_CONTENT_ROOT": str(wt_path), "PA_QUIET": "1"}
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(METHOD_ROOT / "tools" / "project.py"),
+            "archive",
+            args.short,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(f"pa-session: project.py archive failed (rc={r.returncode})")
+    sys.stderr.write(r.stdout)
+
+    # Commit the archive flip on the worktree's branch. Direct git commit (no
+    # live-commit-push.sh, which refuses when content_root != .assistant.local.json's vault).
+    status_after_archive = run_git("status", "--porcelain", cwd=wt_path, capture=True).stdout
+    if status_after_archive.strip():
+        run_git("add", "-A", cwd=wt_path)
+        run_git("commit", "-m", f"archive: {args.short}", cwd=wt_path)
+
+    branch = f"project/{args.short}"
+    if args.merge:
+        head_branch = run_git(
+            "rev-parse", "--abbrev-ref", "HEAD", cwd=vault, capture=True
+        ).stdout.strip()
+        if head_branch != "main":
+            sys.exit(
+                f"pa-session: canonical vault on {head_branch!r}; "
+                "switch to main before --merge"
+            )
+        run_git(
+            "merge",
+            "--no-ff",
+            branch,
+            "-m",
+            f"merge {branch} into main",
+            cwd=vault,
+        )
+        remote_check = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(vault),
+            capture_output=True,
+            text=True,
+        )
+        if remote_check.returncode == 0 and remote_check.stdout.strip():
+            run_git("push", "origin", "main", cwd=vault)
+
+    run_git("worktree", "remove", str(wt_path), cwd=vault)
+    if args.merge:
+        run_git("branch", "-d", branch, cwd=vault)
+    print(f"pa-session: closed {args.short}", file=sys.stderr)
+    return 0
+
+
+def cmd_doctor(args, vault: Path) -> int:
+    ok = True
+    gitignore = vault / ".gitignore"
+    if not gitignore.is_file() or GITIGNORE_ENTRY not in gitignore.read_text(encoding="utf-8"):
+        print(f"FAIL: {gitignore} missing {GITIGNORE_ENTRY!r}")
+        ok = False
+    else:
+        print(f"ok:   .gitignore contains {GITIGNORE_ENTRY!r}")
+    wts = existing_worktree_records(vault)
+    pa_wt_root = (vault / WORKTREES_SUBDIR).resolve()
+    pa_wts = {
+        k: v
+        for k, v in wts.items()
+        if str(pa_wt_root) in str(Path(k).resolve())
+    }
+    print(f"info: {len(pa_wts)} pa-worktrees registered with git")
+    if pa_wt_root.is_dir():
+        registered_paths = {str(Path(k).resolve()) for k in wts}
+        for child in pa_wt_root.iterdir():
+            if not child.is_dir():
+                continue
+            if str(child.resolve()) not in registered_paths:
+                print(f"FAIL: orphan worktree dir {child} (not in git worktree list)")
+                ok = False
+    for wt_str in pa_wts:
+        wt = Path(wt_str)
+        slug, _ = find_worktree_project(wt)
+        if slug is None:
+            print(f"FAIL: worktree {wt} has no projects/*/project.md scaffold")
+            ok = False
+    return 0 if ok else 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="pa-session",
+        description="per-project session helper for personal-assistant-ultra (C3 of #214)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_new = sub.add_parser("new", help="Create worktree + scaffold + launch claude.")
+    p_new.add_argument("short")
+    p_new.add_argument("intent")
+    p_new.add_argument("--auto", action="store_true", help="Skip .gitignore confirmation prompt")
+    p_new.add_argument(
+        "--no-launch",
+        action="store_true",
+        help="Don't exec claude; print the launch line instead",
+    )
+    p_new.set_defaults(func=cmd_new)
+
+    p_resume = sub.add_parser("resume", help="Launch claude pointed at existing worktree.")
+    p_resume.add_argument("short")
+    p_resume.add_argument("--no-launch", action="store_true")
+    p_resume.set_defaults(func=cmd_resume)
+
+    p_path = sub.add_parser("path", help="Print absolute worktree path.")
+    p_path.add_argument("short")
+    p_path.set_defaults(func=cmd_path)
+
+    p_list = sub.add_parser("list", help="Enumerate pa-worktrees + project state.")
+    p_list.add_argument("--status", choices=("active", "archived", "all"), default="active")
+    p_list.add_argument("--format", choices=("table", "json"), default="table")
+    p_list.set_defaults(func=cmd_list)
+
+    p_close = sub.add_parser("close", help="Archive + remove worktree.")
+    p_close.add_argument("short")
+    grp = p_close.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--merge", action="store_true")
+    grp.add_argument("--keep-branch", action="store_true")
+    p_close.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove even if worktree is dirty",
+    )
+    p_close.set_defaults(func=cmd_close)
+
+    p_doc = sub.add_parser("doctor", help="Self-check.")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    args = p.parse_args()
+    vault = canonical_vault()
+    return args.func(args, vault)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,6 +1,7 @@
 {
   "$schema_version": 1,
   "$comment": "Per-checkout config for the personal-assistant tools. COPY this file to '.assistant.local.json' (gitignored) and edit `paths.content_root` to point at your vault checkout. Do NOT commit the real .assistant.local.json — it is per-machine and contains absolute paths. See tools/_config.py for the loader.",
+  "$comment_env": "For multi-project workflows: set PA_CONTENT_ROOT=<absolute-path> at the session level to route a single Claude Code session to a different vault checkout (e.g. a git worktree under <vault>/.pa-worktrees/). When PA_CONTENT_ROOT is set + valid, it takes precedence over this file. The scripts/pa-session helper sets this for you per project. See docs/setup.md and parent issue #214.",
   "paths": {
     "content_root": "/Users/<you>/Projects/<your>-pa-vault"
   }

@@ -62,3 +62,7 @@ surfaces:
       - release-policy.yaml
       - scripts/check-release-policy.py
     notes: "Self-describing: the release policy ships with the release."
+
+  helpers:
+    path: scripts/pa-session
+    notes: "Per-project session helper (#214) — vault worktree + scaffold + launch wrapper. User-facing CLI."
