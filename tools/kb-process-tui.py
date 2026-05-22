@@ -848,6 +848,15 @@ def amend_in_editor(memo_path: Path) -> bool:
 _DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)\n```", re.DOTALL)
 
 
+# Sentinel `amend_instr` values used by the m-handler to distinguish $EDITOR-route
+# reasons in the accuracy-log dispatch. Defined as module constants so the setter
+# (m-handler) and the dispatcher (notes-builder) reference the SAME literal —
+# substring matching on free-text `amend_instr` would mis-classify a future NL
+# operator instruction containing one of these substrings (pr-challenger N3 on #232).
+AMEND_INSTR_NO_DIFF_BLOCK = "fallback to direct $EDITOR (no diff block in memo)"
+AMEND_INSTR_CLAUDE_UNAVAILABLE = "fallback to direct $EDITOR (claude unavailable)"
+
+
 def memo_has_diff_block(memo_text: str) -> bool:
     """Cheap predicate for "does this memo carry a ```diff fenced block?".
 
@@ -1397,6 +1406,15 @@ def main(argv: list[str]) -> int:
             # NL amend has nothing to feed `claude -p`. Route to $EDITOR for
             # free-edit with a dim notice — not the red "Couldn't extract" line.
             # This is a known memo class, not an error surface.
+            #
+            # Note: the memo file is read three times across this handler — here,
+            # by `amend_in_editor` (for the pre-edit sha256), and by the scope
+            # check at ~line 1452. Triple-read is intentional: the operator's
+            # $EDITOR session is the only writer between reads, so freshness is
+            # consistent. A concurrent external writer would invalidate this,
+            # but that scenario isn't part of the TUI's threat model (per #190 /
+            # #232 pr-challenger N2). `continue` below returns to the per-memo
+            # walk loop (the `while idx < total` at line ~1256).
             if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
                 sys.stdout.write(
                     f"{DIM}No proposed diff in this memo — opening in $EDITOR for free-edit.{RESET}\n"
@@ -1408,7 +1426,7 @@ def main(argv: list[str]) -> int:
                     getch()
                     continue
                 amend_rounds = 0
-                amend_instr = "fallback to direct $EDITOR (no diff block in memo)"
+                amend_instr = AMEND_INSTR_NO_DIFF_BLOCK
             else:
                 ok, _ = claude_cli_probe()
                 if not ok:
@@ -1430,7 +1448,7 @@ def main(argv: list[str]) -> int:
                         getch()
                         continue
                     amend_rounds = 0
-                    amend_instr = "fallback to direct $EDITOR (claude unavailable)"
+                    amend_instr = AMEND_INSTR_CLAUDE_UNAVAILABLE
                 else:
                     status, amend_rounds, amend_instr = run_amend_flow(memo_path)
                     if status == "cancelled":
@@ -1478,13 +1496,15 @@ def main(argv: list[str]) -> int:
                     # for the pre-amend body but the action reflects an N-round amend.
                     if status == "applied_with_editor":
                         # Discriminate the three $EDITOR-route reasons (per #231 acceptance):
-                        #   (a) "no diff block in memo" — diff-less memo guard fired
-                        #   (b) "claude unavailable"    — legacy claude-missing fallback
-                        #   (c) anything else           — NL amend then $EDITOR fine-tune
-                        # Match on the structured `amend_instr` string set by the m-handler.
-                        if "no diff block in memo" in amend_instr:
+                        #   (a) AMEND_INSTR_NO_DIFF_BLOCK    — diff-less memo guard fired
+                        #   (b) AMEND_INSTR_CLAUDE_UNAVAILABLE — legacy claude-missing fallback
+                        #   (c) anything else                — NL amend then $EDITOR fine-tune
+                        # Exact match on the sentinel constants set by the m-handler (per
+                        # #232 pr-challenger N3 — substring matching on free-text would
+                        # mis-classify NL instructions that happen to contain the substring).
+                        if amend_instr == AMEND_INSTR_NO_DIFF_BLOCK:
                             notes = "amended via direct $EDITOR (no diff block in memo)"
-                        elif "claude unavailable" in amend_instr:
+                        elif amend_instr == AMEND_INSTR_CLAUDE_UNAVAILABLE:
                             notes = "amended via direct $EDITOR (legacy fallback)"
                         else:
                             notes = f"amended via NL+$EDITOR (rounds={amend_rounds}): {amend_instr[:120]}"
