@@ -848,6 +848,32 @@ def amend_in_editor(memo_path: Path) -> bool:
 _DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)\n```", re.DOTALL)
 
 
+# Sentinel `amend_instr` values used by the m-handler to distinguish $EDITOR-route
+# reasons in the accuracy-log dispatch. Defined as module constants so the setter
+# (m-handler) and the dispatcher (notes-builder) reference the SAME literal —
+# substring matching on free-text `amend_instr` would mis-classify a future NL
+# operator instruction containing one of these substrings (pr-challenger N3 on #232).
+AMEND_INSTR_NO_DIFF_BLOCK = "fallback to direct $EDITOR (no diff block in memo)"
+AMEND_INSTR_CLAUDE_UNAVAILABLE = "fallback to direct $EDITOR (claude unavailable)"
+
+
+def memo_has_diff_block(memo_text: str) -> bool:
+    """Cheap predicate for "does this memo carry a ```diff fenced block?".
+
+    Used by the `m` (NL-amend) handler to detect diff-less memos *before*
+    entering the amend flow — kb-scan decision-extract emissions and similar
+    classes legitimately have no ```diff block, and the NL amend path has
+    nothing to feed `claude -p`. Such memos should route to the free-edit
+    `$EDITOR` path with a dim-color notice, not the red "Couldn't extract
+    diff block" error fallback at run_amend_flow's entry. See #229 / #231.
+
+    Same predicate as `extract_diff_block_content`'s regex check — kept as
+    a separate helper so the `m` handler can short-circuit without paying
+    the `+ `-prefix-stripping cost on a memo that's about to bypass the
+    NL flow anyway."""
+    return _DIFF_BLOCK_RE.search(memo_text) is not None
+
+
 AMEND_PROMPT_TEMPLATE = """You are amending a kb-process candidate entry per a user instruction. Output ONLY the amended entry between the markers below — no preamble, no explanation, no surrounding markdown fences.
 
 User instruction:
@@ -1037,6 +1063,16 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
     original_memo_text = memo_path.read_text(encoding="utf-8")
     current_entry = extract_diff_block_content(original_memo_text)
     if current_entry is None:
+        # Mode A (no ```diff block) is guarded upstream by `memo_has_diff_block`
+        # in the `m` handler — diff-less memos route to `amend_in_editor` directly.
+        # Mode B (block present, line shape violation) is a legitimate emitter bug
+        # surfaced via #229 Child 3b, not a TUI-flow problem — fall through to the
+        # legacy red error + $EDITOR fallback so the operator sees it.
+        if not _DIFF_BLOCK_RE.search(original_memo_text):
+            raise AssertionError(
+                "run_amend_flow reached Mode-A failure path; this should be "
+                "guarded by memo_has_diff_block() in the `m` handler. See #231."
+            )
         sys.stdout.write(f"{RED}Couldn't extract diff block from memo — falling back to direct $EDITOR.{RESET}\n")
         return ("failed", 0, "")
 
@@ -1365,19 +1401,24 @@ def main(argv: list[str]) -> int:
         elif key == "m":
             # Slice 3 of #183 / #189 — natural-language amend flow.
             # claude amends per operator instruction; preview + a/r/e/c.
-            ok, _ = claude_cli_probe()
-            if not ok:
+            #
+            # Diff-less guard (#229 / #231): if the memo has no ```diff block,
+            # NL amend has nothing to feed `claude -p`. Route to $EDITOR for
+            # free-edit with a dim notice — not the red "Couldn't extract" line.
+            # This is a known memo class, not an error surface.
+            #
+            # Note: the memo file is read three times across this handler — here,
+            # by `amend_in_editor` (for the pre-edit sha256), and by the scope
+            # check at ~line 1452. Triple-read is intentional: the operator's
+            # $EDITOR session is the only writer between reads, so freshness is
+            # consistent. A concurrent external writer would invalidate this,
+            # but that scenario isn't part of the TUI's threat model (per #190 /
+            # #232 pr-challenger N2). `continue` below returns to the per-memo
+            # walk loop (the `while idx < total` at line ~1256).
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
                 sys.stdout.write(
-                    f"{YELLOW}NL amend requires `claude` on PATH. Falling back to direct $EDITOR "
-                    f"(equivalent to the `M` key). Re-auth claude to use NL amend.{RESET}\n"
+                    f"{DIM}No proposed diff in this memo — opening in $EDITOR for free-edit.{RESET}\n"
                 )
-                sys.stdout.write(f"{DIM}Press any key to open $EDITOR.{RESET}\n")
-                getch()
-                # pr-challenger B1 on #190 — must bind `status` on this path, not
-                # just `status_legacy`. Downstream (line ~1291) reads `status`; without
-                # this, the fallback path crashes with UnboundLocalError exactly when
-                # claude auth is expired and the operator falls back to $EDITOR — the
-                # scenario the fallback was added to handle gracefully.
                 if amend_in_editor(memo_path):
                     status = "applied_with_editor"
                 else:
@@ -1385,18 +1426,40 @@ def main(argv: list[str]) -> int:
                     getch()
                     continue
                 amend_rounds = 0
-                amend_instr = "fallback to direct $EDITOR (claude unavailable)"
+                amend_instr = AMEND_INSTR_NO_DIFF_BLOCK
             else:
-                status, amend_rounds, amend_instr = run_amend_flow(memo_path)
-                if status == "cancelled":
-                    sys.stdout.write(f"{DIM}Amend cancelled — memo restored to pre-amend state.{RESET}\n")
-                    sys.stdout.write(f"{DIM}Press any key to re-render.{RESET}\n")
+                ok, _ = claude_cli_probe()
+                if not ok:
+                    sys.stdout.write(
+                        f"{YELLOW}NL amend requires `claude` on PATH. Falling back to direct $EDITOR "
+                        f"(equivalent to the `M` key). Re-auth claude to use NL amend.{RESET}\n"
+                    )
+                    sys.stdout.write(f"{DIM}Press any key to open $EDITOR.{RESET}\n")
                     getch()
-                    continue
-                if status == "failed":
-                    sys.stdout.write(f"{DIM}Press any key to re-render (memo restored).{RESET}\n")
-                    getch()
-                    continue
+                    # pr-challenger B1 on #190 — must bind `status` on this path, not
+                    # just `status_legacy`. Downstream (line ~1291) reads `status`; without
+                    # this, the fallback path crashes with UnboundLocalError exactly when
+                    # claude auth is expired and the operator falls back to $EDITOR — the
+                    # scenario the fallback was added to handle gracefully.
+                    if amend_in_editor(memo_path):
+                        status = "applied_with_editor"
+                    else:
+                        sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
+                        getch()
+                        continue
+                    amend_rounds = 0
+                    amend_instr = AMEND_INSTR_CLAUDE_UNAVAILABLE
+                else:
+                    status, amend_rounds, amend_instr = run_amend_flow(memo_path)
+                    if status == "cancelled":
+                        sys.stdout.write(f"{DIM}Amend cancelled — memo restored to pre-amend state.{RESET}\n")
+                        sys.stdout.write(f"{DIM}Press any key to re-render.{RESET}\n")
+                        getch()
+                        continue
+                    if status == "failed":
+                        sys.stdout.write(f"{DIM}Press any key to re-render (memo restored).{RESET}\n")
+                        getch()
+                        continue
             # status is "applied" or "applied_with_editor" — proceed to scope check + apply.
             # After NL amend, the operator may have included Scope in the instruction OR
             # claude may have preserved/added it. Check before prompting (avoid double-prompt
@@ -1432,9 +1495,19 @@ def main(argv: list[str]) -> int:
                     # so post-walk analysis can identify rows where the prediction was
                     # for the pre-amend body but the action reflects an N-round amend.
                     if status == "applied_with_editor":
-                        notes = f"amended via NL+$EDITOR (rounds={amend_rounds}): {amend_instr[:120]}"
-                    elif amend_rounds == 0:
-                        notes = "amended via direct $EDITOR (legacy fallback)"
+                        # Discriminate the three $EDITOR-route reasons (per #231 acceptance):
+                        #   (a) AMEND_INSTR_NO_DIFF_BLOCK    — diff-less memo guard fired
+                        #   (b) AMEND_INSTR_CLAUDE_UNAVAILABLE — legacy claude-missing fallback
+                        #   (c) anything else                — NL amend then $EDITOR fine-tune
+                        # Exact match on the sentinel constants set by the m-handler (per
+                        # #232 pr-challenger N3 — substring matching on free-text would
+                        # mis-classify NL instructions that happen to contain the substring).
+                        if amend_instr == AMEND_INSTR_NO_DIFF_BLOCK:
+                            notes = "amended via direct $EDITOR (no diff block in memo)"
+                        elif amend_instr == AMEND_INSTR_CLAUDE_UNAVAILABLE:
+                            notes = "amended via direct $EDITOR (legacy fallback)"
+                        else:
+                            notes = f"amended via NL+$EDITOR (rounds={amend_rounds}): {amend_instr[:120]}"
                     else:
                         notes = f"amended via NL (rounds={amend_rounds}): {amend_instr[:120]}"
                     log_accuracy_row(accuracy_log, art_id, this_prediction, "m", m_scope, candidate_kind=this_kind, notes=notes, scope_source=m_scope_source)
