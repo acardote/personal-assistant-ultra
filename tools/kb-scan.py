@@ -721,12 +721,47 @@ def emit_memo(content_root: Path, candidate: Candidate, session_id: str, query: 
     return path
 
 
+def _prefix_diff_body(body: str) -> str:
+    """Return `body` with `+ ` on every non-empty line and bare `+` on blank lines.
+
+    Used by the diff-renderers so wrapped paragraphs in `body` / `summary` have
+    the `+ ` prefix on every line, not just the first. Matches the round-trip
+    format `kb-process-tui.py:splice_amended_back` writes back, so a memo
+    extracted + amended + spliced + applied preserves shape (Mode-B regression
+    surface from #229 Child 3b / #233).
+
+    Idempotency: a body that arrives ALREADY-prefixed (e.g., `"+ foo\\n+ bar"`)
+    must NOT be double-prefixed to `"+ + foo\\n+ + bar"` — that would be the
+    pr-challenger F3 risk. Detect the case by checking whether EVERY non-empty
+    line already starts with `"+ "` or equals `"+"`; if so, return verbatim
+    (the body is already in diff format and the renderer is composing on
+    pre-rendered input). This is defensive — current callers pass raw bodies,
+    but a future caller could compose renderers."""
+    if body == "":
+        return ""
+    lines = body.split("\n")
+    # Idempotency check: if every line is already in `+ X` / `+` / blank form,
+    # return verbatim. (Blank lines are ambiguous — they're valid in both raw
+    # and prefixed forms — so the check counts non-empty lines only.)
+    non_empty = [ln for ln in lines if ln.strip() != ""]
+    if non_empty and all(ln.startswith("+ ") or ln == "+" for ln in non_empty):
+        return body
+    out: list[str] = []
+    for ln in lines:
+        if ln == "":
+            out.append("+")
+        else:
+            out.append(f"+ {ln}")
+    return "\n".join(out)
+
+
 def render_person_org_diff(syn: dict) -> str:
     """Render the LLM's synthesis output as the proposed-diff section."""
     title = syn.get("title", "(missing title)")
     role = syn.get("role_or_relation", "")
     summary = syn.get("summary", "")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    summary_block = _prefix_diff_body(summary) if summary else ""
     return (
         f"```diff\n"
         f"+ ## {title}\n"
@@ -735,7 +770,7 @@ def render_person_org_diff(syn: dict) -> str:
         f"+ - **Expires:** never (refresh on role/org change)\n"
         f"+ - **Source:** scan-driven candidate from kb-scan\n"
         f"+ \n"
-        f"+ {summary}\n"
+        f"{summary_block}\n"
         f"```"
     )
 
@@ -744,6 +779,7 @@ def render_decision_diff(dec: dict, mo: MemoryObject) -> str:
     title = dec.get("title", "(missing title)")
     body = dec.get("body", "")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    body_block = _prefix_diff_body(body) if body else ""
     return (
         f"```diff\n"
         f"+ ## {title}\n"
@@ -753,7 +789,7 @@ def render_decision_diff(dec: dict, mo: MemoryObject) -> str:
         f"+ - **Expires:** never\n"
         f"+ - **Source:** mem://{mo.memory_id} ({mo.source_kind})\n"
         f"+ \n"
-        f"+ {body}\n"
+        f"{body_block}\n"
         f"```"
     )
 
