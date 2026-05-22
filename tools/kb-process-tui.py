@@ -1418,6 +1418,34 @@ def main(argv: list[str]) -> int:
         wants_scope = this_kind == "decision"
 
         if key == "a":
+            # Diff-less guard (#241 / #242): same rationale as the `m` handler's
+            # gate (#235) — `kb-process apply` shells to `extract_proposed_diff`
+            # which raises ValueError without a ```diff fence. Pressing `a` on a
+            # diff-less memo cascades through scope-prompt (→ "Couldn't inject
+            # Scope" red error) into apply (→ "apply failed rc=1"). Bounce the
+            # operator BEFORE the cascade with a clear "no proposed diff to
+            # apply" message + the same options the `m` handler suggests.
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                sys.stdout.write(
+                    f"{YELLOW}This memo has no proposed diff and cannot be auto-applied.{RESET}\n"
+                )
+                sys.stdout.write(
+                    f"{DIM}Options: `m` to free-edit in $EDITOR (also won't auto-apply — "
+                    f"see #229 / #235), `s` to skip, or `r` to reject (last resort — "
+                    f"diff-less memos are often notes-only observations, not rejection "
+                    f"candidates). Hand-edit the file to add a ```diff block if you want "
+                    f"to apply it.{RESET}\n"
+                )
+                if accuracy_log:
+                    log_accuracy_row(
+                        accuracy_log, art_id, this_prediction, "a", "",
+                        candidate_kind=this_kind,
+                        notes="a-key blocked: no diff block (cannot apply)",
+                        scope_source=SCOPE_SOURCE_NA,
+                    )
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue  # don't advance — let operator pick another action
             scope = ""  # B1 on #188 (pr-reviewer) — initialize unconditionally so the
             # downstream accuracy_log row build doesn't UnboundLocalError on
             # person/org/glossary candidates where `wants_scope == False`.
@@ -1668,6 +1696,31 @@ def main(argv: list[str]) -> int:
             # so a malformed save (broken diff fence, garbled frontmatter) that
             # crashes apply_memo can roll back instead of leaving the memo
             # corrupted in .unprocessed/.
+            #
+            # Diff-less guard (#241 / #242): same as `a` / `m` handlers —
+            # diff-less memos can't apply (extract_proposed_diff raises). The
+            # pre-gate $EDITOR snapshot still happens before the gate fires,
+            # but the gate fires BEFORE `amend_in_editor` opens the editor, so
+            # the operator doesn't lose time to an edit-then-rollback cycle.
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                sys.stdout.write(
+                    f"{YELLOW}This memo has no proposed diff and cannot be auto-applied via `M`.{RESET}\n"
+                )
+                sys.stdout.write(
+                    f"{DIM}Use `m` to free-edit in $EDITOR (won't auto-apply but the edits "
+                    f"persist), `s` to skip, or `r` to reject. Hand-edit the file to add "
+                    f"a ```diff block if you want to apply it.{RESET}\n"
+                )
+                if accuracy_log:
+                    log_accuracy_row(
+                        accuracy_log, art_id, this_prediction, "M", "",
+                        candidate_kind=this_kind,
+                        notes="M-key blocked: no diff block (cannot apply)",
+                        scope_source=SCOPE_SOURCE_NA,
+                    )
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue
             m_original_text = memo_path.read_text(encoding="utf-8")
             changed = amend_in_editor(memo_path)
             if not changed:

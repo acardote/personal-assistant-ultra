@@ -413,5 +413,118 @@ def test_mode_b_helper_consistent_with_extractor_on_crlf(tmp_path):
     )
 
 
+# ---------- T5: a / M handler gates on diff-less memos (#241 / #242) ----------
+#
+# The `a` (approve) and `M` (direct-$EDITOR amend) handlers used to drive
+# diff-less memos through scope-inject + apply chains that fail downstream.
+# The fix gates BOTH handlers on `memo_has_diff_block` BEFORE any of that.
+# These tests exercise the gate via source-level invariants — the handlers
+# themselves live inside the TUI's giant per-memo loop and aren't unit-
+# testable directly, so we pin the gate's PRESENCE (the keystroke handler
+# block contains a `memo_has_diff_block` check) and ABSENCE of the
+# misleading help text the gate replaces.
+
+
+def _read_tui_source() -> str:
+    return (PROJ / "tools" / "kb-process-tui.py").read_text(encoding="utf-8")
+
+
+def test_all_three_apply_paths_gate_on_memo_has_diff_block():
+    """The `m`, `a`, and `M` handlers must EACH gate on `memo_has_diff_block`
+    before any code that would reach `kb-process.py apply` (whose
+    `extract_proposed_diff` raises ValueError without a ```diff fence).
+
+    Source-level invariant: every block containing an `inject_scope_into_memo`
+    call must be preceded — within the same handler — by a `memo_has_diff_block`
+    check that `continue`s on False. This pins the contract that ALL three
+    paths bounce diff-less memos before reaching the apply chain.
+
+    A simpler approximation: the source contains exactly THREE
+    `memo_has_diff_block(memo_path` call sites — one per gated handler.
+    The `m` handler's gate landed in #235; this test verifies #242's gates
+    on `a` and `M` also exist."""
+    src = _read_tui_source()
+    n = src.count("memo_has_diff_block(memo_path")
+    assert n == 3, (
+        f"Expected 3 `memo_has_diff_block(memo_path` call sites (one per "
+        f"gated handler: m / a / M); found {n}. If you removed or added a "
+        f"handler's gate, update this test deliberately. See #235 (m) + "
+        f"#242 (a, M)."
+    )
+
+
+def test_handlers_gate_before_inject_scope_into_memo_call_sites():
+    """Every CALL SITE of `inject_scope_into_memo` (not the def itself, not
+    docstring mentions) must be preceded — within the same handler block —
+    by a `memo_has_diff_block` check. Pin the locality so a future refactor
+    that moves the gate too far or removes it fails this test.
+
+    Match pattern: `injected = inject_scope_into_memo(memo_path,` — that's
+    the specific call shape used in both the `a` and `M` handlers."""
+    src = _read_tui_source()
+    call_pattern = "injected = inject_scope_into_memo(memo_path,"
+    call_positions = [i for i in range(len(src)) if src.startswith(call_pattern, i)]
+    assert len(call_positions) == 3, (
+        f"expected exactly 3 inject_scope_into_memo CALL sites — `a` "
+        f"handler, `m` handler (post-claude-amend success), and `M` "
+        f"handler; found {len(call_positions)}. If you added or removed "
+        f"a call site, update this test deliberately."
+    )
+    for pos in call_positions:
+        # Find the immediately-preceding handler header (`if key == "X":` or
+        # `elif key == "X":` in the main walk loop). The handler block between
+        # that header and this call site must contain the gate.
+        before = src[:pos]
+        # Match the LAST `if key ==` / `elif key ==` before this position.
+        header_pos = max(
+            before.rfind('if key == "a":'),
+            before.rfind('elif key == "m":'),
+            before.rfind('elif key == "M":'),
+        )
+        assert header_pos >= 0, (
+            f"inject_scope_into_memo call at position {pos} has no preceding "
+            f"a/m/M handler header — unexpected structure."
+        )
+        handler_block = src[header_pos:pos]
+        assert "memo_has_diff_block(memo_path" in handler_block, (
+            f"inject_scope_into_memo call at position {pos} is inside a "
+            f"handler block (starting at {header_pos}) that does NOT contain "
+            f"a memo_has_diff_block gate — diff-less memos could reach this "
+            f"call site. See #242."
+        )
+
+
+def test_a_M_handler_bounce_messages_do_not_misdirect_to_apply_via_m():
+    """F3 (per #242 falsifier) — the bounce messages on `a` and `M` must
+    NOT suggest `m` is a path to APPLY the memo. The post-#235 reality is
+    that `m` also can't auto-apply diff-less memos; suggesting "use `m`
+    then apply" misleads."""
+    src = _read_tui_source()
+    # The misleading phrasing from the pre-existing message
+    # ("Use `m` to edit manually, then apply") MUST NOT appear inside the
+    # diff-less gate blocks I added in #242. The pre-existing message at
+    # the scope-inject failure path (which is still reachable for memos
+    # that HAVE a diff block but a non-kb-scan-template shape) is OK to
+    # keep — for those memos, `m` → claude-amend → fixed shape → apply
+    # is the actual workflow.
+    #
+    # Verify by counting: post-#242, the source should contain the bounce
+    # text only in places where it's correct.
+    bad_phrase = "Use `m` to edit manually, then apply"
+    # Find each occurrence and assert it's NOT inside one of the diff-less
+    # gate blocks (markers: the comments containing "#241 / #242").
+    bad_positions = [i for i in range(len(src)) if src.startswith(bad_phrase, i)]
+    for pos in bad_positions:
+        # Within 1500 chars BEFORE this position, ensure no "#241 / #242"
+        # marker appears — that would mean the bad phrase is inside one of
+        # my new gate blocks.
+        window = src[max(0, pos - 1500):pos]
+        assert "#241 / #242" not in window, (
+            f"The misleading phrase {bad_phrase!r} at position {pos} appears "
+            f"inside a diff-less gate block — #242 F3 says it would mislead "
+            f"the operator (m won't apply diff-less memos either)."
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
