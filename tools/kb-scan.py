@@ -721,12 +721,45 @@ def emit_memo(content_root: Path, candidate: Candidate, session_id: str, query: 
     return path
 
 
+def _prefix_diff_body(body: str | None) -> str:
+    """Return `body` with `+ ` on every non-empty line and bare `+` on blank lines.
+
+    Used by the diff-renderers so wrapped paragraphs in `body` / `summary` have
+    the `+ ` prefix on every line, not just the first. Matches the round-trip
+    format `kb-process-tui.py:splice_amended_back` and `kb-process.py:extract_proposed_diff`
+    both consume (Mode-B regression surface from #229 Child 3b / #233).
+
+    Always prefixes. Callers MUST pass raw body content (no leading `+ ` on any
+    line). The natural defensive instinct — detect already-prefixed input and
+    pass through verbatim — creates a footgun: an LLM-emitted body using
+    CommonMark `+`-bulleted items (`"+ point A\\n+ point B"` — a valid bullet
+    style per CommonMark) would be mis-classified as already-prefixed, pass
+    through verbatim, and have its `+ ` bullets silently stripped by both
+    extractors on round-trip. pr-challenger surfaced this on PR #236. Renderer
+    composition isn't a current need — drop the defense rather than ship the
+    footgun.
+
+    `body or ""` defends against `None` arriving from a synthesis dict where
+    the LLM emitted JSON `null`."""
+    body = body or ""
+    if body == "":
+        return ""
+    out: list[str] = []
+    for ln in body.split("\n"):
+        if ln == "":
+            out.append("+")
+        else:
+            out.append(f"+ {ln}")
+    return "\n".join(out)
+
+
 def render_person_org_diff(syn: dict) -> str:
     """Render the LLM's synthesis output as the proposed-diff section."""
     title = syn.get("title", "(missing title)")
     role = syn.get("role_or_relation", "")
     summary = syn.get("summary", "")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    summary_block = _prefix_diff_body(summary)
     return (
         f"```diff\n"
         f"+ ## {title}\n"
@@ -735,7 +768,7 @@ def render_person_org_diff(syn: dict) -> str:
         f"+ - **Expires:** never (refresh on role/org change)\n"
         f"+ - **Source:** scan-driven candidate from kb-scan\n"
         f"+ \n"
-        f"+ {summary}\n"
+        f"{summary_block}\n"
         f"```"
     )
 
@@ -744,6 +777,7 @@ def render_decision_diff(dec: dict, mo: MemoryObject) -> str:
     title = dec.get("title", "(missing title)")
     body = dec.get("body", "")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    body_block = _prefix_diff_body(body)
     return (
         f"```diff\n"
         f"+ ## {title}\n"
@@ -753,7 +787,7 @@ def render_decision_diff(dec: dict, mo: MemoryObject) -> str:
         f"+ - **Expires:** never\n"
         f"+ - **Source:** mem://{mo.memory_id} ({mo.source_kind})\n"
         f"+ \n"
-        f"+ {body}\n"
+        f"{body_block}\n"
         f"```"
     )
 
