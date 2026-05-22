@@ -66,3 +66,7 @@ surfaces:
   helpers:
     path: scripts/pa-session
     notes: "Per-project session helper (#214) — vault worktree + scaffold + launch wrapper. User-facing CLI."
+
+  claude_settings:
+    path: .claude/settings.json
+    notes: "Project-level Claude Code settings (#216) — MCP tool allowlist + Bash patterns for interactive harvest-routine runs. Allow-only by design (no deny / no defaultMode) to preserve scheduled-fire non-regression."
