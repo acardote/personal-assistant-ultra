@@ -848,12 +848,17 @@ def amend_in_editor(memo_path: Path) -> bool:
 _DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)\n```", re.DOTALL)
 
 
-# Sentinel `amend_instr` values used by the m-handler to distinguish $EDITOR-route
-# reasons in the accuracy-log dispatch. Defined as module constants so the setter
-# (m-handler) and the dispatcher (notes-builder) reference the SAME literal —
-# substring matching on free-text `amend_instr` would mis-classify a future NL
-# operator instruction containing one of these substrings (pr-challenger N3 on #232).
-AMEND_INSTR_NO_DIFF_BLOCK = "fallback to direct $EDITOR (no diff block in memo)"
+# Sentinel `amend_instr` value used by the m-handler to distinguish the claude-
+# unavailable $EDITOR fallback from a "real" NL+$EDITOR amend in the accuracy-log
+# dispatch. Defined as a module constant so setter (m-handler) and dispatcher
+# (notes-builder) reference the SAME literal — substring matching on free-text
+# `amend_instr` would mis-classify a future NL operator instruction containing
+# the substring (pr-challenger N3 on #232).
+#
+# The diff-less-memo route used to set its own sentinel here (AMEND_INSTR_NO_DIFF_BLOCK)
+# but #235 short-circuited that path entirely — diff-less memos now skip the
+# scope/apply chain instead of going through it, so they never reach the notes-
+# dispatcher with a "diff-less" amend_instr.
 AMEND_INSTR_CLAUDE_UNAVAILABLE = "fallback to direct $EDITOR (claude unavailable)"
 
 
@@ -1414,19 +1419,61 @@ def main(argv: list[str]) -> int:
             # consistent. A concurrent external writer would invalidate this,
             # but that scenario isn't part of the TUI's threat model (per #190 /
             # #232 pr-challenger N2). `continue` below returns to the per-memo
-            # walk loop (the `while idx < total` at line ~1256).
+            # walk loop (the `while idx < len(memos)` at line ~1279).
             if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                # Diff-less memos can't auto-apply: `kb-process.py apply` shells
+                # to `extract_proposed_diff` which raises ValueError without a
+                # ```diff fence. Going through scope-prompt + apply-attempt
+                # would produce a yellow "scope inject failed" + red "apply
+                # failed rc=1" cascade on every walk — confusing noise on the
+                # most common kb-scan emission class (#229 evidence: 79/144).
+                # Per #235 Move-2 scope: offer free-edit but SKIP scope-prompt
+                # and apply. Memo stays in .unprocessed/ with the operator's
+                # edits intact; they can return to it via hand-edit / `s` / `r`.
+                #
+                # `amend_rounds` / `amend_instr` deliberately NOT reset here —
+                # they're never read between this `continue` and the next memo's
+                # m-handler entry (which re-initializes them via run_amend_flow
+                # or the claude-unavailable branch). pr-challenger #237 F-new-1
+                # / F-new-4 are addressed below: skip the accuracy-log row when
+                # `edited=False` (no-op event), and the dispatcher comment names
+                # the sentinel-deprecation contract.
                 sys.stdout.write(
                     f"{DIM}No proposed diff in this memo — opening in $EDITOR for free-edit.{RESET}\n"
                 )
-                if amend_in_editor(memo_path):
-                    status = "applied_with_editor"
+                edited = amend_in_editor(memo_path)
+                if edited:
+                    sys.stdout.write(
+                        f"{GREEN}✓ memo edited in $EDITOR (no apply — diff-less memo){RESET}: {art_id}\n"
+                    )
+                    sys.stdout.write(
+                        f"{DIM}(your $EDITOR edits are saved on disk; the memo stays in .unprocessed/.){RESET}\n"
+                    )
                 else:
-                    sys.stdout.write(f"{DIM}Memo unchanged — press any key to re-render.{RESET}\n")
-                    getch()
-                    continue
-                amend_rounds = 0
-                amend_instr = AMEND_INSTR_NO_DIFF_BLOCK
+                    sys.stdout.write(
+                        f"{DIM}Memo unchanged.{RESET}\n"
+                    )
+                sys.stdout.write(
+                    f"{DIM}This memo has no proposed diff and cannot be auto-applied. "
+                    f"Options: hand-edit the file to add a ```diff block, "
+                    f"`s` to skip on the next iteration, or `r` to reject (last resort — "
+                    f"diff-less memos are often notes-only observations, not rejection candidates).{RESET}\n"
+                )
+                if accuracy_log and edited:
+                    # Only log when the operator actually edited the memo —
+                    # the "no edit" event is a non-action (pr-challenger F-new-1
+                    # on #237: re-walking the same queue would otherwise inflate
+                    # the log with duplicate non-action rows per memo).
+                    log_accuracy_row(
+                        accuracy_log, art_id, this_prediction, "m", "",
+                        candidate_kind=this_kind,
+                        notes="edited via $EDITOR (no diff block — apply skipped)",
+                        scope_source=SCOPE_SOURCE_NA,
+                    )
+                sys.stdout.write(f"{DIM}Press any key to continue.{RESET}\n")
+                getch()
+                idx += 1
+                continue
             else:
                 ok, _ = claude_cli_probe()
                 if not ok:
@@ -1495,16 +1542,14 @@ def main(argv: list[str]) -> int:
                     # so post-walk analysis can identify rows where the prediction was
                     # for the pre-amend body but the action reflects an N-round amend.
                     if status == "applied_with_editor":
-                        # Discriminate the three $EDITOR-route reasons (per #231 acceptance):
-                        #   (a) AMEND_INSTR_NO_DIFF_BLOCK    — diff-less memo guard fired
-                        #   (b) AMEND_INSTR_CLAUDE_UNAVAILABLE — legacy claude-missing fallback
-                        #   (c) anything else                — NL amend then $EDITOR fine-tune
-                        # Exact match on the sentinel constants set by the m-handler (per
-                        # #232 pr-challenger N3 — substring matching on free-text would
-                        # mis-classify NL instructions that happen to contain the substring).
-                        if amend_instr == AMEND_INSTR_NO_DIFF_BLOCK:
-                            notes = "amended via direct $EDITOR (no diff block in memo)"
-                        elif amend_instr == AMEND_INSTR_CLAUDE_UNAVAILABLE:
+                        # Discriminate the two `applied_with_editor` reasons reaching the
+                        # dispatcher post-#235:
+                        #   (a) AMEND_INSTR_CLAUDE_UNAVAILABLE — legacy claude-missing fallback
+                        #   (b) anything else                  — NL amend then $EDITOR fine-tune
+                        # Exact match on the sentinel constant (per #232 pr-challenger N3 —
+                        # substring matching on free-text would mis-classify NL instructions
+                        # that happen to contain the substring).
+                        if amend_instr == AMEND_INSTR_CLAUDE_UNAVAILABLE:
                             notes = "amended via direct $EDITOR (legacy fallback)"
                         else:
                             notes = f"amended via NL+$EDITOR (rounds={amend_rounds}): {amend_instr[:120]}"
