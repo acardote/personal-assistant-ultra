@@ -1419,7 +1419,7 @@ def main(argv: list[str]) -> int:
             # consistent. A concurrent external writer would invalidate this,
             # but that scenario isn't part of the TUI's threat model (per #190 /
             # #232 pr-challenger N2). `continue` below returns to the per-memo
-            # walk loop (the `while idx < total` at line ~1256).
+            # walk loop (the `while idx < len(memos)` at line ~1279).
             if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
                 # Diff-less memos can't auto-apply: `kb-process.py apply` shells
                 # to `extract_proposed_diff` which raises ValueError without a
@@ -1429,7 +1429,15 @@ def main(argv: list[str]) -> int:
                 # most common kb-scan emission class (#229 evidence: 79/144).
                 # Per #235 Move-2 scope: offer free-edit but SKIP scope-prompt
                 # and apply. Memo stays in .unprocessed/ with the operator's
-                # edits intact; they can return to it via `r` / `s` / hand-edit.
+                # edits intact; they can return to it via hand-edit / `s` / `r`.
+                #
+                # `amend_rounds` / `amend_instr` deliberately NOT reset here —
+                # they're never read between this `continue` and the next memo's
+                # m-handler entry (which re-initializes them via run_amend_flow
+                # or the claude-unavailable branch). pr-challenger #237 F-new-1
+                # / F-new-4 are addressed below: skip the accuracy-log row when
+                # `edited=False` (no-op event), and the dispatcher comment names
+                # the sentinel-deprecation contract.
                 sys.stdout.write(
                     f"{DIM}No proposed diff in this memo — opening in $EDITOR for free-edit.{RESET}\n"
                 )
@@ -1438,24 +1446,28 @@ def main(argv: list[str]) -> int:
                     sys.stdout.write(
                         f"{GREEN}✓ memo edited in $EDITOR (no apply — diff-less memo){RESET}: {art_id}\n"
                     )
+                    sys.stdout.write(
+                        f"{DIM}(your $EDITOR edits are saved on disk; the memo stays in .unprocessed/.){RESET}\n"
+                    )
                 else:
                     sys.stdout.write(
                         f"{DIM}Memo unchanged.{RESET}\n"
                     )
                 sys.stdout.write(
                     f"{DIM}This memo has no proposed diff and cannot be auto-applied. "
-                    f"Use `r` to reject or `s` to skip on the next iteration, "
-                    f"or hand-edit the file to add a ```diff block.{RESET}\n"
+                    f"Options: hand-edit the file to add a ```diff block, "
+                    f"`s` to skip on the next iteration, or `r` to reject (last resort — "
+                    f"diff-less memos are often notes-only observations, not rejection candidates).{RESET}\n"
                 )
-                if accuracy_log:
-                    notes = (
-                        "edited via $EDITOR (no diff block — apply skipped)"
-                        if edited
-                        else "no edit (no diff block — apply skipped)"
-                    )
+                if accuracy_log and edited:
+                    # Only log when the operator actually edited the memo —
+                    # the "no edit" event is a non-action (pr-challenger F-new-1
+                    # on #237: re-walking the same queue would otherwise inflate
+                    # the log with duplicate non-action rows per memo).
                     log_accuracy_row(
                         accuracy_log, art_id, this_prediction, "m", "",
-                        candidate_kind=this_kind, notes=notes,
+                        candidate_kind=this_kind,
+                        notes="edited via $EDITOR (no diff block — apply skipped)",
                         scope_source=SCOPE_SOURCE_NA,
                     )
                 sys.stdout.write(f"{DIM}Press any key to continue.{RESET}\n")
