@@ -862,6 +862,43 @@ _DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)\n```", re.DOTALL)
 AMEND_INSTR_CLAUDE_UNAVAILABLE = "fallback to direct $EDITOR (claude unavailable)"
 
 
+def _mode_b_violation_lines(memo_text: str) -> list[int]:
+    """Return the absolute (1-indexed) file line numbers of EVERY line inside
+    the first ```diff block that violates the `+ ` / bare-`+` / blank shape
+    contract. Empty list means no violations (or no diff block at all).
+
+    Used by `run_amend_flow`'s Mode-B error surface (#234) — distinct from
+    `extract_diff_block_content`'s short-circuiting behavior (it bails on the
+    FIRST violation, which would hide the fact that a memo may have multiple
+    bad lines; pr-challenger F3 on #234).
+
+    Reports FILE line numbers (the operator opens the memo in `$EDITOR` and
+    needs absolute positions to navigate, per pr-challenger F4 on #234),
+    NOT diff-body offsets. Does NOT echo any line content (the operator's
+    terminal scrollback might contain PII; pr-challenger F2 on #234)."""
+    m = _DIFF_BLOCK_RE.search(memo_text)
+    if not m:
+        return []
+    # Compute the absolute file line where the diff body starts. `m.group(1)`
+    # is the body between the fences; `m.start(1)` is the byte offset of its
+    # first char. Count newlines from the start of the memo up to that offset
+    # to get the 1-indexed file line of the body's first character. Add 0
+    # since the body's first char IS the first body line.
+    prefix_newlines = memo_text[:m.start(1)].count("\n")
+    body_first_file_line = prefix_newlines + 1  # 1-indexed
+    out: list[int] = []
+    body_lines = m.group(1).split("\n")
+    for body_idx, line in enumerate(body_lines):
+        if line.startswith("+ "):
+            continue
+        if line == "+":
+            continue
+        if line.strip() == "":
+            continue
+        out.append(body_first_file_line + body_idx)
+    return out
+
+
 def memo_has_diff_block(memo_text: str) -> bool:
     """Cheap predicate for "does this memo carry a ```diff fenced block?".
 
@@ -1078,7 +1115,28 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
                 "run_amend_flow reached Mode-A failure path; this should be "
                 "guarded by memo_has_diff_block() in the `m` handler. See #231."
             )
-        sys.stdout.write(f"{RED}Couldn't extract diff block from memo — falling back to direct $EDITOR.{RESET}\n")
+        # Mode B (#229 / #234): regex matched but lines inside the block violate
+        # the shape contract. Report ALL offending file line numbers (so the
+        # operator sees the full scope of the fix; pr-challenger F3 on #234)
+        # and the absolute memo path (so the operator can `$EDITOR <path>`
+        # directly). Do NOT echo the offending line content — terminal
+        # scrollback might be shared/recorded and the content can contain
+        # sensitive material (pr-challenger F2 on #234).
+        violations = _mode_b_violation_lines(original_memo_text)
+        n = len(violations)
+        if n == 1:
+            scope_desc = f"at file line {violations[0]}"
+        elif n <= 5:
+            scope_desc = f"at file lines {', '.join(str(v) for v in violations)}"
+        else:
+            scope_desc = (
+                f"{n} violations starting at file line {violations[0]} "
+                f"(next: {', '.join(str(v) for v in violations[1:4])}, …)"
+            )
+        sys.stdout.write(
+            f"{RED}Couldn't extract diff block (Mode B: line-shape violation "
+            f"{scope_desc}; memo: {memo_path}) — falling back to direct $EDITOR.{RESET}\n"
+        )
         return ("failed", 0, "")
 
     last_instruction = ""

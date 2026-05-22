@@ -196,5 +196,137 @@ def test_run_amend_flow_red_error_path_intact_on_mode_b(tmp_path, capsys, monkey
     assert "Couldn't extract diff block" in captured.out
 
 
+# ---------- T4: Mode-B error-surface improvements (#234) ----------
+
+
+def test_mode_b_violation_lines_finds_all_offenders():
+    """`_mode_b_violation_lines` reports EVERY shape-violating file line
+    inside the first ```diff block — not just the first (pr-challenger F3
+    on #234). Operator needs to see the full scope of the fix so they don't
+    fix-and-retry one line at a time."""
+    memo_with_two_violations = (
+        "---\n"
+        "id: art-test\n"
+        "---\n"
+        "\n"
+        "## Heading\n"
+        "\n"
+        "```diff\n"        # file line 7
+        "+ ## Title\n"     # file line 8 — OK
+        "+ - item\n"       # file line 9 — OK
+        "raw bad line 1\n" # file line 10 — VIOLATION
+        "+ ok again\n"     # file line 11 — OK
+        "another raw bad\n"# file line 12 — VIOLATION
+        "```\n"
+    )
+    violations = tui._mode_b_violation_lines(memo_with_two_violations)
+    assert violations == [10, 12], (
+        f"Expected violations at file lines [10, 12]; got {violations}. "
+        "If this assert fails, the file-line arithmetic in "
+        "_mode_b_violation_lines drifted from the docstring contract."
+    )
+
+
+def test_mode_b_violation_lines_empty_when_no_violations():
+    """A clean diff block returns empty list — no false positives."""
+    clean = (
+        "## Heading\n\n"
+        "```diff\n"
+        "+ a\n"
+        "+ b\n"
+        "+\n"
+        "+ c\n"
+        "```\n"
+    )
+    assert tui._mode_b_violation_lines(clean) == []
+
+
+def test_mode_b_violation_lines_empty_when_no_diff_block():
+    """No ```diff fence → empty list. This function is a Mode-B classifier;
+    Mode A is `memo_has_diff_block`'s domain."""
+    assert tui._mode_b_violation_lines("just prose no diff fence") == []
+
+
+def test_run_amend_flow_mode_b_message_names_mode_and_file_line(tmp_path, capsys):
+    """The Mode-B error surface (#234) must include the string 'Mode B' and
+    the file line number(s) of the offending line(s). It must NOT echo the
+    offending line CONTENT (pr-challenger F2 — privacy)."""
+    memo = (
+        "---\n"
+        "id: art-mode-b-1\n"
+        "---\n"
+        "\n"
+        "## Heading\n"
+        "\n"
+        "```diff\n"
+        "+ ## Title\n"
+        "+ - **Source:** secret_token_AKIAIOSFODNN7EXAMPLE\n"
+        "secret_token_AKIAIOSFODNN7EXAMPLE_continued_on_unprefixed_line\n"
+        "```\n"
+    )
+    memo_path = tmp_path / "art-mode-b-1.md"
+    memo_path.write_text(memo, encoding="utf-8")
+
+    status, rounds, instr = tui.run_amend_flow(memo_path)
+    assert status == "failed"
+    captured = capsys.readouterr()
+    assert "Mode B" in captured.out
+    # File line 10 is the violation (1: ---, 2: id, 3: ---, 4: blank, 5: ## Heading,
+    # 6: blank, 7: ```diff, 8: + ## Title, 9: + - **Source:**, 10: secret_token_...)
+    assert "line 10" in captured.out
+    assert str(memo_path) in captured.out
+    # F2 — content NOT echoed. The fake secret string must not leak into the
+    # message. (We use a fake AWS-key-shaped string to make the leak obvious
+    # if it ever happened; a real secret would also leak.)
+    assert "AKIAIOSFODNN7EXAMPLE" not in captured.out
+
+
+def test_run_amend_flow_mode_b_message_lists_all_violations(tmp_path, capsys):
+    """Multiple violations are all reported (pr-challenger F3) — the operator
+    sees the full scope, not just the first offender."""
+    memo = (
+        "---\n"
+        "id: art-mode-b-multi\n"
+        "---\n"
+        "\n"
+        "```diff\n"        # file line 5
+        "+ ## Title\n"     # file line 6 — OK
+        "raw line A\n"     # file line 7 — VIOLATION
+        "+ ok\n"           # file line 8 — OK
+        "raw line B\n"     # file line 9 — VIOLATION
+        "+ also ok\n"      # file line 10 — OK
+        "raw line C\n"     # file line 11 — VIOLATION
+        "```\n"
+    )
+    memo_path = tmp_path / "art-mode-b-multi.md"
+    memo_path.write_text(memo, encoding="utf-8")
+
+    status, _, _ = tui.run_amend_flow(memo_path)
+    assert status == "failed"
+    captured = capsys.readouterr()
+    assert "Mode B" in captured.out
+    assert "7" in captured.out
+    assert "9" in captured.out
+    assert "11" in captured.out
+
+
+def test_run_amend_flow_mode_b_message_truncates_when_many_violations(tmp_path, capsys):
+    """For ≥6 violations, the message summarizes ('N violations starting at
+    line K (next: …)') rather than listing all — keeps the terminal line
+    readable while preserving the total count."""
+    diff_lines = ["+ ## T"]
+    for i in range(8):
+        diff_lines.append(f"bad line {i}")  # 8 violations
+    memo = "---\nid: x\n---\n\n```diff\n" + "\n".join(diff_lines) + "\n```\n"
+    memo_path = tmp_path / "art-mode-b-many.md"
+    memo_path.write_text(memo, encoding="utf-8")
+
+    status, _, _ = tui.run_amend_flow(memo_path)
+    assert status == "failed"
+    captured = capsys.readouterr()
+    assert "8 violations" in captured.out
+    assert "Mode B" in captured.out
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
