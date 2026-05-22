@@ -862,6 +862,60 @@ _DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(.*?)\n```", re.DOTALL)
 AMEND_INSTR_CLAUDE_UNAVAILABLE = "fallback to direct $EDITOR (claude unavailable)"
 
 
+def _mode_b_violation_lines(memo_text: str) -> list[int]:
+    """Return the absolute (1-indexed) file line numbers of EVERY line inside
+    the first ```diff block that violates the `+ ` / bare-`+` / blank shape
+    contract. Empty list means no violations (or no diff block at all).
+
+    Used by `run_amend_flow`'s Mode-B error surface (#234) — distinct from
+    `extract_diff_block_content`'s short-circuiting behavior (it bails on the
+    FIRST violation, which would hide the fact that a memo may have multiple
+    bad lines; pr-challenger F3 on #234).
+
+    Reports FILE line numbers (the operator opens the memo in `$EDITOR` and
+    needs absolute positions to navigate, per pr-challenger F4 on #234),
+    NOT diff-body offsets. Does NOT echo any line content (the operator's
+    terminal scrollback might contain PII; pr-challenger F2 on #234).
+
+    Test-public contract: the test file in
+    `tests/test_kb_process_tui_diff_less_memo_acceptance.py` imports this
+    function by name (`tui._mode_b_violation_lines`) to pin the file-line
+    arithmetic and the all-violations contract. Renaming this function
+    breaks the test; do so deliberately if you do.
+
+    **CRLF caveat**: this function intentionally mirrors
+    `extract_diff_block_content`'s shape contract — it does NOT strip
+    trailing `\\r` from body lines before checking the bare-`+` blank
+    form. CRLF memos trip Mode B in both functions consistently (the
+    extractor returns None on the first `+\\r` line; this helper reports
+    every `+\\r` line as a violation). Stripping `\\r` here without also
+    stripping in the extractor would create disagreement between the
+    Mode-B trigger and the violation report. Fixing CRLF support requires
+    a separate, coordinated change to both functions (latent issue —
+    pr-challenger F5 on #234 surfaced; tracked as future work)."""
+    m = _DIFF_BLOCK_RE.search(memo_text)
+    if not m:
+        return []
+    # Compute the absolute file line where the diff body starts. `m.group(1)`
+    # is the body between the fences; `m.start(1)` is the byte offset of its
+    # first char. Count newlines from the start of the memo up to that offset
+    # to get the 1-indexed file line of the body's first character. Add 0
+    # since the body's first char IS the first body line.
+    prefix_newlines = memo_text[:m.start(1)].count("\n")
+    body_first_file_line = prefix_newlines + 1  # 1-indexed
+    out: list[int] = []
+    body_lines = m.group(1).split("\n")
+    for body_idx, line in enumerate(body_lines):
+        if line.startswith("+ "):
+            continue
+        if line == "+":
+            continue
+        if line.strip() == "":
+            continue
+        out.append(body_first_file_line + body_idx)
+    return out
+
+
 def memo_has_diff_block(memo_text: str) -> bool:
     """Cheap predicate for "does this memo carry a ```diff fenced block?".
 
@@ -1078,7 +1132,41 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
                 "run_amend_flow reached Mode-A failure path; this should be "
                 "guarded by memo_has_diff_block() in the `m` handler. See #231."
             )
-        sys.stdout.write(f"{RED}Couldn't extract diff block from memo — falling back to direct $EDITOR.{RESET}\n")
+        # Mode B (#229 / #234): regex matched but lines inside the block violate
+        # the shape contract. Report ALL offending file line numbers (so the
+        # operator sees the full scope of the fix; pr-challenger F3 on #234)
+        # and the absolute memo path (so the operator can `$EDITOR <path>`
+        # directly). Do NOT echo the offending line content — terminal
+        # scrollback might be shared/recorded and the content can contain
+        # sensitive material (pr-challenger F2 on #234).
+        violations = _mode_b_violation_lines(original_memo_text)
+        n = len(violations)
+        if n == 1:
+            scope_desc = f"at file line {violations[0]}"
+        elif n <= 5:
+            scope_desc = f"at file lines {', '.join(str(v) for v in violations)}"
+        else:
+            # n >= 6: show first + up to 3 "next" + ellipsis only if MORE remain
+            # after the preview (pr-challenger F7 on #234 — the previous shape
+            # always showed `, …` regardless of remainder count; for n=6 there
+            # was actually only 1 line left after the preview, making the
+            # ellipsis misleading).
+            preview = violations[1:4]
+            ellipsis = ", …" if n > 1 + len(preview) + 1 else ""
+            scope_desc = (
+                f"{n} violations starting at file line {violations[0]} "
+                f"(next: {', '.join(str(v) for v in preview)}{ellipsis})"
+            )
+        # F8 (pr-challenger #238) — interpolate the memo path via `repr()` so
+        # any ANSI escape characters embedded in a maliciously-crafted memo
+        # filename are rendered as quoted Python string literals rather than
+        # interpreted by the terminal. kb-scan controls filenames so the risk
+        # is low, but the defense is one repr() call.
+        memo_path_safe = repr(str(memo_path))
+        sys.stdout.write(
+            f"{RED}Couldn't extract diff block (Mode B: line-shape violation "
+            f"{scope_desc}; memo: {memo_path_safe}) — falling back to direct $EDITOR.{RESET}\n"
+        )
         return ("failed", 0, "")
 
     last_instruction = ""
