@@ -429,27 +429,26 @@ def _read_tui_source() -> str:
     return (PROJ / "tools" / "kb-process-tui.py").read_text(encoding="utf-8")
 
 
-def test_all_three_apply_paths_gate_on_memo_has_diff_block():
+def test_all_apply_paths_gate_on_memo_has_diff_block():
     """The `m`, `a`, and `M` handlers must EACH gate on `memo_has_diff_block`
     before any code that would reach `kb-process.py apply` (whose
     `extract_proposed_diff` raises ValueError without a ```diff fence).
 
-    Source-level invariant: every block containing an `inject_scope_into_memo`
-    call must be preceded — within the same handler — by a `memo_has_diff_block`
-    check that `continue`s on False. This pins the contract that ALL three
-    paths bounce diff-less memos before reaching the apply chain.
-
-    A simpler approximation: the source contains exactly THREE
-    `memo_has_diff_block(memo_path` call sites — one per gated handler.
-    The `m` handler's gate landed in #235; this test verifies #242's gates
-    on `a` and `M` also exist."""
+    Post-#243 F4 fix, the m and M handlers ALSO re-check after the amend
+    session — claude or hand-edit could have deleted the ```diff fence.
+    So the expected count of `memo_has_diff_block(memo_path…` calls is:
+    - `m` handler: entry gate (#235) + post-amend re-check (#243 F4) = 2
+    - `a` handler: entry gate (#242)                                  = 1
+    - `M` handler: entry gate (#242) + post-edit re-check (#243 F4)   = 2
+    Total = 5."""
     src = _read_tui_source()
     n = src.count("memo_has_diff_block(memo_path")
-    assert n == 3, (
-        f"Expected 3 `memo_has_diff_block(memo_path` call sites (one per "
-        f"gated handler: m / a / M); found {n}. If you removed or added a "
-        f"handler's gate, update this test deliberately. See #235 (m) + "
-        f"#242 (a, M)."
+    assert n == 5, (
+        f"Expected 5 `memo_has_diff_block(memo_path` call sites — entry "
+        f"gates for m/a/M (3) plus post-amend re-checks for m/M (2); "
+        f"found {n}. If you removed or added a gate / re-check, update "
+        f"this test deliberately. See #235 (m entry), #242 (a/M entry), "
+        f"#243 F4 (m/M post-amend)."
     )
 
 
@@ -494,35 +493,96 @@ def test_handlers_gate_before_inject_scope_into_memo_call_sites():
         )
 
 
-def test_a_M_handler_bounce_messages_do_not_misdirect_to_apply_via_m():
-    """F3 (per #242 falsifier) — the bounce messages on `a` and `M` must
-    NOT suggest `m` is a path to APPLY the memo. The post-#235 reality is
-    that `m` also can't auto-apply diff-less memos; suggesting "use `m`
-    then apply" misleads."""
+def test_apply_memo_after_amend_is_preceded_by_diff_block_recheck():
+    """F4 (per #243 pr-challenger) — the entry gates in the `m` and `M`
+    handlers read the memo on ENTRY, but the amend session can DELETE the
+    ```diff fence (claude instruction like "rewrite as prose" / hand-edit).
+    If `apply_memo` runs unconditionally after that, the operator gets a
+    "✗ apply failed rc=1" cascade.
+
+    Invariant (only for handlers WITH an amend session — `m` and `M`,
+    not `a`): between the amend call (`run_amend_flow` for `m`, the post-
+    gate `amend_in_editor` for `M`) and the subsequent `apply_memo` call,
+    there must be a `memo_has_diff_block` re-check."""
     src = _read_tui_source()
-    # The misleading phrasing from the pre-existing message
-    # ("Use `m` to edit manually, then apply") MUST NOT appear inside the
-    # diff-less gate blocks I added in #242. The pre-existing message at
-    # the scope-inject failure path (which is still reachable for memos
-    # that HAVE a diff block but a non-kb-scan-template shape) is OK to
-    # keep — for those memos, `m` → claude-amend → fixed shape → apply
-    # is the actual workflow.
-    #
-    # Verify by counting: post-#242, the source should contain the bounce
-    # text only in places where it's correct.
+    apply_pattern = "rc, out = apply_memo(method_root, art_id)"
+    apply_positions = [i for i in range(len(src)) if src.startswith(apply_pattern, i)]
+    # 3 apply call sites (a, m, M). Check the two with amend sessions.
+    # We identify those by looking for `run_amend_flow(memo_path)` or
+    # `changed = amend_in_editor(memo_path)` between the handler header
+    # and the apply call.
+    amend_markers = (
+        "status, amend_rounds, amend_instr = run_amend_flow(memo_path)",
+        "changed = amend_in_editor(memo_path)",
+    )
+    apply_after_amend_positions = []
+    for pos in apply_positions:
+        # Look at the 6000 chars before the apply for an amend marker. The
+        # m-handler block is large (~5000 chars from `run_amend_flow` call to
+        # `apply_memo` due to scope-prompt, accuracy log, etc.).
+        before = src[max(0, pos - 6000):pos]
+        if any(m in before for m in amend_markers):
+            apply_after_amend_positions.append(pos)
+    assert len(apply_after_amend_positions) == 2, (
+        f"expected exactly 2 apply_memo call sites downstream of an amend "
+        f"session (m + M handlers); found {len(apply_after_amend_positions)}"
+    )
+    for pos in apply_after_amend_positions:
+        # The re-check must appear AFTER the amend marker and BEFORE the
+        # apply call. Find the latest amend marker before this apply, then
+        # check the slice in between contains memo_has_diff_block.
+        before = src[max(0, pos - 6000):pos]
+        latest_amend_idx = max(before.rfind(m) for m in amend_markers if m in before)
+        between = before[latest_amend_idx:]
+        assert "memo_has_diff_block(memo_path" in between, (
+            f"apply_memo at position {pos} is downstream of an amend call "
+            f"but lacks a memo_has_diff_block re-check between the amend "
+            f"and the apply. F4 on #243: amend can delete the diff fence; "
+            f"apply without a re-check cascades through ValueError."
+        )
+
+
+def test_diff_less_gate_blocks_do_not_misdirect_to_apply_via_m():
+    """F3 (per #242 falsifier, hardened per #243 pr-challenger F6) — the
+    misleading "Use `m` to edit manually, then apply" phrase must NOT
+    appear inside ANY diff-less gate block, regardless of which issue
+    number the block was added under.
+
+    Pre-#243 version of this test keyed on the "#241 / #242" comment
+    marker, which would silently NOT cover a future gate block added
+    under a different issue. The hardened version delimits each gate
+    block by `if not memo_has_diff_block(memo_path` (entry) and the next
+    `continue` keyword — independent of any issue-number marker.
+
+    Each `if not memo_has_diff_block(memo_path...` defines a gate block.
+    For each block, the misleading phrase MUST NOT appear before the
+    block's terminating `continue`."""
+    src = _read_tui_source()
+    gate_start_pattern = "if not memo_has_diff_block(memo_path"
     bad_phrase = "Use `m` to edit manually, then apply"
-    # Find each occurrence and assert it's NOT inside one of the diff-less
-    # gate blocks (markers: the comments containing "#241 / #242").
-    bad_positions = [i for i in range(len(src)) if src.startswith(bad_phrase, i)]
-    for pos in bad_positions:
-        # Within 1500 chars BEFORE this position, ensure no "#241 / #242"
-        # marker appears — that would mean the bad phrase is inside one of
-        # my new gate blocks.
-        window = src[max(0, pos - 1500):pos]
-        assert "#241 / #242" not in window, (
-            f"The misleading phrase {bad_phrase!r} at position {pos} appears "
-            f"inside a diff-less gate block — #242 F3 says it would mislead "
-            f"the operator (m won't apply diff-less memos either)."
+    gate_starts = [i for i in range(len(src)) if src.startswith(gate_start_pattern, i)]
+    # Expect 5 occurrences post-#243 F4: 3 entry gates (m/a/M) + 2 post-amend
+    # re-checks (m/M). See the count-invariant test above for the breakdown.
+    assert len(gate_starts) == 5, (
+        f"expected exactly 5 `if not memo_has_diff_block(memo_path…` blocks "
+        f"(3 entry gates + 2 post-amend re-checks); found {len(gate_starts)}. "
+        f"If you added or removed a gate, update the count here deliberately."
+    )
+    for start in gate_starts:
+        # Find the next `continue` statement after this gate's body. The
+        # bounce body is indented 16 spaces inside the `if not memo_has_diff_block(...)`
+        # block (which itself is at 12 spaces inside the handler).
+        block_end = src.find("\n                continue", start)
+        assert block_end > start, (
+            f"gate block starting at {start} has no terminating `continue` "
+            f"at the expected 16-space indent"
+        )
+        block = src[start:block_end]
+        assert bad_phrase not in block, (
+            f"The misleading phrase {bad_phrase!r} appears inside a "
+            f"diff-less gate block (start={start}). #242 F3 / #243 F6: "
+            f"`m` cannot apply diff-less memos post-#235, so suggesting "
+            f"'use `m`... then apply' would mislead the operator."
         )
 
 
