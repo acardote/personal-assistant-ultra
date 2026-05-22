@@ -721,33 +721,31 @@ def emit_memo(content_root: Path, candidate: Candidate, session_id: str, query: 
     return path
 
 
-def _prefix_diff_body(body: str) -> str:
+def _prefix_diff_body(body: str | None) -> str:
     """Return `body` with `+ ` on every non-empty line and bare `+` on blank lines.
 
     Used by the diff-renderers so wrapped paragraphs in `body` / `summary` have
     the `+ ` prefix on every line, not just the first. Matches the round-trip
-    format `kb-process-tui.py:splice_amended_back` writes back, so a memo
-    extracted + amended + spliced + applied preserves shape (Mode-B regression
-    surface from #229 Child 3b / #233).
+    format `kb-process-tui.py:splice_amended_back` and `kb-process.py:extract_proposed_diff`
+    both consume (Mode-B regression surface from #229 Child 3b / #233).
 
-    Idempotency: a body that arrives ALREADY-prefixed (e.g., `"+ foo\\n+ bar"`)
-    must NOT be double-prefixed to `"+ + foo\\n+ + bar"` — that would be the
-    pr-challenger F3 risk. Detect the case by checking whether EVERY non-empty
-    line already starts with `"+ "` or equals `"+"`; if so, return verbatim
-    (the body is already in diff format and the renderer is composing on
-    pre-rendered input). This is defensive — current callers pass raw bodies,
-    but a future caller could compose renderers."""
+    Always prefixes. Callers MUST pass raw body content (no leading `+ ` on any
+    line). The natural defensive instinct — detect already-prefixed input and
+    pass through verbatim — creates a footgun: an LLM-emitted body using
+    CommonMark `+`-bulleted items (`"+ point A\\n+ point B"` — a valid bullet
+    style per CommonMark) would be mis-classified as already-prefixed, pass
+    through verbatim, and have its `+ ` bullets silently stripped by both
+    extractors on round-trip. pr-challenger surfaced this on PR #236. Renderer
+    composition isn't a current need — drop the defense rather than ship the
+    footgun.
+
+    `body or ""` defends against `None` arriving from a synthesis dict where
+    the LLM emitted JSON `null`."""
+    body = body or ""
     if body == "":
         return ""
-    lines = body.split("\n")
-    # Idempotency check: if every line is already in `+ X` / `+` / blank form,
-    # return verbatim. (Blank lines are ambiguous — they're valid in both raw
-    # and prefixed forms — so the check counts non-empty lines only.)
-    non_empty = [ln for ln in lines if ln.strip() != ""]
-    if non_empty and all(ln.startswith("+ ") or ln == "+" for ln in non_empty):
-        return body
     out: list[str] = []
-    for ln in lines:
+    for ln in body.split("\n"):
         if ln == "":
             out.append("+")
         else:
@@ -761,7 +759,7 @@ def render_person_org_diff(syn: dict) -> str:
     role = syn.get("role_or_relation", "")
     summary = syn.get("summary", "")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    summary_block = _prefix_diff_body(summary) if summary else ""
+    summary_block = _prefix_diff_body(summary)
     return (
         f"```diff\n"
         f"+ ## {title}\n"
@@ -779,7 +777,7 @@ def render_decision_diff(dec: dict, mo: MemoryObject) -> str:
     title = dec.get("title", "(missing title)")
     body = dec.get("body", "")
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    body_block = _prefix_diff_body(body) if body else ""
+    body_block = _prefix_diff_body(body)
     return (
         f"```diff\n"
         f"+ ## {title}\n"

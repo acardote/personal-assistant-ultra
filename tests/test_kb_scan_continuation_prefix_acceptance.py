@@ -40,6 +40,7 @@ def _load(name: str, filename: str):
 
 scan = _load("kb_scan", "kb-scan.py")
 tui = _load("kb_process_tui", "kb-process-tui.py")
+process = _load("kb_process", "kb-process.py")
 
 
 # ---------- T1: _prefix_diff_body unit ----------
@@ -62,24 +63,26 @@ def test_prefix_diff_body_empty_input_returns_empty():
     assert scan._prefix_diff_body("") == ""
 
 
-def test_prefix_diff_body_idempotent_on_already_prefixed():
-    """F3: already-prefixed body must NOT be double-prefixed.
-    Defends against renderer composition (passing pre-rendered output back in)."""
-    already = "+ a\n+ b"
-    assert scan._prefix_diff_body(already) == already
+def test_prefix_diff_body_none_input_returns_empty():
+    """The synthesis dict can carry `null` if the LLM omits a field; the
+    helper must handle None without crashing (pr-challenger M1 on #236)."""
+    assert scan._prefix_diff_body(None) == ""
 
 
-def test_prefix_diff_body_idempotent_with_bare_plus_blank():
-    already = "+ a\n+\n+ b"
-    assert scan._prefix_diff_body(already) == already
+def test_prefix_diff_body_commonmark_plus_bullets_get_double_prefixed():
+    """**Load-bearing** (pr-challenger F3-on-#236): if an LLM emits a body
+    using CommonMark `+`-bulleted items, the helper MUST treat them as raw
+    content and prefix again — anything else silently destroys the bullets
+    on extractor round-trip.
 
-
-def test_prefix_diff_body_mixed_input_treated_as_raw():
-    """If only SOME lines are prefixed, treat as raw (the idempotency check
-    requires ALL non-empty lines to be prefixed). This makes the helper
-    conservative — the caller has a slightly mixed input → prefix everything."""
-    mixed = "+ a\nb"
-    assert scan._prefix_diff_body(mixed) == "+ + a\n+ b"
+    Before the F3-fix on #236, the helper detected "all lines start with
+    `+ `" as "already prefixed" and passed through. That meant the rendered
+    diff carried raw `+ point A` lines; both extractors strip the leading
+    `+ ` and the kb file lost the bullet markers. Always-prefix avoids the
+    footgun — at the cost of a one-time round-trip mismatch for any caller
+    that ACTUALLY pre-prefixed (currently zero callers do this)."""
+    bullets = "+ point A\n+ point B"
+    assert scan._prefix_diff_body(bullets) == "+ + point A\n+ + point B"
 
 
 # ---------- T2: round-trip through extract_diff_block_content ----------
@@ -161,6 +164,67 @@ def test_pre_fix_shape_would_have_tripped_mode_b():
         "naive multi-line body should trip Mode B; if this assert fails, the "
         "extractor's shape contract has changed and #233's premise is stale"
     )
+
+
+# ---------- T4: apply-path round-trip (pr-challenger #236 critical finding) ----------
+
+
+def test_render_decision_diff_round_trips_through_extract_proposed_diff():
+    """The amend path uses `kb-process-tui.py:extract_diff_block_content`; the
+    apply path uses `kb-process.py:extract_proposed_diff` — a SEPARATE, more
+    strict extractor (raises ValueError instead of returning None). If the two
+    extractors drift, a body the TUI accepts but apply rejects (or vice versa)
+    lands as a silent class of bugs. Verify the renderer's output round-trips
+    through BOTH extractors on a multi-line body — that's the only contract
+    that holds the full pipeline together. pr-challenger N1 on #236."""
+    dec = {"title": "Decision X", "body": "line one\nline two wraps here\nline three"}
+    class _Mo:
+        memory_id = "mem-test"
+        source_kind = "test"
+    diff_text = scan.render_decision_diff(dec, _Mo())
+    # Apply-side extractor — raises ValueError on shape violation; returning
+    # at all means the diff parsed cleanly.
+    applied_text = process.extract_proposed_diff(diff_text)
+    assert "line one" in applied_text
+    assert "line two wraps here" in applied_text
+    assert "line three" in applied_text
+
+
+def test_render_person_org_diff_round_trips_through_extract_proposed_diff():
+    syn = {
+        "title": "Person Y",
+        "role_or_relation": "Engineer",
+        "summary": "first paragraph line\nsecond line\n\nsecond paragraph",
+    }
+    diff_text = scan.render_person_org_diff(syn)
+    applied_text = process.extract_proposed_diff(diff_text)
+    assert "first paragraph line" in applied_text
+    assert "second line" in applied_text
+    assert "second paragraph" in applied_text
+
+
+def test_commonmark_plus_bullet_body_extracts_cleanly_on_both_extractors():
+    """**Load-bearing**: an LLM emitting a body of `+`-bulleted CommonMark items
+    must produce a rendered diff that BOTH the TUI extractor AND the apply
+    extractor parse without dropping the bullets. The always-prefix design
+    guarantees this: `+ point A` in the body becomes `+ + point A` in the diff;
+    extractor strips `+ ` → user sees `+ point A` (the bullet) in the kb file.
+    pr-challenger F3 on #236 — silently destroying bullets via incorrect
+    idempotency-detection is the failure mode this test pins."""
+    dec = {"title": "Decision with bullets", "body": "Key points:\n+ point A\n+ point B"}
+    class _Mo:
+        memory_id = "mem-test"
+        source_kind = "test"
+    diff_text = scan.render_decision_diff(dec, _Mo())
+    # TUI side
+    tui_extracted = tui.extract_diff_block_content(diff_text)
+    assert tui_extracted is not None
+    assert "+ point A" in tui_extracted
+    assert "+ point B" in tui_extracted
+    # Apply side
+    apply_extracted = process.extract_proposed_diff(diff_text)
+    assert "+ point A" in apply_extracted
+    assert "+ point B" in apply_extracted
 
 
 if __name__ == "__main__":
