@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Slack__*",
+      "mcp__claude_ai_Gmail__*",
+      "mcp__claude_ai_Granola__*",
+      "mcp__claude_ai_GitHub__*",
+      "Bash(git *)",
+      "Bash(find *)",
+      "Bash(openssl rand *)",
+      "Write",
+      "Edit"
+    ]
+  }
+}

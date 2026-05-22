@@ -33,6 +33,7 @@ A release ships these as a unit. A change to any of them is in scope of the next
 - **Config example** — `.assistant.local.json.example`.
 - **Release artefacts** — `RELEASE.md`, `release-policy.yaml`, `scripts/check-release-policy.py`.
 - **Helpers** — `scripts/pa-session` (per-project session helper, #214 — vault worktree + scaffold + launch wrapper).
+- **Claude settings** — `.claude/settings.json` (project-level MCP tool allowlist for harvest-routine interactive runs, #216 — allow-only / no-deny / no-defaultMode to preserve scheduled-fire non-regression).
 
 A version increment ships these together as a unit. `release-policy.yaml` is the machine-readable mirror of this list, validated by CI on every push and PR — drift between the two documents fails the build.
 
