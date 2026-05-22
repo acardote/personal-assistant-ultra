@@ -274,11 +274,20 @@ def test_run_amend_flow_mode_b_message_names_mode_and_file_line(tmp_path, capsys
     # File line 10 is the violation (1: ---, 2: id, 3: ---, 4: blank, 5: ## Heading,
     # 6: blank, 7: ```diff, 8: + ## Title, 9: + - **Source:**, 10: secret_token_...)
     assert "line 10" in captured.out
-    assert str(memo_path) in captured.out
-    # F2 — content NOT echoed. The fake secret string must not leak into the
-    # message. (We use a fake AWS-key-shaped string to make the leak obvious
-    # if it ever happened; a real secret would also leak.)
-    assert "AKIAIOSFODNN7EXAMPLE" not in captured.out
+    # Memo path is repr'd for terminal-safety (#238 pr-challenger F8); check
+    # via the file's basename (a substring of both raw and repr'd forms).
+    assert memo_path.name in captured.out
+    # F2 + F11 (pr-challenger on #234, hardened on #238) — content NOT echoed.
+    # The fake secret string must not leak; and no ≥6-char substring of it
+    # should appear either (defends against partial-leak via column-truncation
+    # or base64-style chunking).
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    assert secret not in captured.out
+    for i in range(len(secret) - 6 + 1):
+        chunk = secret[i:i + 6]
+        assert chunk not in captured.out, (
+            f"6-char substring `{chunk}` of the secret leaked into the message"
+        )
 
 
 def test_run_amend_flow_mode_b_message_lists_all_violations(tmp_path, capsys):
@@ -326,6 +335,82 @@ def test_run_amend_flow_mode_b_message_truncates_when_many_violations(tmp_path, 
     captured = capsys.readouterr()
     assert "8 violations" in captured.out
     assert "Mode B" in captured.out
+    # F7 (pr-challenger #238) — ellipsis only appears when MORE remain after
+    # the preview. For n=8: preview shows 3 ("next: X, Y, Z"), 4 remain
+    # afterward → ellipsis present.
+    assert "…" in captured.out
+
+
+def test_mode_b_message_ellipsis_only_when_items_remain_beyond_preview(tmp_path, capsys):
+    """F7 (pr-challenger #238) — ellipsis must be truthful. The previous shape
+    showed `, …` unconditionally for n≥6, but the right rule is "ellipsis
+    appears IFF there are items beyond the preview".
+
+    Boundary trace (preview is `violations[1:4]` = up to 3 items):
+    - n=6: first shown + preview shown (3) = 4 items. Remaining = 2. Ellipsis ✓
+    - n=7: 4 shown, 3 remain. Ellipsis ✓
+    - n=4 / n=5: handled by the `n <= 5` enumerate-all branch — no ellipsis ever.
+
+    The condition `n > 1 + len(preview) + 1` says "ellipsis if at least one
+    item exists beyond the [first + preview] block". For n=6, 6 > 1+3+1=5 →
+    ellipsis. Correct — 2 more do exist."""
+    # Verify n=6 case: ellipsis IS present (2 items remain beyond preview).
+    diff_lines = ["+ ## T"]
+    for i in range(6):
+        diff_lines.append(f"bad line {i}")
+    memo = "---\nid: x\n---\n\n```diff\n" + "\n".join(diff_lines) + "\n```\n"
+    memo_path = tmp_path / "art-mode-b-six.md"
+    memo_path.write_text(memo, encoding="utf-8")
+
+    status, _, _ = tui.run_amend_flow(memo_path)
+    assert status == "failed"
+    captured = capsys.readouterr()
+    assert "6 violations" in captured.out
+    # 2 items remain after the 4-item header; ellipsis correctly says "more".
+    assert "…" in captured.out, (
+        "ellipsis should appear at n=6 — 2 violations exist beyond the preview"
+    )
+
+
+def test_mode_b_helper_consistent_with_extractor_on_crlf(tmp_path):
+    """F5 (pr-challenger #238) — CRLF caveat. `_mode_b_violation_lines` and
+    `extract_diff_block_content` BOTH use `m.group(1).split('\\n')` without
+    stripping `\\r`. The bare-`+` blank line ends up as `+\\r`, which fails
+    the shape contract in BOTH functions consistently:
+      - extractor: returns None (bails on the first `+\\r`).
+      - helper: reports every `+\\r` line as a violation.
+    The two functions AGREE that the memo trips Mode B. This test pins the
+    consistency — if a future change strips `\\r` in one but not the other,
+    the message would say "Mode B violations: <empty>" while the extractor
+    correctly bailed (or vice versa). Fixing CRLF support requires
+    coordinating BOTH functions; tracked as future work."""
+    crlf_memo = (
+        "---\r\n"
+        "id: art-crlf\r\n"
+        "---\r\n"
+        "\r\n"
+        "```diff\r\n"
+        "+ ## Title\r\n"
+        "+ - **Source:** ok\r\n"
+        "+\r\n"  # ← bare-`+` blank line in CRLF; both functions see `+\r`
+        "+ body\r\n"
+        "```\r\n"
+    )
+    memo_path = tmp_path / "art-crlf.md"
+    memo_path.write_text(crlf_memo, encoding="utf-8", newline="")
+    # Extractor and helper must agree that the memo is malformed:
+    extracted = tui.extract_diff_block_content(crlf_memo)
+    violations = tui._mode_b_violation_lines(crlf_memo)
+    # Either both signal failure (extractor returns None AND helper finds
+    # violations) OR both signal success (extractor returns content AND
+    # helper finds none). Anything else is a contract drift.
+    extractor_failed = extracted is None
+    helper_found_violations = len(violations) > 0
+    assert extractor_failed == helper_found_violations, (
+        f"extractor and helper disagree on CRLF input: "
+        f"extractor returned None? {extractor_failed}; "
+        f"helper found violations? {helper_found_violations} ({violations})"
+    )
 
 
 if __name__ == "__main__":

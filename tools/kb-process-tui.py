@@ -875,7 +875,24 @@ def _mode_b_violation_lines(memo_text: str) -> list[int]:
     Reports FILE line numbers (the operator opens the memo in `$EDITOR` and
     needs absolute positions to navigate, per pr-challenger F4 on #234),
     NOT diff-body offsets. Does NOT echo any line content (the operator's
-    terminal scrollback might contain PII; pr-challenger F2 on #234)."""
+    terminal scrollback might contain PII; pr-challenger F2 on #234).
+
+    Test-public contract: the test file in
+    `tests/test_kb_process_tui_diff_less_memo_acceptance.py` imports this
+    function by name (`tui._mode_b_violation_lines`) to pin the file-line
+    arithmetic and the all-violations contract. Renaming this function
+    breaks the test; do so deliberately if you do.
+
+    **CRLF caveat**: this function intentionally mirrors
+    `extract_diff_block_content`'s shape contract — it does NOT strip
+    trailing `\\r` from body lines before checking the bare-`+` blank
+    form. CRLF memos trip Mode B in both functions consistently (the
+    extractor returns None on the first `+\\r` line; this helper reports
+    every `+\\r` line as a violation). Stripping `\\r` here without also
+    stripping in the extractor would create disagreement between the
+    Mode-B trigger and the violation report. Fixing CRLF support requires
+    a separate, coordinated change to both functions (latent issue —
+    pr-challenger F5 on #234 surfaced; tracked as future work)."""
     m = _DIFF_BLOCK_RE.search(memo_text)
     if not m:
         return []
@@ -1129,13 +1146,26 @@ def run_amend_flow(memo_path: Path) -> tuple[str, int, str]:
         elif n <= 5:
             scope_desc = f"at file lines {', '.join(str(v) for v in violations)}"
         else:
+            # n >= 6: show first + up to 3 "next" + ellipsis only if MORE remain
+            # after the preview (pr-challenger F7 on #234 — the previous shape
+            # always showed `, …` regardless of remainder count; for n=6 there
+            # was actually only 1 line left after the preview, making the
+            # ellipsis misleading).
+            preview = violations[1:4]
+            ellipsis = ", …" if n > 1 + len(preview) + 1 else ""
             scope_desc = (
                 f"{n} violations starting at file line {violations[0]} "
-                f"(next: {', '.join(str(v) for v in violations[1:4])}, …)"
+                f"(next: {', '.join(str(v) for v in preview)}{ellipsis})"
             )
+        # F8 (pr-challenger #238) — interpolate the memo path via `repr()` so
+        # any ANSI escape characters embedded in a maliciously-crafted memo
+        # filename are rendered as quoted Python string literals rather than
+        # interpreted by the terminal. kb-scan controls filenames so the risk
+        # is low, but the defense is one repr() call.
+        memo_path_safe = repr(str(memo_path))
         sys.stdout.write(
             f"{RED}Couldn't extract diff block (Mode B: line-shape violation "
-            f"{scope_desc}; memo: {memo_path}) — falling back to direct $EDITOR.{RESET}\n"
+            f"{scope_desc}; memo: {memo_path_safe}) — falling back to direct $EDITOR.{RESET}\n"
         )
         return ("failed", 0, "")
 
