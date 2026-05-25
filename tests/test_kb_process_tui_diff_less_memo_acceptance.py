@@ -413,5 +413,178 @@ def test_mode_b_helper_consistent_with_extractor_on_crlf(tmp_path):
     )
 
 
+# ---------- T5: a / M handler gates on diff-less memos (#241 / #242) ----------
+#
+# The `a` (approve) and `M` (direct-$EDITOR amend) handlers used to drive
+# diff-less memos through scope-inject + apply chains that fail downstream.
+# The fix gates BOTH handlers on `memo_has_diff_block` BEFORE any of that.
+# These tests exercise the gate via source-level invariants — the handlers
+# themselves live inside the TUI's giant per-memo loop and aren't unit-
+# testable directly, so we pin the gate's PRESENCE (the keystroke handler
+# block contains a `memo_has_diff_block` check) and ABSENCE of the
+# misleading help text the gate replaces.
+
+
+def _read_tui_source() -> str:
+    return (PROJ / "tools" / "kb-process-tui.py").read_text(encoding="utf-8")
+
+
+def test_all_apply_paths_gate_on_memo_has_diff_block():
+    """The `m`, `a`, and `M` handlers must EACH gate on `memo_has_diff_block`
+    before any code that would reach `kb-process.py apply` (whose
+    `extract_proposed_diff` raises ValueError without a ```diff fence).
+
+    Post-#243 F4 fix, the m and M handlers ALSO re-check after the amend
+    session — claude or hand-edit could have deleted the ```diff fence.
+    So the expected count of `memo_has_diff_block(memo_path…` calls is:
+    - `m` handler: entry gate (#235) + post-amend re-check (#243 F4) = 2
+    - `a` handler: entry gate (#242)                                  = 1
+    - `M` handler: entry gate (#242) + post-edit re-check (#243 F4)   = 2
+    Total = 5."""
+    src = _read_tui_source()
+    n = src.count("memo_has_diff_block(memo_path")
+    assert n == 5, (
+        f"Expected 5 `memo_has_diff_block(memo_path` call sites — entry "
+        f"gates for m/a/M (3) plus post-amend re-checks for m/M (2); "
+        f"found {n}. If you removed or added a gate / re-check, update "
+        f"this test deliberately. See #235 (m entry), #242 (a/M entry), "
+        f"#243 F4 (m/M post-amend)."
+    )
+
+
+def test_handlers_gate_before_inject_scope_into_memo_call_sites():
+    """Every CALL SITE of `inject_scope_into_memo` (not the def itself, not
+    docstring mentions) must be preceded — within the same handler block —
+    by a `memo_has_diff_block` check. Pin the locality so a future refactor
+    that moves the gate too far or removes it fails this test.
+
+    Match pattern: `injected = inject_scope_into_memo(memo_path,` — that's
+    the specific call shape used in both the `a` and `M` handlers."""
+    src = _read_tui_source()
+    call_pattern = "injected = inject_scope_into_memo(memo_path,"
+    call_positions = [i for i in range(len(src)) if src.startswith(call_pattern, i)]
+    assert len(call_positions) == 3, (
+        f"expected exactly 3 inject_scope_into_memo CALL sites — `a` "
+        f"handler, `m` handler (post-claude-amend success), and `M` "
+        f"handler; found {len(call_positions)}. If you added or removed "
+        f"a call site, update this test deliberately."
+    )
+    for pos in call_positions:
+        # Find the immediately-preceding handler header (`if key == "X":` or
+        # `elif key == "X":` in the main walk loop). The handler block between
+        # that header and this call site must contain the gate.
+        before = src[:pos]
+        # Match the LAST `if key ==` / `elif key ==` before this position.
+        header_pos = max(
+            before.rfind('if key == "a":'),
+            before.rfind('elif key == "m":'),
+            before.rfind('elif key == "M":'),
+        )
+        assert header_pos >= 0, (
+            f"inject_scope_into_memo call at position {pos} has no preceding "
+            f"a/m/M handler header — unexpected structure."
+        )
+        handler_block = src[header_pos:pos]
+        assert "memo_has_diff_block(memo_path" in handler_block, (
+            f"inject_scope_into_memo call at position {pos} is inside a "
+            f"handler block (starting at {header_pos}) that does NOT contain "
+            f"a memo_has_diff_block gate — diff-less memos could reach this "
+            f"call site. See #242."
+        )
+
+
+def test_apply_memo_after_amend_is_preceded_by_diff_block_recheck():
+    """F4 (per #243 pr-challenger) — the entry gates in the `m` and `M`
+    handlers read the memo on ENTRY, but the amend session can DELETE the
+    ```diff fence (claude instruction like "rewrite as prose" / hand-edit).
+    If `apply_memo` runs unconditionally after that, the operator gets a
+    "✗ apply failed rc=1" cascade.
+
+    Invariant (only for handlers WITH an amend session — `m` and `M`,
+    not `a`): between the amend call (`run_amend_flow` for `m`, the post-
+    gate `amend_in_editor` for `M`) and the subsequent `apply_memo` call,
+    there must be a `memo_has_diff_block` re-check."""
+    src = _read_tui_source()
+    apply_pattern = "rc, out = apply_memo(method_root, art_id)"
+    apply_positions = [i for i in range(len(src)) if src.startswith(apply_pattern, i)]
+    # 3 apply call sites (a, m, M). Check the two with amend sessions.
+    # We identify those by looking for `run_amend_flow(memo_path)` or
+    # `changed = amend_in_editor(memo_path)` between the handler header
+    # and the apply call.
+    amend_markers = (
+        "status, amend_rounds, amend_instr = run_amend_flow(memo_path)",
+        "changed = amend_in_editor(memo_path)",
+    )
+    apply_after_amend_positions = []
+    for pos in apply_positions:
+        # Look at the 6000 chars before the apply for an amend marker. The
+        # m-handler block is large (~5000 chars from `run_amend_flow` call to
+        # `apply_memo` due to scope-prompt, accuracy log, etc.).
+        before = src[max(0, pos - 6000):pos]
+        if any(m in before for m in amend_markers):
+            apply_after_amend_positions.append(pos)
+    assert len(apply_after_amend_positions) == 2, (
+        f"expected exactly 2 apply_memo call sites downstream of an amend "
+        f"session (m + M handlers); found {len(apply_after_amend_positions)}"
+    )
+    for pos in apply_after_amend_positions:
+        # The re-check must appear AFTER the amend marker and BEFORE the
+        # apply call. Find the latest amend marker before this apply, then
+        # check the slice in between contains memo_has_diff_block.
+        before = src[max(0, pos - 6000):pos]
+        latest_amend_idx = max(before.rfind(m) for m in amend_markers if m in before)
+        between = before[latest_amend_idx:]
+        assert "memo_has_diff_block(memo_path" in between, (
+            f"apply_memo at position {pos} is downstream of an amend call "
+            f"but lacks a memo_has_diff_block re-check between the amend "
+            f"and the apply. F4 on #243: amend can delete the diff fence; "
+            f"apply without a re-check cascades through ValueError."
+        )
+
+
+def test_diff_less_gate_blocks_do_not_misdirect_to_apply_via_m():
+    """F3 (per #242 falsifier, hardened per #243 pr-challenger F6) — the
+    misleading "Use `m` to edit manually, then apply" phrase must NOT
+    appear inside ANY diff-less gate block, regardless of which issue
+    number the block was added under.
+
+    Pre-#243 version of this test keyed on the "#241 / #242" comment
+    marker, which would silently NOT cover a future gate block added
+    under a different issue. The hardened version delimits each gate
+    block by `if not memo_has_diff_block(memo_path` (entry) and the next
+    `continue` keyword — independent of any issue-number marker.
+
+    Each `if not memo_has_diff_block(memo_path...` defines a gate block.
+    For each block, the misleading phrase MUST NOT appear before the
+    block's terminating `continue`."""
+    src = _read_tui_source()
+    gate_start_pattern = "if not memo_has_diff_block(memo_path"
+    bad_phrase = "Use `m` to edit manually, then apply"
+    gate_starts = [i for i in range(len(src)) if src.startswith(gate_start_pattern, i)]
+    # Expect 5 occurrences post-#243 F4: 3 entry gates (m/a/M) + 2 post-amend
+    # re-checks (m/M). See the count-invariant test above for the breakdown.
+    assert len(gate_starts) == 5, (
+        f"expected exactly 5 `if not memo_has_diff_block(memo_path…` blocks "
+        f"(3 entry gates + 2 post-amend re-checks); found {len(gate_starts)}. "
+        f"If you added or removed a gate, update the count here deliberately."
+    )
+    for start in gate_starts:
+        # Find the next `continue` statement after this gate's body. The
+        # bounce body is indented 16 spaces inside the `if not memo_has_diff_block(...)`
+        # block (which itself is at 12 spaces inside the handler).
+        block_end = src.find("\n                continue", start)
+        assert block_end > start, (
+            f"gate block starting at {start} has no terminating `continue` "
+            f"at the expected 16-space indent"
+        )
+        block = src[start:block_end]
+        assert bad_phrase not in block, (
+            f"The misleading phrase {bad_phrase!r} appears inside a "
+            f"diff-less gate block (start={start}). #242 F3 / #243 F6: "
+            f"`m` cannot apply diff-less memos post-#235, so suggesting "
+            f"'use `m`... then apply' would mislead the operator."
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

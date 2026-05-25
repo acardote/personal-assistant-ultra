@@ -1418,6 +1418,34 @@ def main(argv: list[str]) -> int:
         wants_scope = this_kind == "decision"
 
         if key == "a":
+            # Diff-less guard (#241 / #242): same rationale as the `m` handler's
+            # gate (#235) — `kb-process apply` shells to `extract_proposed_diff`
+            # which raises ValueError without a ```diff fence. Pressing `a` on a
+            # diff-less memo cascades through scope-prompt (→ "Couldn't inject
+            # Scope" red error) into apply (→ "apply failed rc=1"). Bounce the
+            # operator BEFORE the cascade with a clear "no proposed diff to
+            # apply" message + the same options the `m` handler suggests.
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                sys.stdout.write(
+                    f"{YELLOW}This memo has no proposed diff and cannot be auto-applied.{RESET}\n"
+                )
+                sys.stdout.write(
+                    f"{DIM}Options: `m` to free-edit in $EDITOR (also won't auto-apply — "
+                    f"see #229 / #235), `s` to skip, or `r` to reject (last resort — "
+                    f"diff-less memos are often notes-only observations, not rejection "
+                    f"candidates). Hand-edit the file to add a ```diff block if you want "
+                    f"to apply it.{RESET}\n"
+                )
+                # No accuracy-log row written here: bounce is a non-action
+                # (no kb mutation, no operator decision recorded). Pre-#242,
+                # action="a" in the log meant "applied"; writing a row with
+                # action="a" + notes="a-key blocked" would mis-classify the
+                # bounce as an approval in downstream aggregations that
+                # filter on action alone (pr-challenger F7 on #243). Mirrors
+                # the no-edit-skip logic from #235's diff-less m-handler.
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue  # don't advance — let operator pick another action
             scope = ""  # B1 on #188 (pr-reviewer) — initialize unconditionally so the
             # downstream accuracy_log row build doesn't UnboundLocalError on
             # person/org/glossary candidates where `wants_scope == False`.
@@ -1621,6 +1649,24 @@ def main(argv: list[str]) -> int:
                             sys.stdout.write(
                                 f"{YELLOW}Scope inject failed (diff-block shape mismatch); applying without.{RESET}\n"
                             )
+            # Post-amend diff-less re-check (pr-challenger F4 on #243):
+            # the entry gate at the top of the `m` handler reads the memo on
+            # ENTRY, but `run_amend_flow` / `amend_in_editor` can mutate the
+            # body — including deleting the ```diff fence (claude instruction
+            # like "rewrite as prose" or hand-edit). Re-check before
+            # `apply_memo` so a post-amend diff-less memo bounces instead of
+            # cascading through `extract_proposed_diff`'s ValueError.
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                sys.stdout.write(
+                    f"{YELLOW}Post-amend memo has no proposed diff — apply skipped.{RESET}\n"
+                )
+                sys.stdout.write(
+                    f"{DIM}Your edits are on disk; the memo stays in .unprocessed/. "
+                    f"Hand-edit to restore a ```diff block, or `r` to reject.{RESET}\n"
+                )
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue  # don't advance — let operator pick another action
             rc, out = apply_memo(method_root, art_id)
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied (after amend){RESET}: {out}\n")
@@ -1668,6 +1714,27 @@ def main(argv: list[str]) -> int:
             # so a malformed save (broken diff fence, garbled frontmatter) that
             # crashes apply_memo can roll back instead of leaving the memo
             # corrupted in .unprocessed/.
+            #
+            # Diff-less guard (#241 / #242): same as `a` / `m` handlers —
+            # diff-less memos can't apply (extract_proposed_diff raises). The
+            # gate fires BEFORE both `m_original_text = memo_path.read_text(...)`
+            # (the #190 snapshot for rollback) and `amend_in_editor(memo_path)`
+            # — so on diff-less memos the operator bounces immediately, never
+            # paying for the snapshot or the editor session.
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                sys.stdout.write(
+                    f"{YELLOW}This memo has no proposed diff and cannot be auto-applied via `M`.{RESET}\n"
+                )
+                sys.stdout.write(
+                    f"{DIM}Use `m` to free-edit in $EDITOR (won't auto-apply but the edits "
+                    f"persist), `s` to skip, or `r` to reject. Hand-edit the file to add "
+                    f"a ```diff block if you want to apply it.{RESET}\n"
+                )
+                # No accuracy-log row — same rationale as the `a`-handler
+                # bounce above (pr-challenger F7 on #243).
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue
             m_original_text = memo_path.read_text(encoding="utf-8")
             changed = amend_in_editor(memo_path)
             if not changed:
@@ -1690,6 +1757,23 @@ def main(argv: list[str]) -> int:
                         injected = inject_scope_into_memo(memo_path, m_scope)
                         if injected:
                             last_scope = m_scope
+            # Post-edit diff-less re-check (pr-challenger F4 on #243): the
+            # entry gate above reads the memo on ENTRY; `amend_in_editor`
+            # can have removed the ```diff fence. Roll back to the pre-edit
+            # state and bounce, rather than cascading through apply.
+            if not memo_has_diff_block(memo_path.read_text(encoding="utf-8")):
+                sys.stdout.write(
+                    f"{YELLOW}Post-$EDITOR memo has no proposed diff — apply skipped, rolling back.{RESET}\n"
+                )
+                memo_path.write_text(m_original_text, encoding="utf-8")
+                sys.stdout.write(
+                    f"{DIM}Memo restored to pre-edit state. Use `m` for free-edit "
+                    f"(no auto-apply), `r` to reject, or hand-edit to add a "
+                    f"```diff block.{RESET}\n"
+                )
+                sys.stdout.write(f"{DIM}Press any key.{RESET}\n")
+                getch()
+                continue
             rc, out = apply_memo(method_root, art_id)
             if rc == 0:
                 sys.stdout.write(f"{GREEN}✓ applied (after $EDITOR){RESET}: {out}\n")
