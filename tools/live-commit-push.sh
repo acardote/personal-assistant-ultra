@@ -195,6 +195,23 @@ if grep -q "non-fast-forward\|fetch first" "$ERR_FILE"; then
     exit 3
 fi
 
+# No upstream configured (new project branch never pushed) → retry once with
+# --set-upstream. Separate dispatch branch from the non-ff rebase-retry above;
+# the error-classification regex there is left unchanged. git emits "The current
+# branch <name> has no upstream branch." on this failure — matching "no upstream
+# branch" keeps unrelated network/auth failures (which fall through to the
+# catch-all below) from being misclassified as a missing upstream.
+if grep -q "no upstream branch" "$ERR_FILE"; then
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    echo "[live-commit-push] no upstream for $BRANCH — pushing with --set-upstream" >&2
+    if git push --set-upstream origin "$BRANCH" 2>&1 >&2; then
+        echo "[live-commit-push] pushed with upstream set"
+        exit 0
+    fi
+    echo "[live-commit-push] push with --set-upstream failed" >&2
+    exit 2
+fi
+
 # Some other push failure (auth, network, etc.) — surface it.
 echo "[live-commit-push] push failed (not non-ff):" >&2
 cat "$ERR_FILE" >&2
