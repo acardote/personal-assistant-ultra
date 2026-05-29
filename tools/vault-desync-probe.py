@@ -158,9 +158,8 @@ def _format_banner(result: ProbeResult) -> str:
     for sig in result.signals:
         lines.append(f"  - {sig}")
     lines.append(
-        "[vault-desync-probe] Recovery: Children #252 (one-shot recovery helper) and #254 "
-        "(runbook in RELEASE.md) of parent #249 are in flight. Until they land, see #249's "
-        "evidence comments for the manual recovery sequence."
+        f"[vault-desync-probe] Recovery: tools/vault-desync-recover.py {result.vault} "
+        "(child #254 of #249 will land the full RELEASE.md runbook)."
     )
     return "\n".join(lines)
 

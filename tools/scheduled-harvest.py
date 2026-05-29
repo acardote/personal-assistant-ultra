@@ -118,7 +118,8 @@ def git_commit_and_push(content_root: Path, message: str) -> tuple[bool, str]:
             )
             return False, (
                 "vault-desync-probe refused: vault is in the May-28 desync class "
-                "(see #249). Stderr:\n" + diag.stderr
+                f"(see #249). Recovery: tools/vault-desync-recover.py {content_root}. "
+                f"Stderr:\n{diag.stderr}"
             )
     try:
         subprocess.run(["git", "-C", str(content_root), "add", "-A"], check=True, capture_output=True, text=True)
