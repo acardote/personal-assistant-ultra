@@ -62,26 +62,34 @@ tools/vault-desync-recover.py <vault-path> --dry-run  # show plan, no changes
 The recovery:
 1. Probes the vault. On clean → `nothing to recover` (idempotent and safe).
 2. Restores HEAD-tracked files absent from the working tree.
-3. Skips D-set paths that hold operator-authored working-tree content (preserved for manual resolution).
+3. Skips D-set paths that hold operator-authored working-tree content (preserved for manual resolution — see "Handling skipped D-set paths" below).
 4. Removes `.git/AUTO_MERGE`. Does NOT touch `MERGE_HEAD` (that signals a legitimate in-flight merge).
 5. Re-probes. If still firing → exit 1 with diagnostic; manual investigation needed.
 
-User-uncommitted edits (staged modifications, unstaged modifications, untracked files) are NOT touched.
+Commands above run **from the method-repo root** (`personal-assistant-ultra/`). User-uncommitted edits (staged modifications, unstaged modifications, untracked files) are NOT touched.
+
+### Handling skipped D-set paths
+
+When the recovery skips a D-set path (because the working tree holds operator content at that path), it lists the path under `SKIP <N> D-set path(s) that hold working-tree content`. For each one:
+
+1. `git status -- <path>` — confirm what git thinks the state is.
+2. `git diff HEAD -- <path>` — see how the operator content differs from HEAD.
+3. If the operator content is genuinely something you want to keep: leave it alone, commit it deliberately later. If it's artifactual (you didn't author it, it appeared during the desync): `git checkout HEAD -- <path>` to restore HEAD's version.
 
 ### Worked example: 2026-05-28 incident
 
-State observed:
-- 233 staged "deletions" against `HEAD = 45ffd5e` (the agentic-org-doctor merge).
-- 13 staged "modifications" — turned out to be byte-identical to a prior commit `15a42b8` (the May 25 frozen base).
+State observed (vault paths anonymized as `<vault>`):
+- 238 total "deletions" against `HEAD = 45ffd5e` (the agentic-org-doctor merge): 233 in the index, 5 in the working tree only.
+- 13 staged "modifications" — of which 8 were forensically inspected and confirmed byte-identical to a prior commit `15a42b8` (the May-25 frozen base). The remaining 5 were modifications to files whose HEAD content equaled the May-25 content (`HEAD vs 15a42b8 for path` empty), so byte-identity was structural; no separate check needed.
 - `.git/AUTO_MERGE` present, `.git/MERGE_HEAD` absent.
 - HEAD reflog had a 3-day gap; `refs/heads/main` reflog showed two ref mutations that bypassed the HEAD-aware path.
 
 Recovery executed:
 1. `git diff --cached --diff-filter=D --name-only HEAD | xargs -0 git checkout HEAD --` (manual equivalent of recover step 2 — the recovery tool didn't exist yet).
 2. `rm .git/AUTO_MERGE`.
-3. Working tree restored to HEAD's state. The 13 "stale modifications" turned out to be artifactual (no real local content to preserve) — confirmed by `git diff <base> -- <path>` returning empty for all 8.
+3. Working tree restored to HEAD's state. The 13 "stale modifications" turned out to be artifactual — confirmed via the byte-identity check above; no real local content to preserve.
 
-If the recovery tool had existed: `tools/vault-desync-recover.py /Users/acardote/Projects/acardote-pa-vault --yes`.
+If the recovery tool had existed: `tools/vault-desync-recover.py <vault> --yes`.
 
 ### Bypass
 
@@ -95,8 +103,10 @@ The bypass emits a banner to stderr (`[pa-vault pre-commit] BYPASS: PA_VAULT_HOO
 
 ### Prevention
 
+Per #250's "unrecoverable verdict," the specific command that caused the 2026-05-28 incident is unidentified. We therefore can't tell operators "don't run X" specifically; the actionable prevention is structural:
+
 - `pa-session new` and `pa-session doctor` install the vault pre-commit hook (`templates/git-hooks/pre-commit`) idempotently. Run `pa-session doctor` periodically on a long-lived vault to keep the hook in place.
-- Don't mutate `refs/heads/main` from outside the main worktree's HEAD-aware command path. `git branch -f main ...`, `git update-ref refs/heads/main ...`, and `gh pr merge` + manual sync are all candidate vectors (per #250's "unrecoverable verdict" the specific command remains unidentified, but the class is "ref mutation bypassing the working tree update").
+- Treat the class — "ref mutation that bypasses the working tree update" — as the thing to avoid. Candidate vectors: `git branch -f main ...`, `git update-ref refs/heads/main ...`, `gh pr merge` followed by direct ref edits, and any script that mutates `.git/refs/heads/main` without going through `git commit` / `git merge` / `git checkout`. If you find yourself wanting to do one of these, run `pa-session doctor` immediately after.
 
 ## The `latest` tag
 
