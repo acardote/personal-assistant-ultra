@@ -55,6 +55,30 @@ def validate_short(short: str) -> None:
         )
 
 
+def refuse_if_vault_desynced(vault: Path) -> None:
+    """Preflight: run vault-desync-probe and refuse if it fires (per #251 of #249).
+
+    The probe is skipped if the binary isn't present — older method-repo checkouts
+    don't ship it, and we don't want to break those. Once #251 lands and the probe
+    is part of the standard toolchain, the skip-path becomes dead code.
+    """
+    probe = METHOD_ROOT / "tools" / "vault-desync-probe.py"
+    if not probe.is_file():
+        return
+    r = subprocess.run(
+        [str(probe), str(vault)],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return
+    sys.stderr.write(r.stderr)
+    sys.exit(
+        "pa-session: refusing to operate on a desynced vault. "
+        "Recovery: tools/vault-desync-recover.sh (lands in #252 of #249) "
+        "or see RUNBOOK.md."
+    )
+
+
 def worktree_path(vault: Path, short: str) -> Path:
     return vault / WORKTREES_SUBDIR / short
 
@@ -176,6 +200,7 @@ def find_worktree_project(wt: Path) -> tuple[str | None, dict]:
 
 def cmd_new(args, vault: Path) -> int:
     validate_short(args.short)
+    refuse_if_vault_desynced(vault)
     ensure_gitignore_entry(vault, auto=args.auto)
     (vault / WORKTREES_SUBDIR).mkdir(exist_ok=True)
     wt_path = worktree_path(vault, args.short)
@@ -252,6 +277,7 @@ def cmd_reopen(args, vault: Path) -> int:
     - branch project/<short> doesn't exist locally (the --merge close case;
       manual recovery path surfaced in the refusal message)."""
     validate_short(args.short)
+    refuse_if_vault_desynced(vault)
     wt_path = worktree_path(vault, args.short)
     if wt_path.is_dir():
         sys.exit(
@@ -321,6 +347,7 @@ def cmd_reopen(args, vault: Path) -> int:
 
 def cmd_resume(args, vault: Path) -> int:
     validate_short(args.short)
+    refuse_if_vault_desynced(vault)
     wt_path = worktree_path(vault, args.short)
     if not wt_path.is_dir():
         sys.exit(
@@ -398,6 +425,7 @@ def cmd_list(args, vault: Path) -> int:
 
 def cmd_close(args, vault: Path) -> int:
     validate_short(args.short)
+    refuse_if_vault_desynced(vault)
     wt_path = worktree_path(vault, args.short)
     if not wt_path.is_dir():
         sys.exit(f"pa-session: no worktree at {wt_path}")
@@ -478,6 +506,28 @@ def cmd_doctor(args, vault: Path) -> int:
         ok = False
     else:
         print(f"ok:   .gitignore contains {GITIGNORE_ENTRY!r}")
+
+    # Vault-desync probe (per #251 of #249). doctor reports rather than refuses —
+    # the refusal path lives in cmd_new/resume/close/reopen.
+    probe = METHOD_ROOT / "tools" / "vault-desync-probe.py"
+    if probe.is_file():
+        r = subprocess.run(
+            [str(probe), str(vault), "--quiet"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            print("ok:   vault not desynced (probe clean)")
+        else:
+            diag = subprocess.run(
+                [str(probe), str(vault)],
+                capture_output=True, text=True,
+            )
+            print("FAIL: vault desync detected (see signals below). Recovery: tools/vault-desync-recover.sh (lands in #252 of #249).")
+            for line in diag.stderr.splitlines():
+                print(f"      {line}")
+            ok = False
+    else:
+        print("warn: tools/vault-desync-probe.py missing — desync check skipped")
     wts = existing_worktree_records(vault)
     pa_wt_root = (vault / WORKTREES_SUBDIR).resolve()
     pa_wts = {

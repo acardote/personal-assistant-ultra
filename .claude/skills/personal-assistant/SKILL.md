@@ -74,6 +74,16 @@ tools/assemble-kb.py
 
 Do not proceed with the user's request until layer 3 is loaded into your working context. If `tools/assemble-kb.py` fails or produces empty output, surface the failure to the user and stop — operating without layer 3 violates the "always-in-context" invariant on issue #4. If `.assistant.local.json` is missing, the assembler will emit a loud warning + fall back to method-root: that's fixture/test mode, not production; if you see the warning during a real session, **stop and tell the user to set up the config** before proceeding.
 
+### Pre-flight: vault-desync probe (per [#251](https://github.com/acardote/personal-assistant-ultra/issues/251) of [#249](https://github.com/acardote/personal-assistant-ultra/issues/249))
+
+Immediately after layer-3 loads — and BEFORE any vault-mutating step (harvest orchestration, live-writeback, kb-process, project ops) — run:
+
+```
+tools/vault-desync-probe.py "$(python3 -c 'from pathlib import Path; import json; print(json.load(open(".assistant.local.json"))["paths"]["content_root"])')"
+```
+
+The probe exits 0 when the vault is clean. On non-zero exit, **stop and surface the banner to the user**. Do NOT proceed with any vault-mutating step — the desync class (May-28 incident) means a commit on top of the current state would push stale / inverted content to origin. Direct the user to `tools/vault-desync-recover.sh` (lands in [#252](https://github.com/acardote/personal-assistant-ultra/issues/252) of #249) or the runbook section in `RELEASE.md` (lands in [#254](https://github.com/acardote/personal-assistant-ultra/issues/254)) for recovery.
+
 ### Pre-flight: harvest freshness check (per [#27](https://github.com/acardote/personal-assistant-ultra/issues/27))
 
 Immediately after layer-3 loads, run:

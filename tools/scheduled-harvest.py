@@ -102,6 +102,24 @@ def git_commit_and_push(content_root: Path, message: str) -> tuple[bool, str]:
     """Best-effort git commit + push from content_root. Returns (ok, detail)."""
     if not (content_root / ".git").is_dir():
         return True, "content_root is not a git repo — skipping commit/push"
+    # Vault-desync preflight (per #251 of #249). The local launchd path of the
+    # harvest routine commits directly to main, so a desynced vault here would
+    # propagate the bad state to origin. Refuse instead.
+    probe = Path(__file__).resolve().parent / "vault-desync-probe.py"
+    if probe.is_file():
+        r = subprocess.run(
+            [str(probe), str(content_root), "--quiet"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            diag = subprocess.run(
+                [str(probe), str(content_root)],
+                capture_output=True, text=True,
+            )
+            return False, (
+                "vault-desync-probe refused: vault is in the May-28 desync class "
+                "(see #249). Stderr:\n" + diag.stderr
+            )
     try:
         subprocess.run(["git", "-C", str(content_root), "add", "-A"], check=True, capture_output=True, text=True)
         # If nothing changed, exit cleanly.

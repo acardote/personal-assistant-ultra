@@ -25,6 +25,8 @@
 #       malformed entry and retry.
 #   5 — content_root arg disagrees with .assistant.local.json's configured
 #       vault path (per #87); refuses to lint the wrong tree silently.
+#   6 — vault-desync-probe detected the desync class (per #251 of #249);
+#       refuses to commit on top of a stale-WT/HEAD-advanced vault state.
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
@@ -98,6 +100,19 @@ case "$SCOPE_CHECK" in
 esac
 
 cd "$CONTENT_ROOT"
+
+# Vault-desync probe (per #251 of #249) — refuse to commit/push from a desynced
+# vault. The desync class: `refs/heads/main` advanced behind the working tree,
+# and the next merge captures the gap as staged "deletions". Committing in that
+# state would push partial / inverted content. The probe exits 0 when clean.
+DESYNC_PROBE="$SCRIPT_DIR/vault-desync-probe.py"
+if [[ -x "$DESYNC_PROBE" ]]; then
+    if ! "$DESYNC_PROBE" "$CONTENT_ROOT" >&2; then
+        echo "[live-commit-push] vault is desynced — refusing to commit/push." >&2
+        echo "  Recovery: tools/vault-desync-recover.sh (lands in #252 of #249) or see RUNBOOK.md." >&2
+        exit 6
+    fi
+fi
 
 # Per-invocation tempfile, cleaned on exit (per #75 challenger C3 — shared
 # /tmp/live-push.err raced when concurrent invocations stomped each other's
