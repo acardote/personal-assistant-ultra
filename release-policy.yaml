@@ -30,7 +30,7 @@ surfaces:
 
   templates:
     path: templates/
-    notes: "Routine prompts (harvest, watchdog) and launchd plists."
+    notes: "Routine prompts (harvest, watchdog), launchd plists, and vault git hooks (templates/git-hooks/ — installed by pa-session per #253)."
 
   method_kb:
     path: kb/glossary.md

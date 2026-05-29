@@ -118,7 +118,8 @@ def git_commit_and_push(content_root: Path, message: str) -> tuple[bool, str]:
             )
             return False, (
                 "vault-desync-probe refused: vault is in the May-28 desync class "
-                f"(see #249). Recovery: tools/vault-desync-recover.py {content_root}. "
+                f"(see #249). Recovery: tools/vault-desync-recover.py {content_root} "
+                "(runbook: RELEASE.md § Vault desync recovery runbook). "
                 f"Stderr:\n{diag.stderr}"
             )
     try:

@@ -114,7 +114,7 @@ if [[ -f "$DESYNC_PROBE" ]]; then
         "$DESYNC_PROBE" "$CONTENT_ROOT" >&2 || true
         echo "[live-commit-push] refusing to commit/push from a desynced vault." >&2
         echo "  Recovery: tools/vault-desync-recover.py \"$CONTENT_ROOT\"" >&2
-        echo "  Child #254 of #249 will land the full RELEASE.md runbook." >&2
+        echo "  Full runbook: RELEASE.md § Vault desync recovery runbook" >&2
         exit 6
     fi
 fi

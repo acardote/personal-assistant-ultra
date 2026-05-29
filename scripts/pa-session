@@ -100,7 +100,7 @@ def refuse_if_vault_desynced(vault: Path) -> None:
     sys.exit(
         "pa-session: refusing to operate on a desynced vault. "
         f"Recovery: run `tools/vault-desync-recover.py {vault}` "
-        "(child #254 of #249 will land the full RELEASE.md runbook)."
+        "(full runbook: RELEASE.md § Vault desync recovery runbook)."
     )
 
 
@@ -553,7 +553,7 @@ def cmd_doctor(args, vault: Path) -> int:
                 [str(probe), str(vault)],
                 capture_output=True, text=True,
             )
-            print(f"FAIL: vault desync detected. Recovery: run `tools/vault-desync-recover.py {vault}`. See signals below:")
+            print(f"FAIL: vault desync detected. Recovery: run `tools/vault-desync-recover.py {vault}` (see RELEASE.md § Vault desync recovery runbook). Signals:")
             for line in diag.stderr.splitlines():
                 print(f"      {line}")
             ok = False

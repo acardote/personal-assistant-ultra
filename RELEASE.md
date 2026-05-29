@@ -25,7 +25,7 @@ A release ships these as a unit. A change to any of them is in scope of the next
 - **SKILL** — `.claude/skills/personal-assistant/SKILL.md` (the skill body the user invokes).
 - **Slash command surface** — `.claude/commands/personal-assistant.md` (operator-task router).
 - **Tools** — everything under `tools/` (Python toolchain: `harvest.py`, `compress.py`, `route.py`, `assemble-kb.py`, `lint-provenance.py`, `project.py`, `bootstrap.py`, etc.).
-- **Templates** — everything under `templates/` (routine prompts, launchd plists).
+- **Templates** — everything under `templates/` (routine prompts, launchd plists, vault git hooks per [#253](https://github.com/acardote/personal-assistant-ultra/issues/253)).
 - **Method KB** — `kb/glossary.md` (canonical project terms shipped to every user of the skill).
 - **KB templates** — everything under `kb-templates/` (scaffolding the user copies into their vault).
 - **Method docs** — everything under `docs/` (ADRs, editorial rules, setup, MCP setup, schemas).
@@ -36,6 +36,67 @@ A release ships these as a unit. A change to any of them is in scope of the next
 - **Claude settings** — `.claude/settings.json` (project-level MCP tool allowlist for harvest-routine interactive runs, #216 — allow-only / no-deny / no-defaultMode to preserve scheduled-fire non-regression).
 
 A version increment ships these together as a unit. `release-policy.yaml` is the machine-readable mirror of this list, validated by CI on every push and PR — drift between the two documents fails the build.
+
+## Vault desync recovery runbook (per [#249](https://github.com/acardote/personal-assistant-ultra/issues/249))
+
+The May-28 desync class: `refs/heads/main` advances behind a frozen working tree, the next `git merge`-class operation captures the gap as staged "deletions" via `.git/AUTO_MERGE`, and the operator sees a working tree apparently gutted of files that exist in HEAD.
+
+### How to tell you're in this state
+
+Any of:
+
+- `pa-session doctor` reports `FAIL: vault desync detected`.
+- `git status` in the vault shows many staged-as-deleted files you didn't `git rm`.
+- `.git/AUTO_MERGE` exists alongside no `.git/MERGE_HEAD`.
+- A `pre-commit` hook (installed by `pa-session doctor`) refuses a commit with `[pa-vault pre-commit] REFUSED: vault is in the desync class (#249)`.
+- `tools/vault-desync-probe.py <vault-path>` exits non-zero.
+
+### Recovery
+
+```bash
+tools/vault-desync-recover.py <vault-path>      # interactive, asks before mutating
+tools/vault-desync-recover.py <vault-path> --yes  # for scripts (CI / automation)
+tools/vault-desync-recover.py <vault-path> --dry-run  # show plan, no changes
+```
+
+The recovery:
+1. Probes the vault. On clean → `nothing to recover` (idempotent and safe).
+2. Restores HEAD-tracked files absent from the working tree.
+3. Skips D-set paths that hold operator-authored working-tree content (preserved for manual resolution).
+4. Removes `.git/AUTO_MERGE`. Does NOT touch `MERGE_HEAD` (that signals a legitimate in-flight merge).
+5. Re-probes. If still firing → exit 1 with diagnostic; manual investigation needed.
+
+User-uncommitted edits (staged modifications, unstaged modifications, untracked files) are NOT touched.
+
+### Worked example: 2026-05-28 incident
+
+State observed:
+- 233 staged "deletions" against `HEAD = 45ffd5e` (the agentic-org-doctor merge).
+- 13 staged "modifications" — turned out to be byte-identical to a prior commit `15a42b8` (the May 25 frozen base).
+- `.git/AUTO_MERGE` present, `.git/MERGE_HEAD` absent.
+- HEAD reflog had a 3-day gap; `refs/heads/main` reflog showed two ref mutations that bypassed the HEAD-aware path.
+
+Recovery executed:
+1. `git diff --cached --diff-filter=D --name-only HEAD | xargs -0 git checkout HEAD --` (manual equivalent of recover step 2 — the recovery tool didn't exist yet).
+2. `rm .git/AUTO_MERGE`.
+3. Working tree restored to HEAD's state. The 13 "stale modifications" turned out to be artifactual (no real local content to preserve) — confirmed by `git diff <base> -- <path>` returning empty for all 8.
+
+If the recovery tool had existed: `tools/vault-desync-recover.py /Users/acardote/Projects/acardote-pa-vault --yes`.
+
+### Bypass
+
+The vault `pre-commit` hook can be bypassed for legitimate edge cases (e.g., committing a known-safe change while the desync is being repaired):
+
+```bash
+PA_VAULT_HOOK_DISABLE=1 git commit -m "..."
+```
+
+The bypass emits a banner to stderr (`[pa-vault pre-commit] BYPASS: PA_VAULT_HOOK_DISABLE=1 — desync guard skipped.`) so the override is visible in logs and to post-hoc auditors. Use sparingly; the probe-based preflights in `pa-session`, `live-commit-push.sh`, and `scheduled-harvest.py` still cover the canonical write paths.
+
+### Prevention
+
+- `pa-session new` and `pa-session doctor` install the vault pre-commit hook (`templates/git-hooks/pre-commit`) idempotently. Run `pa-session doctor` periodically on a long-lived vault to keep the hook in place.
+- Don't mutate `refs/heads/main` from outside the main worktree's HEAD-aware command path. `git branch -f main ...`, `git update-ref refs/heads/main ...`, and `gh pr merge` + manual sync are all candidate vectors (per #250's "unrecoverable verdict" the specific command remains unidentified, but the class is "ref mutation bypassing the working tree update").
 
 ## The `latest` tag
 

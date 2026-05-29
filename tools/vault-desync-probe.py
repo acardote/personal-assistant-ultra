@@ -159,7 +159,7 @@ def _format_banner(result: ProbeResult) -> str:
         lines.append(f"  - {sig}")
     lines.append(
         f"[vault-desync-probe] Recovery: tools/vault-desync-recover.py {result.vault} "
-        "(child #254 of #249 will land the full RELEASE.md runbook)."
+        "(full runbook: RELEASE.md § Vault desync recovery runbook)."
     )
     return "\n".join(lines)
 
