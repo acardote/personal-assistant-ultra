@@ -37,7 +37,7 @@ fi
 CONTENT_ROOT="$1"
 COMMIT_MSG="$2"
 
-if [[ ! -d "$CONTENT_ROOT/.git" ]]; then
+if [[ ! -e "$CONTENT_ROOT/.git" ]]; then
     echo "[live-commit-push] $CONTENT_ROOT is not a git repo" >&2
     exit 1
 fi
