@@ -59,8 +59,8 @@ def refuse_if_vault_desynced(vault: Path) -> None:
     """Preflight: run vault-desync-probe and refuse if it fires (per #251 of #249).
 
     The probe is skipped if the binary isn't present — older method-repo checkouts
-    don't ship it, and we don't want to break those. Once #251 lands and the probe
-    is part of the standard toolchain, the skip-path becomes dead code.
+    don't ship it, and we don't want to break those. Once #251 lands everywhere,
+    the skip-path becomes dead code.
     """
     probe = METHOD_ROOT / "tools" / "vault-desync-probe.py"
     if not probe.is_file():
@@ -74,8 +74,8 @@ def refuse_if_vault_desynced(vault: Path) -> None:
     sys.stderr.write(r.stderr)
     sys.exit(
         "pa-session: refusing to operate on a desynced vault. "
-        "Recovery: tools/vault-desync-recover.sh (lands in #252 of #249) "
-        "or see RUNBOOK.md."
+        "Recovery: Children #252 (recovery helper) and #254 (RELEASE.md runbook) "
+        "of parent #249 are in flight. Until they land, see #249's evidence comments."
     )
 
 
@@ -522,7 +522,7 @@ def cmd_doctor(args, vault: Path) -> int:
                 [str(probe), str(vault)],
                 capture_output=True, text=True,
             )
-            print("FAIL: vault desync detected (see signals below). Recovery: tools/vault-desync-recover.sh (lands in #252 of #249).")
+            print("FAIL: vault desync detected (see signals below). Recovery: Children #252 + #254 of #249 are in flight; see #249's evidence comments for manual recovery.")
             for line in diag.stderr.splitlines():
                 print(f"      {line}")
             ok = False

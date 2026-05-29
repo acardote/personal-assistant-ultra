@@ -16,20 +16,32 @@ Reference incident: parent #249 evidence comments document the 2026-05-28
 forensic walk. The probe in this file is the O(1) signal those comments
 identified as cheaply detectable.
 
-Two signals are checked:
+Two signals are checked (state-based, not history-based — history-based
+signals like a HEAD-reflog gap are cleared by an innocuous `git checkout
+main` while the working tree stays stale, and they're structurally absent
+when `core.logAllRefUpdates=false`; both are tested against, see
+`tests/test_vault_desync_probe_acceptance.py`):
 
-  1. `.git/AUTO_MERGE` artifact present (definitive — git only writes
-     this during a merge operation, and the file persists if the
-     operation was aborted or interrupted before the commit step).
+  1. `.git/AUTO_MERGE` present AND `.git/MERGE_HEAD` absent. AUTO_MERGE
+     persists when a merge wrote the auto-resolved tree but didn't
+     advance to a commit; MERGE_HEAD presence means a legitimate merge
+     is in progress (mid-conflict-resolution), which is NOT the desync
+     class. Both files together = normal merge state; AUTO_MERGE alone
+     = the post-failed-merge desync.
 
-  2. HEAD reflog top != current HEAD value (smoking-gun signature). When
-     HEAD is a symref to a branch and the branch advances WITHOUT a
-     HEAD-aware command, HEAD's reflog isn't updated. Subsequent ops see
-     `git reflog show HEAD -1` returning an older SHA than
-     `git rev-parse HEAD`.
+  2. WT-vs-HEAD tree mismatch surfaces enough D entries to clear a
+     "user-intentional-delete" threshold. Specifically, count files in
+     HEAD's tree that are absent from the working tree (`git diff
+     --diff-filter=D --name-only HEAD`) and fire if the count exceeds
+     `MASS_DELETION_THRESHOLD`. Below the threshold, the diff is
+     plausibly an in-flight user edit (e.g., `kb-process` moving 5
+     memos from `.unprocessed/` to `.processed/`); above it, no realistic
+     manual workflow produces that many deletions in one uncommitted
+     batch. The May-28 incident had 233 staged D + 5 unstaged D — well
+     above the threshold.
 
-Either signal alone is sufficient to refuse a vault-touching operation.
-Both together are the May 28 fingerprint exactly.
+Skipped entirely when a legitimate merge is in progress (MERGE_HEAD
+present): the probe is a desync gate, not a merge-state gate.
 
 Usage:
     tools/vault-desync-probe.py <vault-path>           # human-readable banner
@@ -52,6 +64,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# Below this many WT-vs-HEAD deletions the probe treats the diff as a
+# plausible in-flight user workflow (kb-process moves, a few-file `git rm`,
+# etc.). Above it, no realistic manual flow produces that many uncommitted
+# deletions in one batch; the May-28 incident had 238. The threshold is
+# deliberately high — false-negatives in the 1-50 range are acceptable
+# (recovery still works), but false-positives would block legitimate flows
+# and the probe would get bypassed in practice.
+MASS_DELETION_THRESHOLD = 50
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     clean: bool
@@ -59,19 +81,18 @@ class ProbeResult:
     vault: Path | None = None
 
 
-def _run_git(vault: Path, *args: str) -> str:
-    """Run a git command in the vault, return stdout. Raises on non-zero."""
+def _run_git(vault: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(vault), *args],
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout
+        check=check,
+    )
 
 
 def _git_dir(vault: Path) -> Path:
     """Locate `.git` for the vault — handles both real dirs and worktree files."""
-    raw = _run_git(vault, "rev-parse", "--git-dir").strip()
+    raw = _run_git(vault, "rev-parse", "--git-dir").stdout.strip()
     p = Path(raw)
     if not p.is_absolute():
         p = vault / p
@@ -79,40 +100,53 @@ def _git_dir(vault: Path) -> Path:
 
 
 def probe(vault: Path) -> ProbeResult:
-    """Detect the desync class. Returns ProbeResult."""
+    """Detect the desync class. Returns ProbeResult.
+
+    Signals are state-based (not history-based) — see module docstring for the
+    full rationale, including pr-challenger B1/B3 reproductions on the original
+    reflog-based design.
+    """
     if not (vault / ".git").exists():
         raise FileNotFoundError(f"{vault} is not a git worktree (no .git found)")
 
     signals: list[str] = []
-
-    # Signal 1: .git/AUTO_MERGE artifact (definitive).
-    # Use rev-parse --git-dir to handle worktree-file .git pointers correctly.
     git_dir = _git_dir(vault)
     auto_merge = git_dir / "AUTO_MERGE"
-    if auto_merge.exists():
-        signals.append(f"AUTO_MERGE artifact present at {auto_merge.relative_to(vault) if auto_merge.is_relative_to(vault) else auto_merge}")
+    merge_head = git_dir / "MERGE_HEAD"
 
-    # Signal 2: HEAD reflog top != current HEAD.
-    # When HEAD is a symref and its branch moved without a HEAD-aware op,
-    # the reflog top is the older value.
-    current_head = _run_git(vault, "rev-parse", "HEAD").strip()
-    try:
-        # `git reflog show HEAD -n 1 --format=%H` would be cleanest, but
-        # not all git versions accept --format on reflog. Use plumbing:
-        # read .git/logs/HEAD's last line and parse "<old> <new> ..."
-        head_log = git_dir / "logs" / "HEAD"
-        if head_log.exists():
-            last = head_log.read_text(encoding="utf-8").rstrip("\n").splitlines()[-1]
-            # Format: "<old-sha> <new-sha> <ident> <ts> <tz>\tmsg"
-            new_sha = last.split(" ", 2)[1]
-            if new_sha != current_head:
-                signals.append(
-                    f"HEAD reflog top ({new_sha[:8]}) != current HEAD ({current_head[:8]}) — "
-                    f"ref advanced without a HEAD-aware operation"
-                )
-    except (IndexError, ValueError):
-        # Empty or malformed reflog — skip this signal rather than false-positive.
-        pass
+    # MERGE_HEAD present = legitimate merge-in-progress. NOT the desync class.
+    # The probe is a desync gate, not a merge-state gate — return clean and let
+    # the user resolve / abort their merge through normal means.
+    if merge_head.exists():
+        return ProbeResult(clean=True, signals=[], vault=vault)
+
+    # Signal 1: AUTO_MERGE present without MERGE_HEAD.
+    # git only writes AUTO_MERGE during a merge operation. With MERGE_HEAD
+    # present this is a normal in-flight merge (handled above). Without
+    # MERGE_HEAD, the merge wrote the auto-resolved tree but didn't reach the
+    # commit step — that's the May-28 fingerprint exactly.
+    if auto_merge.exists():
+        rel = (
+            auto_merge.relative_to(vault)
+            if auto_merge.is_relative_to(vault)
+            else auto_merge
+        )
+        signals.append(f"AUTO_MERGE present without MERGE_HEAD ({rel}) — failed-merge artifact, the May-28 desync fingerprint")
+
+    # Signal 2: WT/HEAD tree mismatch surfacing mass deletions.
+    # `git diff --diff-filter=D --name-only HEAD` returns files HEAD tracks
+    # that the working tree lacks (combining staged + unstaged D states). On
+    # a fresh repo with no HEAD yet, the command errors — treat that as
+    # "cannot assess" rather than "clean" (probe is conservative; a brand-new
+    # repo has no desync to detect anyway).
+    r = _run_git(vault, "diff", "--diff-filter=D", "--name-only", "HEAD", check=False)
+    if r.returncode == 0:
+        missing = [line for line in r.stdout.splitlines() if line]
+        if len(missing) > MASS_DELETION_THRESHOLD:
+            signals.append(
+                f"{len(missing)} HEAD-tracked files absent from working tree "
+                f"(threshold {MASS_DELETION_THRESHOLD}) — likely WT frozen behind HEAD"
+            )
 
     return ProbeResult(clean=not signals, signals=signals, vault=vault)
 
@@ -123,7 +157,11 @@ def _format_banner(result: ProbeResult) -> str:
     lines = [f"[vault-desync-probe] DESYNC DETECTED in {result.vault}:"]
     for sig in result.signals:
         lines.append(f"  - {sig}")
-    lines.append("[vault-desync-probe] Recovery: see RUNBOOK.md (Child #252 of #249 lands the one-shot helper).")
+    lines.append(
+        "[vault-desync-probe] Recovery: Children #252 (one-shot recovery helper) and #254 "
+        "(runbook in RELEASE.md) of parent #249 are in flight. Until they land, see #249's "
+        "evidence comments for the manual recovery sequence."
+    )
     return "\n".join(lines)
 
 

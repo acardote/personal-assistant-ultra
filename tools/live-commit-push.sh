@@ -105,11 +105,16 @@ cd "$CONTENT_ROOT"
 # vault. The desync class: `refs/heads/main` advanced behind the working tree,
 # and the next merge captures the gap as staged "deletions". Committing in that
 # state would push partial / inverted content. The probe exits 0 when clean.
+# Use -f (file presence) rather than -x (exec bit) so a vault copied via tooling
+# that strips modes still fires the gate — refusing wrong-direction failure mode.
 DESYNC_PROBE="$SCRIPT_DIR/vault-desync-probe.py"
-if [[ -x "$DESYNC_PROBE" ]]; then
-    if ! "$DESYNC_PROBE" "$CONTENT_ROOT" >&2; then
-        echo "[live-commit-push] vault is desynced — refusing to commit/push." >&2
-        echo "  Recovery: tools/vault-desync-recover.sh (lands in #252 of #249) or see RUNBOOK.md." >&2
+if [[ -f "$DESYNC_PROBE" ]]; then
+    if ! "$DESYNC_PROBE" "$CONTENT_ROOT" --quiet; then
+        # Re-run verbose so the operator sees which signal fired.
+        "$DESYNC_PROBE" "$CONTENT_ROOT" >&2 || true
+        echo "[live-commit-push] refusing to commit/push from a desynced vault." >&2
+        echo "  Recovery: Children #252 (recovery helper) and #254 (RELEASE.md runbook)" >&2
+        echo "  of parent #249 are in flight. Until they land, see #249's evidence comments." >&2
         exit 6
     fi
 fi
