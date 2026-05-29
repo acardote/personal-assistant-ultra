@@ -113,8 +113,8 @@ if [[ -f "$DESYNC_PROBE" ]]; then
         # Re-run verbose so the operator sees which signal fired.
         "$DESYNC_PROBE" "$CONTENT_ROOT" >&2 || true
         echo "[live-commit-push] refusing to commit/push from a desynced vault." >&2
-        echo "  Recovery: Children #252 (recovery helper) and #254 (RELEASE.md runbook)" >&2
-        echo "  of parent #249 are in flight. Until they land, see #249's evidence comments." >&2
+        echo "  Recovery: tools/vault-desync-recover.py \"$CONTENT_ROOT\"" >&2
+        echo "  Child #254 of #249 will land the full RELEASE.md runbook." >&2
         exit 6
     fi
 fi
