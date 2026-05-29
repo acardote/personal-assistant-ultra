@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# vault pre-commit hook — refuse commits from a desynced vault.
+#
+# Installed by `pa-session doctor` (Child #253 of #249). The class-level guard:
+# defense in depth on top of pa-session / live-commit-push / scheduled-harvest
+# preflights. If any of those bypass mechanisms grow (or new commit paths get
+# added that don't route through pa-session's gates), this hook catches the
+# May-28 desync class at the last possible mechanical gate before the commit
+# enters the local history and gets pushed.
+#
+# Looks up the method-repo's probe via the vault's `.assistant.local.json`
+# (resolved indirectly: the hook is installed PER VAULT, so the vault knows
+# where its method repo lives via the inverse `_config.py` lookup — we walk
+# up from the vault path to find a sibling `personal-assistant-ultra/`).
+#
+# Exits 0 (allow commit) when:
+#   - probe is missing (no method repo found; older setup, don't block)
+#   - probe exits 0 (clean)
+#   - PA_VAULT_HOOK_DISABLE=1 in env (operator escape hatch for legit cases)
+#
+# Exits 1 (refuse commit) when probe exits non-zero. The hook stderr explains
+# what fired and how to recover.
+
+set -u  # NOTE: not -e, because we want to handle probe-missing gracefully.
+
+# Operator escape hatch — auditable (banner to stderr so the override is visible).
+if [ "${PA_VAULT_HOOK_DISABLE:-0}" = "1" ]; then
+    echo "[pa-vault pre-commit] BYPASS: PA_VAULT_HOOK_DISABLE=1 — desync guard skipped." >&2
+    exit 0
+fi
+
+# Anchor on the SHARED git dir, not `--show-toplevel`. From a linked worktree at
+# .pa-worktrees/<short>/, `--show-toplevel` returns the worktree path, but the
+# May-28 desync's artifacts (AUTO_MERGE, refs/heads/main reflog, the WT-vs-HEAD
+# tree gap) live in the CANONICAL VAULT's .git/. So we walk up from
+# `--git-common-dir` (the shared .git/) to find the canonical vault root and
+# run the probe there. Per pr-challenger B1 on PR #257.
+GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+case "$GIT_COMMON_DIR" in
+    /*) ;;  # already absolute
+    *)  GIT_COMMON_DIR=$(cd "$GIT_COMMON_DIR" && pwd) ;;
+esac
+VAULT=$(dirname "$GIT_COMMON_DIR")
+
+# Find the method repo. Try environment first, then a sibling of the vault
+# (the standard layout), then the user's $HOME/Projects/personal-assistant-ultra.
+PROBE=""
+for candidate in \
+    "${PA_METHOD_ROOT:-}/tools/vault-desync-probe.py" \
+    "$(dirname "$VAULT")/personal-assistant-ultra/tools/vault-desync-probe.py" \
+    "$HOME/Projects/personal-assistant-ultra/tools/vault-desync-probe.py" \
+; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+        PROBE="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PROBE" ]; then
+    # Probe not found — older method-repo checkout or non-standard layout.
+    # Don't block commit; surface a one-line warning so the operator knows
+    # the class-level guard isn't engaged.
+    echo "[pa-vault pre-commit] warn: vault-desync-probe not found; hook disengaged." >&2
+    exit 0
+fi
+
+# Run the probe quietly first. Distinguish exit codes:
+#   0 → clean, allow commit
+#   1 → desync detected, refuse with verbose diagnostic
+#   2 → probe invocation error (path not a git WT, etc.). Fail OPEN with a
+#       warning rather than block — per pr-challenger B2 on PR #257, "probe
+#       errored" must not be mislabeled as "desync detected."
+"$PROBE" "$VAULT" --quiet 2>/dev/null
+PROBE_RC=$?
+
+if [ "$PROBE_RC" = "0" ]; then
+    exit 0
+fi
+
+if [ "$PROBE_RC" = "2" ]; then
+    # Re-run verbose to surface the actual invocation error.
+    PROBE_DIAG=$("$PROBE" "$VAULT" 2>&1 || true)
+    echo "[pa-vault pre-commit] warn: probe invocation error ($PROBE_RC); hook fails OPEN." >&2
+    echo "  Probe output: $PROBE_DIAG" >&2
+    exit 0
+fi
+
+# PROBE_RC=1: desync detected. Emit the verbose banner and refuse.
+"$PROBE" "$VAULT" >&2 || true
+RECOVER="$(dirname "$(dirname "$PROBE")")/tools/vault-desync-recover.py"
+echo "" >&2
+echo "[pa-vault pre-commit] REFUSED: vault is in the desync class (#249)." >&2
+echo "  Recovery: $RECOVER \"$VAULT\"" >&2
+echo "  Bypass (use sparingly, only when you understand the state):" >&2
+echo "    PA_VAULT_HOOK_DISABLE=1 git commit ..." >&2
+exit 1

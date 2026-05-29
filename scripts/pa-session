@@ -35,6 +35,8 @@ import _config  # noqa: E402
 WORKTREES_SUBDIR = ".pa-worktrees"
 GITIGNORE_ENTRY = "/.pa-worktrees/"
 SHORT_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$")
+VAULT_HOOK_TEMPLATE = METHOD_ROOT / "templates" / "git-hooks" / "pre-commit"
+VAULT_HOOK_DEST_RELATIVE = Path(".git") / "hooks" / "pre-commit"
 
 
 def canonical_vault() -> Path:
@@ -53,6 +55,29 @@ def validate_short(short: str) -> None:
             f"pa-session: invalid short name {short!r} "
             "(lowercase alphanumeric + hyphens, ≤30 chars)"
         )
+
+
+def install_vault_hook(vault: Path, *, force: bool = False) -> str:
+    """Install the desync pre-commit hook into the vault (per #253 of #249).
+
+    The hook refuses commits from a desynced vault — class-level guard layered
+    on top of pa-session / live-commit-push / scheduled-harvest preflights.
+    Returns a one-line status string describing what happened: "installed",
+    "already present", "missing template", or "preserved existing hook".
+    """
+    if not VAULT_HOOK_TEMPLATE.is_file():
+        return f"missing template ({VAULT_HOOK_TEMPLATE})"
+    dest = vault / VAULT_HOOK_DEST_RELATIVE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    template_bytes = VAULT_HOOK_TEMPLATE.read_bytes()
+    if dest.is_file():
+        if dest.read_bytes() == template_bytes:
+            return "already present"
+        if not force:
+            return "preserved existing hook (use --force to overwrite)"
+    dest.write_bytes(template_bytes)
+    dest.chmod(0o755)
+    return "installed"
 
 
 def refuse_if_vault_desynced(vault: Path) -> None:
@@ -202,6 +227,12 @@ def cmd_new(args, vault: Path) -> int:
     validate_short(args.short)
     refuse_if_vault_desynced(vault)
     ensure_gitignore_entry(vault, auto=args.auto)
+    # Idempotently install the pre-commit hook (per #253 of #249). First-time
+    # vault setup leaves the hook in place; subsequent calls no-op.
+    hook_status = install_vault_hook(vault)
+    if hook_status == "installed":
+        print(f"pa-session: installed vault pre-commit hook at {vault}/.git/hooks/pre-commit",
+              file=sys.stderr)
     (vault / WORKTREES_SUBDIR).mkdir(exist_ok=True)
     wt_path = worktree_path(vault, args.short)
     branch = f"project/{args.short}"
@@ -528,6 +559,16 @@ def cmd_doctor(args, vault: Path) -> int:
             ok = False
     else:
         print("warn: tools/vault-desync-probe.py missing — desync check skipped")
+
+    # Vault pre-commit hook (per #253 of #249). doctor installs idempotently.
+    # Missing template (older method-repo checkout) is `warn` not `FAIL` — matches
+    # the probe-missing handling above; the mechanical preflight gates still cover.
+    hook_status = install_vault_hook(vault, force=getattr(args, "force_hook", False))
+    if hook_status in ("installed", "already present"):
+        print(f"ok:   vault pre-commit hook {hook_status}")
+    else:
+        print(f"warn: vault pre-commit hook — {hook_status}")
+
     wts = existing_worktree_records(vault)
     pa_wt_root = (vault / WORKTREES_SUBDIR).resolve()
     pa_wts = {
@@ -605,7 +646,11 @@ def main() -> int:
     )
     p_close.set_defaults(func=cmd_close)
 
-    p_doc = sub.add_parser("doctor", help="Self-check.")
+    p_doc = sub.add_parser("doctor", help="Self-check + idempotent installs (vault pre-commit hook).")
+    p_doc.add_argument(
+        "--force-hook", action="store_true",
+        help="Overwrite a pre-existing vault pre-commit hook (defaults to preserve).",
+    )
     p_doc.set_defaults(func=cmd_doctor)
 
     args = p.parse_args()
