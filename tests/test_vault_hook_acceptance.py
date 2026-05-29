@@ -108,6 +108,63 @@ class VaultHookCases(unittest.TestCase):
             self.assertEqual(r.returncode, 0,
                              msg=f"bypass env var should allow commit; stderr={r.stderr!r}")
 
+    def test_hook_fires_from_linked_worktree(self):
+        """B1 regression (PR #257 review): commits from `.pa-worktrees/<X>/` must
+        also be guarded. The hook anchors on `--git-common-dir`, not
+        `--show-toplevel`, so it sees the CANONICAL vault's .git/ state and
+        runs the probe against the vault path, not the worktree path.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "vault"
+            _init_repo(vault, with_commits=1)
+            _install_hook(vault)
+
+            # Synthesize the desync (touches the canonical vault's state).
+            _synthesize_desync(vault)
+
+            # Create a linked worktree on a different branch.
+            wt = vault / ".pa-worktrees" / "test-wt"
+            wt.parent.mkdir(parents=True, exist_ok=True)
+            _git(vault, None, "worktree", "add", "-b", "project/test-wt", str(wt))
+
+            # Attempt a commit FROM THE WORKTREE. The hook should still fire
+            # because the vault is desynced even though the worktree itself is fine.
+            (wt / "wt-file.txt").write_text("from worktree\n", encoding="utf-8")
+            _git(wt, {"PA_METHOD_ROOT": str(REPO_ROOT)}, "add", "wt-file.txt")
+            r = _git(wt, {"PA_METHOD_ROOT": str(REPO_ROOT)}, "commit", "-q", "-m", "wt commit", check=False)
+            self.assertNotEqual(r.returncode, 0,
+                                msg=f"hook should refuse worktree commit when vault is desynced; "
+                                    f"stdout={r.stdout!r} stderr={r.stderr!r}")
+            self.assertIn("desync", r.stderr.lower())
+
+    def test_hook_fails_open_on_probe_invocation_error(self):
+        """B2 regression (PR #257 review): when the probe errors with exit 2
+        (not desync), the hook fails OPEN with a warning rather than refusing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "vault"
+            _init_repo(vault, with_commits=1)
+            _install_hook(vault)
+
+            # Stub the probe to exit 2 ("not a git worktree" or similar invocation error).
+            stub_method = Path(tmp) / "stubmethod"
+            (stub_method / "tools").mkdir(parents=True)
+            stub_probe = stub_method / "tools" / "vault-desync-probe.py"
+            stub_probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys; sys.stderr.write('[stub] simulated invocation error\\n'); sys.exit(2)\n",
+                encoding="utf-8",
+            )
+            stub_probe.chmod(0o755)
+
+            (vault / "open.txt").write_text("data\n", encoding="utf-8")
+            env = {"PA_METHOD_ROOT": str(stub_method), "HOME": str(Path(tmp) / "nohome")}
+            _git(vault, env, "add", "open.txt")
+            r = _git(vault, env, "commit", "-q", "-m", "open", check=False)
+            self.assertEqual(r.returncode, 0,
+                             msg=f"hook should FAIL OPEN on probe exit 2; stderr={r.stderr!r}")
+            self.assertIn("hook fails open", r.stderr.lower())
+
     def test_hook_disengaged_when_method_root_missing(self):
         """If the method repo can't be located, the hook warns and allows commit
         rather than blocking the operator. The mechanical guard fails open at

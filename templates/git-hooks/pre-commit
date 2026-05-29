@@ -23,13 +23,24 @@
 
 set -u  # NOTE: not -e, because we want to handle probe-missing gracefully.
 
-# Operator escape hatch.
+# Operator escape hatch — auditable (banner to stderr so the override is visible).
 if [ "${PA_VAULT_HOOK_DISABLE:-0}" = "1" ]; then
+    echo "[pa-vault pre-commit] BYPASS: PA_VAULT_HOOK_DISABLE=1 — desync guard skipped." >&2
     exit 0
 fi
 
-# The hook runs in the vault's working directory.
-VAULT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0  # not a git WT? allow.
+# Anchor on the SHARED git dir, not `--show-toplevel`. From a linked worktree at
+# .pa-worktrees/<short>/, `--show-toplevel` returns the worktree path, but the
+# May-28 desync's artifacts (AUTO_MERGE, refs/heads/main reflog, the WT-vs-HEAD
+# tree gap) live in the CANONICAL VAULT's .git/. So we walk up from
+# `--git-common-dir` (the shared .git/) to find the canonical vault root and
+# run the probe there. Per pr-challenger B1 on PR #257.
+GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+case "$GIT_COMMON_DIR" in
+    /*) ;;  # already absolute
+    *)  GIT_COMMON_DIR=$(cd "$GIT_COMMON_DIR" && pwd) ;;
+esac
+VAULT=$(dirname "$GIT_COMMON_DIR")
 
 # Find the method repo. Try environment first, then a sibling of the vault
 # (the standard layout), then the user's $HOME/Projects/personal-assistant-ultra.
@@ -53,16 +64,33 @@ if [ -z "$PROBE" ]; then
     exit 0
 fi
 
-# Run the probe quietly first; re-run verbose only on failure for diagnostic.
-if "$PROBE" "$VAULT" --quiet 2>/dev/null; then
+# Run the probe quietly first. Distinguish exit codes:
+#   0 → clean, allow commit
+#   1 → desync detected, refuse with verbose diagnostic
+#   2 → probe invocation error (path not a git WT, etc.). Fail OPEN with a
+#       warning rather than block — per pr-challenger B2 on PR #257, "probe
+#       errored" must not be mislabeled as "desync detected."
+"$PROBE" "$VAULT" --quiet 2>/dev/null
+PROBE_RC=$?
+
+if [ "$PROBE_RC" = "0" ]; then
     exit 0
 fi
 
-# Probe fired — emit the verbose banner and refuse.
+if [ "$PROBE_RC" = "2" ]; then
+    # Re-run verbose to surface the actual invocation error.
+    PROBE_DIAG=$("$PROBE" "$VAULT" 2>&1 || true)
+    echo "[pa-vault pre-commit] warn: probe invocation error ($PROBE_RC); hook fails OPEN." >&2
+    echo "  Probe output: $PROBE_DIAG" >&2
+    exit 0
+fi
+
+# PROBE_RC=1: desync detected. Emit the verbose banner and refuse.
 "$PROBE" "$VAULT" >&2 || true
+RECOVER="$(dirname "$(dirname "$PROBE")")/tools/vault-desync-recover.py"
 echo "" >&2
 echo "[pa-vault pre-commit] REFUSED: vault is in the desync class (#249)." >&2
-echo "  Recovery: $(dirname "$(dirname "$PROBE")")/tools/vault-desync-recover.py \"$VAULT\"" >&2
+echo "  Recovery: $RECOVER \"$VAULT\"" >&2
 echo "  Bypass (use sparingly, only when you understand the state):" >&2
 echo "    PA_VAULT_HOOK_DISABLE=1 git commit ..." >&2
 exit 1
