@@ -74,6 +74,14 @@ tools/assemble-kb.py
 
 Do not proceed with the user's request until layer 3 is loaded into your working context. If `tools/assemble-kb.py` fails or produces empty output, surface the failure to the user and stop — operating without layer 3 violates the "always-in-context" invariant on issue #4. If `.assistant.local.json` is missing, the assembler will emit a loud warning + fall back to method-root: that's fixture/test mode, not production; if you see the warning during a real session, **stop and tell the user to set up the config** before proceeding.
 
+### Pre-flight: vault-desync probe (per [#251](https://github.com/acardote/personal-assistant-ultra/issues/251) of [#249](https://github.com/acardote/personal-assistant-ultra/issues/249))
+
+Immediately after layer-3 loads — and BEFORE any vault-mutating step (harvest orchestration, live-writeback, kb-process, project ops) — run `tools/vault-desync-probe.py <content_root>`, where `<content_root>` is the value resolved via `tools/_config.py` (the same resolution all other tools use; in practice it reads `.assistant.local.json`'s `paths.content_root`).
+
+The probe exits 0 when the vault is clean. On non-zero exit, **stop and surface the banner to the user**. Do NOT proceed with any vault-mutating step — the desync class (May-28 incident) means a commit on top of the current state would push stale / inverted content to origin. Children [#252](https://github.com/acardote/personal-assistant-ultra/issues/252) (recovery helper) and [#254](https://github.com/acardote/personal-assistant-ultra/issues/254) (RELEASE.md runbook) of #249 ship the operator-facing recovery surface; until they land, point at #249's evidence comments for manual recovery steps.
+
+Note: this is a §11 LLM-compliance instruction (the same architectural caveat the harvest routine accepts). The mechanical safety net lives in `scripts/pa-session`, `tools/live-commit-push.sh`, and `tools/scheduled-harvest.py`, which all enforce the same gate — so even if the LLM forgets to run the probe here, downstream operations will refuse.
+
 ### Pre-flight: harvest freshness check (per [#27](https://github.com/acardote/personal-assistant-ultra/issues/27))
 
 Immediately after layer-3 loads, run:
