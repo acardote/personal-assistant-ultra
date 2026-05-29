@@ -145,6 +145,39 @@ class RecoverDesyncReproduction(unittest.TestCase):
             self.assertEqual(content, "USER-EDIT-PRESERVED\n",
                              "user-staged modification was reverted by recovery — falsifier hit")
 
+    def test_recover_preserves_dset_path_with_wt_content(self):
+        """B1 regression (PR #256 review): a D-set path that holds user WT content
+        must NOT be reverted by recovery. The recovery partitions the D-set by
+        on-disk presence and only restores genuinely-missing paths.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "vault"
+            _init_repo(vault, with_commits=1)
+            _synthesize_desync(vault)
+            # `bulk/f0.txt` was added on the feature branch and is missing from WT
+            # (the desync's signature). Now create a file at that exact path with
+            # operator-authored content. The path is still in the D-set (HEAD has
+            # it, index lacks it), but the disk now has operator state.
+            (vault / "bulk").mkdir(exist_ok=True)
+            victim_path = vault / "bulk" / "f0.txt"
+            victim_path.write_text("USER-PRECIOUS-WORK\n", encoding="utf-8")
+
+            # Confirm probe fires and the victim is on disk.
+            self.assertEqual(_run_probe(vault, "--quiet").returncode, 1)
+            self.assertTrue(victim_path.exists())
+
+            r = _run_recover(vault, "--yes")
+            # Either rc=0 (full recovery; the partition correctly skipped victim)
+            # OR rc=1 (probe still fires due to held-back path). EITHER WAY, the
+            # operator content must survive.
+            self.assertIn(r.returncode, (0, 1),
+                          msg=f"unexpected exit {r.returncode}; stderr={r.stderr!r}")
+            self.assertEqual(victim_path.read_text(encoding="utf-8"),
+                             "USER-PRECIOUS-WORK\n",
+                             "B1 regression: D-set path with WT content was clobbered")
+            # The other bulk/ files (no WT content) should still get restored.
+            self.assertTrue((vault / "bulk" / "f1.txt").exists())
+
     def test_recover_preserves_untracked_outputs(self):
         """Untracked files (kb-process outputs, weekly updates, etc.) must survive."""
         with tempfile.TemporaryDirectory() as tmp:

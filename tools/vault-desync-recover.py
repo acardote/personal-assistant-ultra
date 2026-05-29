@@ -100,6 +100,30 @@ def _deletions(vault: Path) -> list[str]:
     return [line for line in r.stdout.splitlines() if line]
 
 
+def _partition_d_set(vault: Path, paths: list[str]) -> tuple[list[str], list[str]]:
+    """Split the D-set into (restorable, blocked-by-wt-content).
+
+    A `git diff --diff-filter=D HEAD` path can hide a user-authored working
+    tree file. Specifically: `git rm victim && echo "new" > victim` leaves
+    `victim` index-deleted (so the D filter matches) but with operator
+    content in the working tree on disk. `git checkout HEAD -- <path>`
+    would silently revert that operator content. Partition the D-set so
+    only truly-missing-from-disk paths get restored; paths that still
+    exist on disk are surfaced for the operator to inspect.
+
+    Pr-challenger B1 on PR #256 documented + reproduced this with a fresh
+    test fixture; the fix is to intersect the D-set with disk presence.
+    """
+    restorable: list[str] = []
+    blocked: list[str] = []
+    for p in paths:
+        if (vault / p).exists():
+            blocked.append(p)
+        else:
+            restorable.append(p)
+    return restorable, blocked
+
+
 def _restore_from_head(vault: Path, paths: list[str]) -> None:
     """git checkout HEAD -- <paths> in chunks to avoid argv-length limits.
 
@@ -158,15 +182,22 @@ def main() -> int:
 
     # Probe fired — collect the recoverable shape.
     deletions = _deletions(vault)
+    restorable, blocked = _partition_d_set(vault, deletions)
     git_dir = _git_dir(vault)
     artifacts = [name for name in AUTO_MERGE_ARTIFACTS if (git_dir / name).exists()]
 
     print(banner, file=sys.stderr)
     print(f"\n[vault-desync-recover] Recovery plan for {vault}:")
-    print(f"  - restore {len(deletions)} HEAD-tracked files into the working tree")
+    print(f"  - restore {len(restorable)} HEAD-tracked files into the working tree")
+    if blocked:
+        print(f"  - SKIP {len(blocked)} D-set path(s) that hold working-tree content (preserve operator state)")
+        for p in blocked[:5]:
+            print(f"      • {p}")
+        if len(blocked) > 5:
+            print(f"      ... and {len(blocked) - 5} more (see `git status` after)")
     if artifacts:
         print(f"  - remove {len(artifacts)} auto-merge artifact(s): {', '.join(artifacts)}")
-    print(f"\n[vault-desync-recover] Modifications and untracked files are NOT touched.")
+    print(f"\n[vault-desync-recover] Modifications, untracked files, AND D-set paths with WT content are NOT touched.")
 
     if args.dry_run:
         print("\n[vault-desync-recover] --dry-run: no changes made.")
@@ -182,10 +213,13 @@ def main() -> int:
             print("[vault-desync-recover] declined.")
             return 3
 
-    # Phase 2: restore deletions.
-    if deletions:
-        print(f"\n[vault-desync-recover] restoring {len(deletions)} files from HEAD...")
-        _restore_from_head(vault, deletions)
+    # Phase 2: restore deletions — only paths with no WT content (B1 fix).
+    if restorable:
+        print(f"\n[vault-desync-recover] restoring {len(restorable)} files from HEAD...")
+        _restore_from_head(vault, restorable)
+    if blocked:
+        print(f"[vault-desync-recover] skipped {len(blocked)} D-set path(s) with WT content; "
+              "inspect them with `git status` and resolve manually.")
 
     # Phase 3: clear auto-merge artifacts.
     if artifacts:
