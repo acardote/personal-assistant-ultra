@@ -127,7 +127,8 @@ def _partition_d_set(vault: Path, paths: list[str]) -> tuple[list[str], list[str
 def _restore_from_head(vault: Path, paths: list[str]) -> None:
     """git checkout HEAD -- <paths> in chunks to avoid argv-length limits.
 
-    Chunking matters here — the May-28 incident had 238 paths. POSIX ARG_MAX
+    Chunking matters here — the May-28 incident had 238 total D paths (233
+    staged + 5 unstaged; see #249 evidence). POSIX ARG_MAX
     is usually generous (256KB+), but linked-worktree path lengths can be
     long and we'd rather not depend on the limit.
     """

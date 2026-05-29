@@ -91,6 +91,7 @@ RECOVER="$(dirname "$(dirname "$PROBE")")/tools/vault-desync-recover.py"
 echo "" >&2
 echo "[pa-vault pre-commit] REFUSED: vault is in the desync class (#249)." >&2
 echo "  Recovery: $RECOVER \"$VAULT\"" >&2
+echo "  Full runbook: RELEASE.md § Vault desync recovery runbook" >&2
 echo "  Bypass (use sparingly, only when you understand the state):" >&2
 echo "    PA_VAULT_HOOK_DISABLE=1 git commit ..." >&2
 exit 1
