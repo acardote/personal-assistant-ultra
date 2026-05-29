@@ -138,16 +138,20 @@ if [[ -x "$LINT" ]]; then
     fi
 fi
 
-# Stage memory/, .harvest/, kb/, artefacts/ — never raw/ (gitignored anyway,
-# but defensive). kb/ and artefacts/ added per #83 (work-execution procedure):
-# Phase 3 write-back uses this helper for KB diffs and artefact files; without
-# them in the stage list the helper exits 0 silently with nothing committed.
+# Stage memory/, .harvest/, kb/, artefacts/, projects/ — never raw/ (gitignored
+# anyway, but defensive). kb/ and artefacts/ added per #83 (work-execution
+# procedure): Phase 3 write-back uses this helper for KB diffs and artefact
+# files; without them in the stage list the helper exits 0 silently with
+# nothing committed. projects/ added per #247 (of #245): project-tier
+# write-backs land project artefacts (projects/<slug>/artefacts/<kind>/art-*.md)
+# and project metadata (projects/<slug>/project.md) that otherwise hit disk but
+# never get committed.
 #
 # Stage each path individually because `git add a b c` aborts on the FIRST
 # nonexistent path and skips the rest (smoke-tested 2026-05-07 — passing
 # .harvest/ when it doesn't exist made artefacts/ never reach the index).
 # Per-path `|| true` tolerates nonexistent paths silently.
-for path in memory/ .harvest/ kb/ artefacts/; do
+for path in memory/ .harvest/ kb/ artefacts/ projects/; do
     [[ -e "$path" ]] && git add "$path" 2>/dev/null || true
 done
 
