@@ -1,6 +1,6 @@
 # ADR-0004 — Harvest write transport: direct `git push` to `main`
 
-- Status: Accepted
+- Status: Accepted (assumptions A1/A3 pending validation — [#272](https://github.com/acardote/personal-assistant-ultra/issues/272))
 - Date: 2026-06-01
 - Decider: acardote
 - Related: parent [#178](https://github.com/acardote/personal-assistant-ultra/issues/178) (re-scope); transport predecessors [#153](https://github.com/acardote/personal-assistant-ultra/issues/153) / [#161](https://github.com/acardote/personal-assistant-ultra/issues/161) (MCP `push_files`), [#179](https://github.com/acardote/personal-assistant-ultra/issues/179) / [#181](https://github.com/acardote/personal-assistant-ultra/issues/181) (feature-branch + PR + auto-merge, superseded); revert child [#268](https://github.com/acardote/personal-assistant-ultra/issues/268); deploy child [#270](https://github.com/acardote/personal-assistant-ultra/issues/270); validation child [#272](https://github.com/acardote/personal-assistant-ultra/issues/272). Builds on [ADR-0002](0002-scheduled-harvest-trigger.md) (routine vs launchd).
@@ -43,8 +43,8 @@ The deployed routine prompt was simultaneously converted from an inlined copy to
 
 ## Assumption ledger
 
-- **A1** — Direct `git push` to `main` works from within the routine under the current principal (`allow_unrestricted_git_push: true` on the vault source). *Validation: slice [#272](https://github.com/acardote/personal-assistant-ultra/issues/272) (live fire). Falsify: a fire's push to `main` returns 403.*
+- **A1** — Direct `git push` to `main` works from within the routine under the current principal (`allow_unrestricted_git_push: true` on the vault source). *Validation: PENDING — slice [#272](https://github.com/acardote/personal-assistant-ultra/issues/272) (live fire); operator-asserted but not yet reconciled against a landed fire as of 2026-06-01. Falsify: a fire's push to `main` returns 403.*
 - **A2** — The inline `lint-provenance --require-vault` gate is sufficient QA for autonomous direct-to-`main` data writes absent a PR/review. *Falsify: a harvest lands content on `main` the lint passed but a human would have blocked (PII/secret/gross anomaly) with material consequence.*
-- **A3** — Pushing to `main` (vs the session branch) eliminates the `cool-lamport-*` stranding class. *Validation: [#272](https://github.com/acardote/personal-assistant-ultra/issues/272). Falsify: a fire still strands content on a non-`main` branch.*
+- **A3** — Pushing to `main` (vs the session branch) eliminates the `cool-lamport-*` stranding class. *Validation: PENDING — slice [#272](https://github.com/acardote/personal-assistant-ultra/issues/272) (live fire); not yet reconciled as of 2026-06-01. Falsify: a fire still strands content on a non-`main` branch.*
 - **A4** — "Choose ONE scheduler" + the non-ff rebase-retry are sufficient against the reintroduced cross-scheduler race. *Falsify: two schedulers racing on `main` produce a lost/clobbered harvest commit.*
 - **A5** — Fail-loud-without-fallback is operationally acceptable (a failed fire surfaces loudly; a human re-plans before the next fire's data is at risk). *Falsify: a fire fails its push, surfaces nothing actionable, and the gap goes unnoticed past the next fire.*
