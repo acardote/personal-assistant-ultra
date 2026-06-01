@@ -20,7 +20,7 @@ Claude Code routines run on Anthropic's web infrastructure (verified end-to-end 
 
 The routine path is, by construction, an LLM session executing the prompt below. There is no shell harness wrapping the LLM that could enforce gates *before* it runs. As a result, the in-prompt PREFLIGHT block is an instruction the LLM is expected to follow, not a deterministic gate that prevents harvest if it fails. This is a structural §11 dependency on LLM compliance — flagged explicitly by adversarial review on PR #26 (round 3), and accepted as a property of the routine architecture rather than a fixable issue. Mitigations:
 
-- The launchd alternative path (`templates/launchd/`) does have a deterministic Python wrapper (`tools/scheduled-harvest.py`) that can grow real preflight gates if needed; users who require enforced gates should use that path. As of [#251](https://github.com/acardote/personal-assistant-ultra/issues/251) of [#249](https://github.com/acardote/personal-assistant-ultra/issues/249), that wrapper invokes `tools/vault-desync-probe.py` before commit/push and refuses if the vault is in the May-28 desync class (HEAD ref ahead of working tree). The routine sandbox path doesn't need the probe because each fire starts from a fresh `git reset --hard origin/main` (step 3 of "Routine prompt body" below) — the desync class can only arise in a long-lived local checkout.
+- The launchd alternative path (`templates/launchd/`) does have a deterministic Python wrapper (`tools/scheduled-harvest.py`) that can grow real preflight gates if needed; users who require enforced gates should use that path. As of [#251](https://github.com/acardote/personal-assistant-ultra/issues/251) of [#249](https://github.com/acardote/personal-assistant-ultra/issues/249), that wrapper invokes `tools/vault-desync-probe.py` before commit/push and refuses if the vault is in the May-28 desync class (HEAD ref ahead of working tree). The routine path gets the same probe: its commit-push step delegates to `tools/live-commit-push.sh` (see "Routine prompt body" below), which runs `tools/vault-desync-probe.py` before committing — so a desynced vault is refused (exit 6) rather than papered over. The desync class is in any case rare on the routine path, which starts each fire from a fresh checkout.
 - The routine prompt's preflight is structured to make the abort decision binary on the model's side: probe-call returns either a normal response or a discovery-error, with explicit "do not exercise judgment" framing — minimizing the surface where model latitude could mis-classify a missing connector as "fine to skip."
 - If the routine ever produces `ok: true` with a critical connector missing (the falsifier for "the LLM follows preflight reliably"), that is observable in the run-status JSON and constitutes evidence that the §11 trade-off has bitten us — and at that point the principled response is to move the production trigger back to launchd.
 
@@ -129,7 +129,7 @@ Decision rules:
 **Abort condition**: if Slack OR Granola is missing after the rules above, immediately:
 
   - Write `$VAULT/.harvest/runs/$(date -u +%Y-%m-%dT%H%M%SZ).json` with `{"started_at": "<now>", "ok": false, "scheduler": "routine", "phase": "preflight", "error": "critical connector missing: <slack|granola>", "ended_at": "<now>"}`.
-  - **Push that single marker file directly to `main`** via the same transport as a normal harvest, minus the lint gate (a failure marker is exempt). The marker is a new untracked file, so a fresh-main relocate preserves it: `cd "$VAULT" && git fetch origin main && git checkout main 2>/dev/null || git checkout -B main origin/main; git reset --hard origin/main` (untracked marker survives the reset), then `git add .harvest/runs/<ts>.json && git commit -m "preflight abort (routine)" && git push origin main`. If the push fails (e.g. a 403 recurrence), emit `echo "FATAL: preflight abort run-status could not be pushed to main — failure visible only in routine logs" >&2` so the signal is at least in the routine log. (MCP `push_files` remains a manual operator escape hatch, not an automatic fallback.)
+  - **Push that single marker file to `main`** using the commit-push procedure below (step 2 ensure-HEAD-is-`main`, then step 3's `tools/live-commit-push.sh "$VAULT" "preflight abort (routine)"`) — it provides the desync probe, the non-fast-forward rebase-retry, and lands the marker on `main`. The marker is a valid run-status JSON, so the provenance lint passes it. If the helper returns non-zero (e.g. a 403 recurrence), emit `echo "FATAL: preflight abort run-status could not be pushed to main — failure visible only in routine logs" >&2` so the signal is at least in the routine log. (MCP `push_files` remains a manual operator escape hatch, not an automatic fallback.)
   - Exit. **Do NOT proceed to harvest.** A successful-looking partial run with a critical source missing is worse than a clean failure.
 
 The most likely cause of a missing critical connector is "the connector is enabled in claude.ai but not authenticated." Surface that explicitly in the error so the user knows where to look.
@@ -164,7 +164,7 @@ Determine harvest cutoff. **This rule is load-bearing for gap recovery** — if 
 
 Record the resolved cutoff in the run-status JSON's top-level `cutoff` field as an ISO timestamp (e.g. `"cutoff": "2026-05-08T06:11:00Z"`) or the sentinel `"30d cold-start"`. The canonical run-status schema (see "After all sources complete" block below) is extended to include this `cutoff` field. Do NOT use a calendar-yesterday string ("since yesterday", "last 24 hours") — that's the prior buggy rule that orphaned the 2026-05-08 → 2026-05-10T15:25Z window during the proxy-403 outage on [#153](https://github.com/acardote/personal-assistant-ultra/issues/153) (now the subject of backfill child [#172](https://github.com/acardote/personal-assistant-ultra/issues/172)).
 
-**Runtime safety: if the anchor filename ts is more than 14 days old**, do NOT silently cap the harvest. That is the exact failure mode this whole rule is designed to eliminate. Instead: write `runs/<ts>.json` with `ok: false, phase: "cutoff", error: "anchor_older_than_14d_cap — file a deliberate backfill child (e.g. modeled on #172) to harvest this window via an explicit since parameter"`, push the marker via direct `git push` to `main` (same transport as the commit-push procedure below — ensure HEAD is `main` synced to `origin/main` first, as in step 3 of that procedure). **If that push itself fails** (403, network-after-retry), emit `echo "FATAL: anchor_older_than_14d_cap AND marker push failed — vault has no observable signal; check claude.ai/code/routines logs and file a backfill child manually." >&2` so the failure surfaces in the routine UI even though no cross-machine signal lands. Exit non-zero. The watchdog will surface STALE within 26h once the marker DOES reach the vault.
+**Runtime safety: if the anchor filename ts is more than 14 days old**, do NOT silently cap the harvest. That is the exact failure mode this whole rule is designed to eliminate. Instead: write `runs/<ts>.json` with `ok: false, phase: "cutoff", error: "anchor_older_than_14d_cap — file a deliberate backfill child (e.g. modeled on #172) to harvest this window via an explicit since parameter"`, push the marker via the commit-push procedure below (step 2 ensure-HEAD-is-`main`, then step 3's `tools/live-commit-push.sh`, which provides the rebase-retry). **If that helper returns non-zero** (403, unresolved rebase), emit `echo "FATAL: anchor_older_than_14d_cap AND marker push failed — vault has no observable signal; check claude.ai/code/routines logs and file a backfill child manually." >&2` so the failure surfaces in the routine UI even though no cross-machine signal lands. Exit non-zero. The watchdog will surface STALE within 26h once the marker DOES reach the vault.
 
 Open `$METHOD/.claude/skills/personal-assistant/SKILL.md` (it's the canonical orchestration spec) and follow its "Harvest orchestration" section for each enabled source. **Do not stop at the first few items per source — enumerate and fetch comprehensively** (per #34 — the original cold-start fetched only 9 items because the prompt was vague about completeness).
 
@@ -263,136 +263,77 @@ Quota-exhaustion line template (used only by the second branch): immediately aft
 
 Expected steady-state: 0-5 drift candidates per daily run (most pairs are cached or judged not-drifted). Cold-start fills the cache incrementally over multiple fires (subject to the default `--max-llm-calls=100` cap).
 
-After all sources complete (including the live write-back catch-up + kb-scan + kb-drift-scan), commit the harvest to the vault via **a single `git commit` + direct `git push` to `main`**. Rationale: [#178](https://github.com/acardote/personal-assistant-ultra/issues/178) — direct writes to `main` from within the routine are available again (the 2026-05-08→2026-05-11 sandbox proxy GitHub-identity swap that briefly blocked them, and motivated the feature-branch + PR + auto-merge workaround of slices 1–2, has been resolved). That workaround is retired: there is no per-fire branch, no PR, no auto-merge, and no PR-based adversarial review. The inline lint HARD gate (step 4) is the sole quality gate, and there is **no automatic fallback** — a failed push fails loudly and a human re-plans (#178 A5).
+After all sources complete (including the live write-back catch-up + kb-scan + kb-drift-scan), commit + push the harvest to the vault by **delegating to `tools/live-commit-push.sh`, which commits the working tree and pushes directly to `main`** — the same hardened write path interactive sessions use (vault-desync probe → provenance-lint HARD gate → commit → push with non-fast-forward rebase-retry). Rationale: [#178](https://github.com/acardote/personal-assistant-ultra/issues/178) — direct writes to `main` from within the routine are available again (the 2026-05-08→2026-05-11 sandbox proxy GitHub-identity swap that briefly blocked them, and motivated the feature-branch + PR + auto-merge workaround of slices 1–2, has been resolved). That workaround is retired: no per-fire branch, no PR, no auto-merge, no PR-based review. The provenance-lint HARD gate inside the helper is the sole quality gate, and there is **no automatic fallback** — a failed push fails loudly and a human re-plans (#178 A5).
 
-**Critical invariant — the push MUST target `main`, never the session branch.** The routine sandbox can start on an ephemeral session branch (e.g. `claude/cool-lamport-*`). A harvest committed + pushed on that branch strands and never reaches `main` — the exact failure class the 2026-06-01 re-scope fixes. Step 3 relocates the harvest output onto a fresh `main` synced to `origin/main` before committing, and refuses to push if it cannot reach `main`.
+**Critical invariant — the push MUST target `main`, never the session branch.** The routine sandbox can start on an ephemeral session branch (e.g. `claude/cool-lamport-*`). `live-commit-push.sh` runs `git push` (current branch → its upstream), so it lands on `main` **only if HEAD is `main`** — otherwise the harvest strands on the session branch and never reaches `main` (the exact failure class the 2026-06-01 re-scope fixes). The routine's only bespoke step is ensuring HEAD is `main` first (step 2), done **non-destructively** (stash → checkout `main` → pop; **never `reset --hard`**, so local commits and modified-tracked harvest files are preserved). All reconciliation against `origin/main` (rebase-retry) and the desync gate are the helper's job.
 
 Procedure:
 
-1. **Move to the vault + detect whether there is anything to commit**:
+1. **Move to the vault, establish `RUN_TS`, write the run-status JSON locally**:
 
        cd "$VAULT"
+       RUN_TS=$(date -u +%Y-%m-%dT%H%M%SZ)
        if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
-           # No harvest output this fire. Still write a zero-shaped success runs JSON so the
-           # freshness check has a marker to anchor on; it becomes the only staged change below.
-           RUN_TS=$(date -u +%Y-%m-%dT%H%M%SZ)
-           # Write runs/<RUN_TS>.json with the canonical success schema: ok:true, scheduler:"routine",
-           # zero-shaped per-source counts ("slack":{"new":0,"errors":[]} ...),
-           # notes:"harvest produced no new files", push.transport:"git-direct-main".
+           # No harvest output this fire. Write a zero-shaped success runs JSON so the freshness
+           # check has a marker; it is the only change and still gets committed + pushed below.
+           # ok:true, scheduler:"routine", zero-shaped per-source counts, notes:"harvest produced
+           # no new files", push.transport:"git-direct-main".
+       else
+           # Write the success runs JSON: ok:true, scheduler:"routine", <per-source counts>,
+           # push.transport:"git-direct-main". No pr_url / branch / auto_merge fields (those were
+           # feature-branch artifacts). commit_shas omitted (commit hasn't happened yet).
        fi
 
-   `git status` respects `.gitignore`, so `raw/` (per [ADR-0001](../../docs/adr/0001-storage-backend.md)) and the regenerable `kb-scan-cache` / `kb-drift-scan-cache` are excluded by construction.
+   `git status` respects `.gitignore`, so `raw/` (per [ADR-0001](../../docs/adr/0001-storage-backend.md)) and the regenerable `kb-scan-cache` / `kb-drift-scan-cache` are excluded by construction. The runs JSON lives under `.harvest/runs/`, which the helper stages.
 
-2. **Establish `RUN_TS` + write the run-status JSON locally FIRST**, then stage everything together (no "pushed without a runs marker" window):
-
-       RUN_TS=${RUN_TS:-$(date -u +%Y-%m-%dT%H%M%SZ)}
-       cat > "$VAULT/.harvest/runs/$RUN_TS.json" <<EOF
-       {
-         "started_at": "<step-1 start ts>",
-         "ok": true,
-         "scheduler": "routine",
-         "sources": { <per-source counts> },
-         "ended_at": "<now>",
-         "push": { "transport": "git-direct-main" }
-       }
-       EOF
-
-   No `pr_url` / `branch` / `auto_merge` fields — those were feature-branch-transport artifacts. `commit_shas` is omitted here (the commit hasn't happened yet); a downstream tool can add it by walking `git log` if a consumer needs it.
-
-3. **Relocate the harvest output onto a fresh `main` synced to `origin/main`** — the stranding fix. Harvest output lives in the working tree (uncommitted: new untracked files + modified tracked files). Stash it (including untracked), hard-reset `main` to `origin/main`, then re-apply:
+2. **Ensure HEAD is `main`, non-destructively** — the stranding fix. No `reset --hard`: if the sandbox is on a session branch, stash the uncommitted harvest output (incl. untracked), switch to `main`, and re-apply. If the stash cannot be taken, abort BEFORE switching rather than risk losing modified-tracked output:
 
        git fetch origin main 2>&1 >&2
-       STASHED=0
-       if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-           git stash push --include-untracked -m "harvest-$RUN_TS" 2>&1 >&2 && STASHED=1
+       if [ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then
+           DIRTY=0; [ -n "$(git status --porcelain --untracked-files=all)" ] && DIRTY=1
+           if [ "$DIRTY" = "1" ]; then
+               git stash push --include-untracked -m "harvest-$RUN_TS" 2>&1 >&2 || {
+                   echo "FATAL: working tree dirty but 'git stash' failed — refusing to switch branches (would risk losing modified-tracked harvest output via the upcoming checkout). Inspect $VAULT." >&2
+                   exit 1; }
+           fi
+           git checkout main 2>&1 >&2 || git checkout -b main --track origin/main 2>&1 >&2
+           if [ "$DIRTY" = "1" ] && ! git stash pop 2>&1 >&2; then
+               echo "FATAL: stash pop conflicted applying harvest output onto main (origin/main changed a file this fire also touched). The harvest output is PRESERVED in the stash — recover with 'git stash list' / 'git stash show -p stash@{0}'; it is NOT lost. Resolve the conflict in $VAULT, re-run, then 'git stash drop'." >&2
+               # Overwrite runs/<RUN_TS>.json: ok:false, phase:"ensure_main", error:"stash_pop_conflict". exit 1.
+               exit 1
+           fi
        fi
-       git checkout main 2>&1 >&2 || git checkout -B main origin/main 2>&1 >&2
-       git reset --hard origin/main 2>&1 >&2
-       if [ "$STASHED" = "1" ] && ! git stash pop 2>&1 >&2; then
-           echo "FATAL: stash pop conflicted re-applying harvest output onto fresh main — origin/main changed a file this fire also touched. Working tree carries the conflict markers for operator inspection." >&2
-           # Overwrite runs/<RUN_TS>.json: ok:false, phase:"relocate_to_main", error:"stash_pop_conflict". exit 1.
-           exit 1
-       fi
-       # Hard guards: we are on main, and the harvest output survived the relocate.
-       [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "FATAL: not on main after relocate (HEAD=$(git rev-parse --abbrev-ref HEAD)) — refusing to push harvest to a non-main branch (the stranding failure class)." >&2; exit 1; }
-       if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
-           echo "FATAL: harvest output disappeared after relocate to main — aborting rather than committing an empty fire." >&2
-           exit 1
-       fi
+       # Hard guard: refuse to proceed off main (the stranding class).
+       [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "FATAL: not on main after ensure-on-main (HEAD=$(git rev-parse --abbrev-ref HEAD)) — refusing to commit/push the harvest to a non-main branch." >&2; exit 1; }
+       git branch --set-upstream-to=origin/main main 2>&1 >&2 || true
 
-4. **Inline lint HARD gate** — the sole quality gate now that there is no PR/review hook. If lint fails, abort BEFORE commit (leave the working tree dirty for operator inspection) and write a failure marker:
+   No `reset --hard`: if local `main` is stale (behind `origin/main`), the harvest commit is based on the stale tip and the helper's rebase-retry (step 3) rebases it onto `origin/main`. If the vault is in the desync class (HEAD ref advanced behind a stale working tree, per [#251](https://github.com/acardote/personal-assistant-ultra/issues/251)), the helper's `vault-desync-probe.py` refuses (exit 6) — the routine no longer relies on a `reset --hard` to paper over that state.
+
+3. **Delegate commit + push to the hardened helper**. It runs `tools/vault-desync-probe.py` (refuses the desync class), `tools/lint-provenance.py --require-vault` (the HARD gate), stages `memory/ .harvest/ kb/ artefacts/ projects/`, commits once, and pushes to `main` with a non-fast-forward rebase-retry:
 
        METHOD="$(dirname "$VAULT")/personal-assistant-ultra"
        [ -d "$METHOD/tools" ] || { echo "FATAL: method repo not found at $METHOD" >&2; exit 1; }
-       if ! "$METHOD/tools/lint-provenance.py" --require-vault 2>&1 >&2; then
-           cat > "$VAULT/.harvest/runs/$RUN_TS.json" <<EOF
-       {
-         "started_at": "<step-1 start>",
-         "ok": false,
-         "scheduler": "routine",
-         "sources": { <per-source counts> },
-         "ended_at": "<now>",
-         "phase": "inline_lint",
-         "error": "lint_provenance_failed",
-         "push": { "transport": "git-direct-main", "aborted_before_commit": true }
-       }
-       EOF
-           echo "FATAL: tools/lint-provenance.py --require-vault refused — harvest aborted before commit. Working tree in $VAULT carries the failed state for inspection." >&2
-           exit 1
-       fi
-       # JSON-validity probe on the runs JSON (catches step-2 quoting bugs).
-       python3 -c "import json; json.load(open('$VAULT/.harvest/runs/$RUN_TS.json'))" 2>&1 >&2 \
-           || { echo "FATAL: runs/$RUN_TS.json is not valid JSON — step 2 produced malformed output. Aborting." >&2; exit 1; }
+       "$METHOD/tools/live-commit-push.sh" "$VAULT" "harvest $(date -u +%Y-%m-%d) (routine)"; RC=$?
 
-5. **Stage harvest paths + commit once**. Stage the same paths as `tools/live-commit-push.sh` (`memory/ .harvest/ kb/ artefacts/ projects/`); `raw/` is `.gitignore`'d. Stage individually because `git add a b c` aborts on the first nonexistent path:
+   Map the helper's exit code (do NOT retry with another transport on any non-zero — no automatic fallback, #178 A5):
 
-       for path in memory/ .harvest/ kb/ artefacts/ projects/; do
-           [ -e "$path" ] && git add "$path" 2>/dev/null || true
-       done
-       if git diff --cached --quiet; then
-           echo "FATAL: nothing staged after step 5 despite step 1 detecting changes — aborting." >&2
-           exit 1
-       fi
-       git commit -m "harvest $(date -u +%Y-%m-%d) (routine)"
-       SHA=$(git rev-parse HEAD)
-       echo "harvest commit: $SHA on main" >&2
+   | RC | Meaning | Action |
+   |----|---------|--------|
+   | 0 | committed + pushed to `main` (or nothing to commit) | success. `SHA=$(git -C "$VAULT" rev-parse HEAD)`; report it. |
+   | 4 | provenance lint refused (malformed entry) | overwrite runs JSON `ok:false, phase:"inline_lint", error:"lint_provenance_failed"`. Harvest NOT committed; in the ephemeral routine sandbox the uncommitted output does not persist — fix the entry, next fire re-harvests; the watchdog surfaces STALE within 26h. |
+   | 6 | vault-desync probe refused | overwrite runs JSON `ok:false, phase:"desync", error:"vault_desync"`. Recovery: `tools/vault-desync-recover.py "$VAULT"` (RELEASE.md § Vault desync recovery runbook). |
+   | 3 | push twice rejected (rebase didn't resolve a real conflict) | overwrite runs JSON `ok:false, phase:"commit_push", error:"push_rebase_unresolved"`. The commit exists locally but is unpushed; the ephemeral sandbox discards it — next fire re-harvests. |
+   | 2 | git op failed — commit / auth / network / **403 on `main`** | inspect the helper's stderr: if it carried `403`/`denied`/`protected` → **#178 A1 FALSIFIED** (direct main writes lost again; cf. the 2026-05-08 swap) — overwrite runs JSON `ok:false, phase:"commit_push", error:"push_403_main_a1_falsified"` and **file evidence on #178**. Otherwise `error:"push_failed_other"`. Either way fail loud. |
+   | 5 | `$VAULT` ≠ `.assistant.local.json` configured vault | config error — overwrite runs JSON `ok:false, phase:"config", error:"vault_scope_mismatch"`; fix `.assistant.local.json`. |
 
-6. **Push to `main`** — single push, with a non-fast-forward rebase-retry (another machine / the other scheduler pushed between our fetch and our push). Mirrors `tools/live-commit-push.sh` semantics:
+   On any non-zero RC, the working tree carries the failed state for inspection where the helper left it; surface the phase/error + recovery hint in the final response.
 
-       ERR_FILE=$(mktemp -t harvest-push.XXXXXX)
-       if git push origin main 2>"$ERR_FILE"; then
-           echo "harvest pushed to main: $SHA" >&2
-       elif grep -qiE 'non-fast-forward|fetch first|behind' "$ERR_FILE"; then
-           echo "WARN: non-ff rejection on main — pulling + rebasing once, then retrying" >&2
-           if ! git pull --rebase origin main 2>&1 >&2; then
-               git rebase --abort 2>/dev/null || true
-               echo "FATAL: rebase onto origin/main failed (conflict) — working tree left clean; next fire retries. Harvest NOT pushed." >&2
-               # Overwrite runs JSON: ok:false, phase:"commit_push", error:"rebase_failed". exit 1.
-               exit 1
-           fi
-           SHA=$(git rev-parse HEAD)
-           git push origin main 2>&1 >&2 || { echo "FATAL: second push to main failed after rebase. Harvest NOT pushed." >&2; exit 1; }
-           echo "harvest pushed to main after rebase: $SHA" >&2
-       else
-           PUSH_ERR=$(cat "$ERR_FILE")
-           if echo "$PUSH_ERR" | grep -qiE '403|permission|denied|protected'; then
-               echo "FATAL: git push to main returned 403/denied — #178 A1 (direct main writes available) is FALSIFIED; the proxy principal may have lost main-write access again (cf. the 2026-05-08 identity swap). Harvest committed locally ($SHA) but NOT pushed. File evidence on #178 and re-plan the transport. Manual recovery: push the local commit from a machine with main-write access, or use the MCP push_files escape hatch by hand." >&2
-               # Overwrite runs JSON: ok:false, phase:"commit_push", error:"push_403_main_a1_falsified". exit 1.
-           else
-               echo "FATAL: git push to main failed (not non-ff): $PUSH_ERR" >&2
-               # Overwrite runs JSON: ok:false, phase:"commit_push", error:"push_failed_other". exit 1.
-           fi
-           exit 1
-       fi
-
-7. **Final user-facing response** — report the commit on `main`:
+4. **Final user-facing response**:
 
        Harvest complete (routine, $RUN_TS).
        - Sources: <one-line per-source summary>
-       - Commit: $SHA on main
+       - Commit: $SHA on main          # or: FAILED — <phase/error>; <recovery hint>
        - Runs JSON: .harvest/runs/$RUN_TS.json
-
-   On any FATAL branch above, the run-status JSON carries `ok:false` + the `phase`/`error`, the working tree is left for operator inspection where the message says so, and the watchdog surfaces STALE within 26h.
 
 ### Manual recovery (operator-only) — MCP `push_files`
 
@@ -400,14 +341,14 @@ Direct push to `main` is the sole automatic transport; there is **no automatic f
 
 ### Race semantics
 
-Direct push to `main` reintroduces the cross-scheduler write race that the feature-branch transport had structurally eliminated: a routine fire and a launchd run can both target `main`. The non-fast-forward rebase-retry in step 6 handles the bounded case (one pushes between the other's fetch and push). **The "Choose ONE scheduler" discipline remains load-bearing** — it is the real guard; the rebase-retry is a backstop, not a license to run both. The dedup-state-file race (`.harvest/<source>.json`, last-writer-wins JSON) is likewise only safe under one scheduler.
+Direct push to `main` reintroduces the cross-scheduler write race that the feature-branch transport had structurally eliminated: a routine fire and a launchd run can both target `main`. The helper's non-fast-forward rebase-retry (step 3) handles the bounded case (one pushes between the other's fetch and push). **The "Choose ONE scheduler" discipline remains load-bearing** — it is the real guard; the rebase-retry is a backstop, not a license to run both. The dedup-state-file race (`.harvest/<source>.json`, last-writer-wins JSON) is likewise only safe under one scheduler.
 
 Because the harvest lands on `main` synchronously (no PR-merge latency), the slice-1→slice-2 "freshness window" regression is gone: fire N's `runs/<ts>.json` and `.harvest/<source>.json` are on `origin/main` the moment the push returns, so fire N+1 anchors its cutoff and seeds its dedup state correctly.
 
 In your final response, summarize:
 - Which sources fired and what each produced.
 - Any errors encountered.
-- Whether the `git push` to `main` succeeded, including the commit SHA. If it failed, the failure phase/error and the manual-recovery hint.
+- Whether the push to `main` succeeded (the helper's RC), the commit SHA on success, or the phase/error + recovery hint on failure.
 - The run-status JSON path.
 ```
 
