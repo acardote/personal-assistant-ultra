@@ -12,7 +12,9 @@ Tests:
   T4 — MISSING: runs/ directory absent, returns MISSING.
   T5 — MISSING: runs/ exists but has no .json files, returns MISSING.
   T6 — Scheduler-agnostic: works with both 'launchd' and 'routine' scheduler markers.
-  T7 — Newest-by-mtime: when multiple files exist, picks the one with newest mtime.
+  T7 — Newest-by-filename: when multiple files exist, picks the lex-newest by
+       filename ts, NOT mtime (revised #274/#276 — A3 fix; git resets mtime on checkout).
+  T7b — Clone equal-mtime: all files share one checkout mtime → still selects lex-newest.
   T8 — CORRUPT: malformed JSON in newest file → CORRUPT, not PASS (challenger fix).
   T9 — STUCK: 3 consecutive ok=false with same error → STUCK, not just FAILED.
   T10 — STUCK threshold: 2 consecutive failures stays as FAILED (below threshold).
@@ -157,27 +159,80 @@ def test_scheduler_agnostic():
     print("  T6 PASS — launchd scheduler marker recognized.")
 
 
-def test_newest_by_mtime_not_lex():
-    """T7: when multiple files exist, picks newest by mtime."""
+def test_newest_by_filename_not_mtime():
+    """T7 (revised, #274/#276 — A3 fix): newest run is selected by FILENAME
+    timestamp, NOT by st_mtime.
+
+    The original T7 codified mtime-based selection. #275 proved that choice is
+    unsound on any git checkout: `git` resets mtime to checkout time, so the
+    "newest by mtime" file is arbitrary on a fresh clone — and reproduced the
+    watchdog's exact STALE-on-2026-06-05 symptom. The harvest routine already
+    anchors its cutoff on the filename timestamp for the same reason (#170: the
+    shell-substituted filename is the only mechanically-trustworthy clock; mtime
+    resets on clone, started_at is LLM-written and drifts). Selection now aligns
+    with that.
+
+    Scenario: the lex-LATER (truly newest) file has an OLDER mtime than a
+    lex-EARLIER (older) file — exactly what a checkout that wrote files
+    out-of-mtime-order produces. Filename selection must pick the lex-later one.
+    """
     cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
     with tempfile.TemporaryDirectory() as td:
         runs = Path(td) / "runs"
-        # File with lex-LATER name but OLDER mtime
-        write_run(runs, "2026-05-05T230000Z.json", {
-            "started_at": iso_hours_ago(40),
-            "ok": False, "scheduler": "routine", "error": "old failure",
+        # Truly-newest run (lex-LATER name) but with an OLDER mtime.
+        write_run(runs, "2026-06-09T060700Z.json", {
+            "started_at": iso_hours_ago(1),
+            "ok": True, "scheduler": "routine",
         }, mtime=time.time() - (40 * 3600))
-        # File with lex-EARLIER name but NEWER mtime
-        write_run(runs, "2026-05-05T010000Z.json", {
-            "started_at": iso_hours_ago(0.5),
+        # Older run (lex-EARLIER name) but with a NEWER mtime (mtime selection
+        # would wrongly pick this and report STALE — the watchdog bug).
+        write_run(runs, "2026-06-05T060700Z.json", {
+            "started_at": iso_hours_ago(40),
             "ok": True, "scheduler": "routine",
         }, mtime=time.time() - 1800)
         result = cf.assess_freshness(runs, max_age_hours=26)
     assert result.state == "PASS", (
-        f"expected PASS from the recent ok=true run; got {result.state}: {result.summary}"
+        f"filename selection should pick the lex-newest (recent ok=true) run; "
+        f"got {result.state}: {result.summary}"
     )
-    assert "010000Z" in str(result.newest_path)
-    print("  T7 PASS — selection by mtime, not lexicographic.")
+    assert "2026-06-09T060700Z" in str(result.newest_path), (
+        f"expected the lex-newest file selected by filename, got {result.newest_path}"
+    )
+    print("  T7 PASS — selection by FILENAME timestamp, not mtime (A3 fix).")
+
+
+def test_clone_equal_mtime_selects_newest_filename():
+    """T7b (#274/#276 — A3 regression): when ALL run files share one mtime (the
+    realistic fresh-clone state, since git stamps every checked-out file with the
+    same checkout time), the newest is still selected deterministically by
+    filename. This is the direct reproduction of the watchdog defect: pre-fix,
+    equal mtimes made selection arbitrary."""
+    cf = load_module("check_freshness", PROJ / "tools" / "check-harvest-freshness.py")
+    shared_mtime = time.time() - 600  # all files "checked out" at the same instant
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        # Several older runs + one truly-newest, all with identical mtime.
+        for name, hours in [
+            ("2026-06-05T060700Z.json", 96),
+            ("2026-06-06T060700Z.json", 72),
+            ("2026-06-07T060700Z.json", 48),
+        ]:
+            write_run(runs, name, {
+                "started_at": iso_hours_ago(hours), "ok": True, "scheduler": "routine",
+            }, mtime=shared_mtime)
+        # Newest by filename, and recent by started_at → must drive a PASS.
+        write_run(runs, "2026-06-10T060700Z.json", {
+            "started_at": iso_hours_ago(2), "ok": True, "scheduler": "routine",
+        }, mtime=shared_mtime)
+        result = cf.assess_freshness(runs, max_age_hours=26)
+    assert result.state == "PASS", (
+        f"equal-mtime clone should still select the lex-newest run; "
+        f"got {result.state}: {result.summary}"
+    )
+    assert "2026-06-10T060700Z" in str(result.newest_path), (
+        f"expected lex-newest file under equal mtimes, got {result.newest_path}"
+    )
+    print("  T7b PASS — equal-mtime clone selects newest by filename (A3 regression).")
 
 
 def test_corrupt_json():
@@ -503,7 +558,8 @@ if __name__ == "__main__":
     test_missing_no_runs_dir()
     test_missing_empty_runs_dir()
     test_scheduler_agnostic()
-    test_newest_by_mtime_not_lex()
+    test_newest_by_filename_not_mtime()
+    test_clone_equal_mtime_selects_newest_filename()
     test_corrupt_json()
     test_stuck_three_same_error()
     test_failed_below_stuck_threshold()
