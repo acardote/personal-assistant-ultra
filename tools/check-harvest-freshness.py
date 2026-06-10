@@ -25,6 +25,12 @@ decides:
   - CORRUPT:          newest .json file is unparseable (truncated write or
                       manual corruption — likely the last run crashed mid-write)
 
+File selection: the newest run is chosen by FILENAME timestamp (canonical
+`YYYY-MM-DDTHHMMSSZ.json`, lexicographic == chronological), NOT by mtime.
+`git clone` resets mtime to checkout time, so mtime-based selection is
+arbitrary on a fresh clone — it produced a STALE false-alarm in the watchdog
+(#274/#276). This matches the harvest routine's cutoff anchor (#170).
+
 Age clock: prefers the `started_at` field from the run-status JSON payload,
 falling back to filesystem mtime if the payload is absent or unparseable.
 This matters because `git clone`, `cp -r`, and the backup/restore tooling
@@ -184,7 +190,15 @@ def assess_freshness(
                 f"`templates/routines/harvest-routine.md`."
             ),
         )
-    files = sorted(runs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Select newest by FILENAME timestamp, not st_mtime. `git` checkout resets
+    # mtime to checkout time, so mtime-based selection is arbitrary on a fresh
+    # clone (the watchdog's environment) — it reproduced a STALE false-alarm by
+    # pinning an old run-status file (#274/#276, A3). The canonical run-status
+    # name is `YYYY-MM-DDTHHMMSSZ.json`, for which lexicographic sort == chrono.
+    # This aligns with the harvest routine's own cutoff anchor, which trusts the
+    # filename ts over started_at/mtime for the same reason (#170). The age clock
+    # below still prefers payload `started_at` (mtime only as last-resort fallback).
+    files = sorted(runs_dir.glob("*.json"), key=lambda p: p.name, reverse=True)
     if not files:
         return FreshnessResult(
             state="MISSING", newest_path=None, age_hours=None, age_source=None,
