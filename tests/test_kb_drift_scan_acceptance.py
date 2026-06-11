@@ -731,6 +731,97 @@ def test_suppressed_decision_skipped_in_routing():
     print("  T16 PASS — suppressed decisions are skipped in routing (slice 4)")
 
 
+def test_stale_schema_cache_entry_does_not_crash():
+    """T17 (#279/#281 slice 1): a cache entry written by the pre-drift_claim/
+    verbatim_excerpt schema (the #277 poison: 82/1682 entries) must NOT crash
+    the scan. It is evicted, the pair is skipped this fire, and the watermark is
+    NOT advanced (so a later fire re-judges with the current schema)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        write_decision(vault, title="d1", scope="Acme",
+                       via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        write_memory(vault, "granola_note", "m1", tags=["acme"])
+        m = import_drift_scan(method)
+        pair = m.build_pairs(m.load_memory(vault, None), m.load_decisions(vault))[0]
+        # Pre-seed a POISON cache entry: old schema, missing drift_claim + verbatim_excerpt.
+        m.cache_write(vault, pair, {
+            "memory_id": pair.memory.memory_id,
+            "decision_art_id": pair.decision.art_id,
+            "scanned_at": "2026-05-20T10:00:00Z",
+            "verdict": {"drifted": True, "drift_confidence": "high", "reasoning": "old-shape"},
+        })
+        cache_file = m.cache_dir(vault) / m.cache_filename(pair)
+        assert cache_file.is_file()
+
+        def boom(*a, **k):
+            raise AssertionError("judge_drift must NOT be called on a cache-hit poison pair")
+        m.judge_drift = boom
+
+        rc = m.main(["--all"])
+        assert rc == 0, "stale-schema cache entry must not crash the scan"
+        assert not cache_file.is_file(), "poison cache entry should be evicted"
+        wm = vault / ".harvest" / "kb-drift-scan-watermark.json"
+        assert not wm.is_file(), "watermark must not advance when a poison entry was evicted"
+        sys.modules.pop("kb_drift_scan_t", None)
+    print("  T17 PASS — stale-schema cache entry evicted, no crash, watermark held")
+
+
+def test_claude_timeout_blocks_watermark_and_retries():
+    """T18 (#279/#281 slice 2): a `claude -p` timeout is transient — the scan
+    must not crash, must NOT cache the pair (caching null would permanently skip
+    it), and must NOT advance the watermark (so the pair is retried next fire)."""
+    import subprocess as _sp
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        write_decision(vault, title="d1", scope="Acme",
+                       via_uuid="aaaaaaaa-1111-2222-3333-444444444444")
+        write_memory(vault, "granola_note", "m1", tags=["acme"])
+        m = import_drift_scan(method)
+
+        def fake_call_claude(prompt, timeout=None):
+            raise _sp.TimeoutExpired(cmd="claude -p", timeout=timeout or 1)
+        m.call_claude = fake_call_claude
+
+        rc = m.main(["--all", "--llm-timeout", "5"])
+        assert rc == 0, "a timed-out claude -p must not crash the scan"
+        pair = m.build_pairs(m.load_memory(vault, None), m.load_decisions(vault))[0]
+        assert not (m.cache_dir(vault) / m.cache_filename(pair)).is_file(), (
+            "timed-out pair must NOT be cached (caching would permanently skip it)"
+        )
+        wm = vault / ".harvest" / "kb-drift-scan-watermark.json"
+        assert not wm.is_file(), "watermark must not advance when a pair timed out"
+        sys.modules.pop("kb_drift_scan_t", None)
+    print("  T18 PASS — claude -p timeout: no crash, not cached, watermark held")
+
+
+def test_call_claude_passes_timeout_to_subprocess():
+    """T19 (#279/#281 slice 2): call_claude must hand a `timeout=` to
+    subprocess.run, sourced from the module timeout (set by --llm-timeout)."""
+    with tempfile.TemporaryDirectory() as td:
+        method, vault = make_fixture(Path(td))
+        m = import_drift_scan(method)
+        captured = {}
+
+        class FakeCompleted:
+            stdout = "drifted: false\n"
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return FakeCompleted()
+
+        orig_run = m.subprocess.run
+        m.subprocess.run = fake_run
+        try:
+            m._LLM_TIMEOUT_SEC = 42
+            m.call_claude("hi")
+        finally:
+            m.subprocess.run = orig_run
+        assert "timeout" in captured, "call_claude must pass timeout= to subprocess.run"
+        assert captured["timeout"] == 42, f"expected timeout=42, got {captured.get('timeout')}"
+        sys.modules.pop("kb_drift_scan_t", None)
+    print("  T19 PASS — call_claude passes timeout= to subprocess.run")
+
+
 if __name__ == "__main__":
     print("Running test_kb_drift_scan_acceptance.py...")
     test_empty_pool_emits_nothing()
@@ -749,4 +840,7 @@ if __name__ == "__main__":
     test_partial_quota_mid_iteration()
     test_decision_append_does_not_invalidate_prior_hashes()
     test_suppressed_decision_skipped_in_routing()
+    test_stale_schema_cache_entry_does_not_crash()
+    test_claude_timeout_blocks_watermark_and_retries()
+    test_call_claude_passes_timeout_to_subprocess()
     print("All kb-drift-scan tests passed.")

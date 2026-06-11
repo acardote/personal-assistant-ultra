@@ -58,6 +58,18 @@ from _config import load_config  # noqa: E402
 
 DEFAULT_MAX_LLM_CALLS = 100
 DEFAULT_CONFIDENCE_THRESHOLD = "medium"
+DEFAULT_LLM_TIMEOUT_SEC = 120  # per `claude -p` call; guards against unbounded hangs (#279/#281)
+
+# Module-level timeout, overridable via --llm-timeout in main(). Kept as a module
+# global (rather than a judge_drift param) so the call site `judge_drift(pair)`
+# signature stays stable for existing test stubs.
+_LLM_TIMEOUT_SEC = DEFAULT_LLM_TIMEOUT_SEC
+
+# Sentinel returned by judge_drift when a `claude -p` call times out. Distinct
+# from None (a parse/exec failure, which is cached-as-null and not retried): a
+# timeout is transient, so the caller must NOT cache it and must block watermark
+# advance so the pair is retried on the next fire (#279/#281).
+TIMEOUT = object()
 CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 MEMORY_BODY_CAP = 2500  # chars passed to LLM (matches kb-scan's prompt-bound)
 EXCERPT_MIN_LEN = 10    # F4: grounding excerpt must be at least this many chars
@@ -444,13 +456,19 @@ Title: {MEMORY_TITLE}
 """
 
 
-def call_claude(prompt: str) -> str:
-    """Same shape as kb-scan.call_claude. Headless `claude -p`, returns stdout."""
+def call_claude(prompt: str, timeout: Optional[float] = None) -> str:
+    """Same shape as kb-scan.call_claude. Headless `claude -p`, returns stdout.
+
+    `timeout` bounds the call (default `_LLM_TIMEOUT_SEC`); on expiry
+    `subprocess.run` raises `subprocess.TimeoutExpired`, which judge_drift maps
+    to the TIMEOUT sentinel. Without this a single hung `claude -p` would block
+    the whole scan unbounded (#279/#281 — observed >500min routine task)."""
     result = subprocess.run(
         ["claude", "-p", prompt],
         check=True,
         capture_output=True,
         text=True,
+        timeout=_LLM_TIMEOUT_SEC if timeout is None else timeout,
     )
     return result.stdout
 
@@ -482,6 +500,14 @@ def judge_drift(pair: DriftPair) -> Optional[DriftVerdict]:
     )
     try:
         raw = call_claude(prompt)
+    except subprocess.TimeoutExpired:
+        print(
+            f"[kb-drift-scan] WARN: claude -p timed out (>{_LLM_TIMEOUT_SEC}s) for "
+            f"({pair.memory.memory_id}, art-{pair.decision.art_id}); transient — "
+            f"will retry next fire (not cached).",
+            file=sys.stderr,
+        )
+        return TIMEOUT
     except subprocess.CalledProcessError as exc:
         print(
             f"[kb-drift-scan] WARN: claude -p failed for ({pair.memory.memory_id}, "
@@ -656,6 +682,22 @@ def confidence_meets_threshold(conf: str, threshold: str) -> bool:
     return CONFIDENCE_RANK.get(conf, 0) >= CONFIDENCE_RANK.get(threshold, 0)
 
 
+def _verdict_from_dict(d) -> Optional[DriftVerdict]:
+    """Build a DriftVerdict from a cached `verdict` dict, tolerating stale or
+    foreign shapes. Returns None when the dict can't form a valid verdict —
+    e.g. the pre-schema cache entries written before drift_claim/verbatim_excerpt
+    existed (#277: 82/1682 entries), which `DriftVerdict(**d)` raised TypeError
+    on, crashing every fire since ~2026-05-16. The caller treats None as a
+    poison entry to evict + re-judge on a later fire (#279/#281)."""
+    if not isinstance(d, dict):
+        return None
+    try:
+        return DriftVerdict(**d)
+    except TypeError:
+        # Missing required fields (stale schema) or unexpected keys (newer schema).
+        return None
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else "")
     p.add_argument("--all", action="store_true", help="ignore watermark; scan full memory pool (bootstrap)")
@@ -667,11 +709,21 @@ def main(argv=None) -> int:
                    default=DEFAULT_CONFIDENCE_THRESHOLD,
                    help="minimum drift_confidence to emit (default medium)")
     p.add_argument("--out-dir", help="override unprocessed memo output dir (testing)")
+    p.add_argument("--llm-timeout", type=float, default=DEFAULT_LLM_TIMEOUT_SEC,
+                   help=(f"per claude -p call timeout in seconds (default {DEFAULT_LLM_TIMEOUT_SEC}); "
+                         f"guards against unbounded hangs (#279/#281). A timed-out pair is retried "
+                         f"next fire and blocks watermark advance."))
     args = p.parse_args(argv)
 
     if args.all and args.since:
         print("--all and --since are mutually exclusive", file=sys.stderr)
         return 2
+
+    if args.llm_timeout <= 0:
+        print("--llm-timeout must be > 0", file=sys.stderr)
+        return 2
+    global _LLM_TIMEOUT_SEC
+    _LLM_TIMEOUT_SEC = args.llm_timeout
 
     cfg = load_config(require_explicit_content_root=True)
     content_root = cfg.content_root
@@ -747,11 +799,29 @@ def main(argv=None) -> int:
     rejected_for_grounding = 0
     below_threshold = 0
     not_drifted = 0
+    stale_cache_evicted = 0  # poison cache entries evicted this fire (#279/#281)
+    timed_out = 0            # claude -p timeouts this fire (#279/#281)
 
     for pair in pairs:
         cached = cache_read(content_root, pair)
         if cached is not None:
             verdict_data = cached.get("verdict")
+            if verdict_data is None:
+                # Prior null-cached failure (parse/exec error) — stays skipped
+                # until either side changes (unchanged behavior).
+                cached_pairs += 1
+                continue
+            verdict = _verdict_from_dict(verdict_data)
+            if verdict is None:
+                # Stale-schema / malformed cached verdict (#277 poison). Evict so
+                # a later fire re-judges with the current schema; skip this fire
+                # and block watermark advance so the pair is revisited.
+                try:
+                    (cache_dir(content_root) / cache_filename(pair)).unlink()
+                except FileNotFoundError:
+                    pass
+                stale_cache_evicted += 1
+                continue
             cached_pairs += 1
         else:
             if llm_calls >= args.max_llm_calls:
@@ -759,6 +829,11 @@ def main(argv=None) -> int:
                 continue
             verdict = judge_drift(pair)
             llm_calls += 1
+            if verdict is TIMEOUT:
+                # Transient: do NOT cache (caching null would permanently skip
+                # it). Block watermark advance so the next fire retries.
+                timed_out += 1
+                continue
             if verdict is None:
                 # Cache the failure shape so we don't retry on the same
                 # (memory, decision) tuple until either side changes.
@@ -769,17 +844,14 @@ def main(argv=None) -> int:
                     "verdict": None,
                 })
                 continue
-            verdict_data = dataclasses.asdict(verdict)
             cache_write(content_root, pair, {
                 "memory_id": pair.memory.memory_id,
                 "decision_art_id": pair.decision.art_id,
                 "scanned_at": now_iso(),
-                "verdict": verdict_data,
+                "verdict": dataclasses.asdict(verdict),
             })
 
-        if not verdict_data:
-            continue
-        verdict = DriftVerdict(**verdict_data)
+        # `verdict` is a valid DriftVerdict here (cached-valid or freshly judged).
         if not verdict.drifted:
             not_drifted += 1
             continue
@@ -804,15 +876,19 @@ def main(argv=None) -> int:
         # When out_dir is overridden (tests), emit_drift_memo writes there directly.
         emit_count += 1
 
-    # Watermark gate (matches kb-scan): don't advance if quota was hit, so the
-    # next default run doesn't silently skip the un-scanned pairs.
-    if skipped_for_quota == 0:
+    # Watermark gate (matches kb-scan): advance ONLY when every pair was
+    # resolved this fire. Any pair left unresolved — quota-skipped, timed-out,
+    # or poison-evicted — must block advance so the next default run revisits it
+    # (#279/#281: a timed-out or evicted pair must not be silently dropped).
+    incomplete = skipped_for_quota + timed_out + stale_cache_evicted
+    if incomplete == 0:
         write_watermark(content_root)
     else:
         print(
-            f"[kb-drift-scan] WARN: quota exhausted with {skipped_for_quota} pairs skipped; "
-            f"watermark NOT advanced. Re-run with --max-llm-calls > {args.max_llm_calls} "
-            f"or split with --since to clear the backlog.",
+            f"[kb-drift-scan] WARN: watermark NOT advanced — unresolved pairs this fire: "
+            f"{skipped_for_quota} quota-skipped, {timed_out} timed-out, "
+            f"{stale_cache_evicted} stale-cache evicted. The next run revisits them "
+            f"(raise --max-llm-calls / --llm-timeout, or split with --since, to drain faster).",
             file=sys.stderr,
         )
 
@@ -824,6 +900,10 @@ def main(argv=None) -> int:
     )
     if skipped_for_quota:
         summary += f", skipped_for_quota={skipped_for_quota}"
+    if timed_out:
+        summary += f", timed_out={timed_out}"
+    if stale_cache_evicted:
+        summary += f", stale_cache_evicted={stale_cache_evicted}"
     print(summary, file=sys.stderr)
     return 0
 
