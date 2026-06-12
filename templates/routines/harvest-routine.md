@@ -297,6 +297,18 @@ Procedure:
                    exit 1; }
            fi
            git checkout main 2>&1 >&2 || git checkout -b main --track origin/main 2>&1 >&2
+           # Make local main current BEFORE re-applying harvest output (the #283 fix).
+           # `git checkout main` lands on a possibly-stale local main; popping the stash
+           # onto a tip missing origin/main's state edits is what produced the recurring
+           # .harvest/*.json conflict. --ff-only advances main only when it is a strict
+           # ancestor of origin/main; if local main has DIVERGED (local-only commits) it
+           # REFUSES rather than move the ref — we never `reset --hard`/force the ref, so
+           # the stashed harvest output stays preserved and recoverable.
+           if ! git merge --ff-only origin/main 2>&1 >&2; then
+               echo "FATAL: local main has diverged from origin/main (not fast-forwardable). Refusing to force the branch ref (no reset --hard). The harvest output is PRESERVED in the stash — recover with 'git stash list' / 'git stash show -p stash@{0}'; it is NOT lost. Resolve the divergence in $VAULT, re-run, then 'git stash drop'." >&2
+               # Overwrite runs/<RUN_TS>.json: ok:false, phase:"ensure_main", error:"main_diverged_no_ff". exit 1.
+               exit 1
+           fi
            if [ "$DIRTY" = "1" ] && ! git stash pop 2>&1 >&2; then
                echo "FATAL: stash pop conflicted applying harvest output onto main (origin/main changed a file this fire also touched). The harvest output is PRESERVED in the stash — recover with 'git stash list' / 'git stash show -p stash@{0}'; it is NOT lost. Resolve the conflict in $VAULT, re-run, then 'git stash drop'." >&2
                # Overwrite runs/<RUN_TS>.json: ok:false, phase:"ensure_main", error:"stash_pop_conflict". exit 1.
@@ -307,7 +319,7 @@ Procedure:
        [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "FATAL: not on main after ensure-on-main (HEAD=$(git rev-parse --abbrev-ref HEAD)) — refusing to commit/push the harvest to a non-main branch." >&2; exit 1; }
        git branch --set-upstream-to=origin/main main 2>&1 >&2 || true
 
-   No `reset --hard`: if local `main` is stale (behind `origin/main`), the harvest commit is based on the stale tip and the helper's rebase-retry (step 3) rebases it onto `origin/main`. If the vault is in the desync class (HEAD ref advanced behind a stale working tree, per [#251](https://github.com/acardote/personal-assistant-ultra/issues/251)), the helper's `vault-desync-probe.py` refuses (exit 6) — the routine no longer relies on a `reset --hard` to paper over that state.
+   No `reset --hard`: if local `main` is stale (behind `origin/main`), the `git merge --ff-only origin/main` above advances local `main` to `origin/main` BEFORE the stash pop, so the re-applied harvest output (and the subsequent commit) is based on the current `origin/main` tip rather than a stale one — this is the [#283](https://github.com/acardote/personal-assistant-ultra/issues/283) fix that eliminated the recurring `.harvest/*.json` stash-pop conflict. `--ff-only` is the data-safety keystone: it refuses (exit non-zero, no ref movement) when local `main` has *diverged* (local-only commits) rather than force-moving the ref, so divergence aborts loudly with the harvest output preserved in the stash. The helper's rebase-retry (step 3) remains the backstop if `origin/main` advances again between this fast-forward and the push (a concurrent writer). If the vault is in the desync class (HEAD ref advanced behind a stale working tree, per [#251](https://github.com/acardote/personal-assistant-ultra/issues/251)), the helper's `vault-desync-probe.py` refuses (exit 6) — the routine no longer relies on a `reset --hard` to paper over that state.
 
 3. **Delegate commit + push to the hardened helper**. It runs `tools/vault-desync-probe.py` (refuses the desync class), `tools/lint-provenance.py --require-vault` (the HARD gate), stages `memory/ .harvest/ kb/ artefacts/ projects/`, commits once, and pushes to `main` with a non-fast-forward rebase-retry:
 
